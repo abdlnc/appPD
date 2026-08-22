@@ -69,6 +69,14 @@ class RobotSocket extends ChangeNotifier {
   int get gpsSatsView => _gpsSatsView;
   bool get hasGps => _robotLat != null && _robotLon != null;
 
+  // ---- SLAM map save ("SAVEMAP" -> "MAPSAVED:<name>" / "MAPERR:<reason>") ----
+  bool _isSavingMap = false;
+  String? _mapSaveResult; // saved map's name, on success
+  String? _mapSaveError; // failure reason, on error
+  bool get isSavingMap => _isSavingMap;
+  String? get mapSaveResult => _mapSaveResult;
+  String? get mapSaveError => _mapSaveError;
+
   // ---- Obstacle pins (GPS location logged each time a DANGER obstacle is seen) ----
   final List<ObstaclePin> _obstaclePins = [];
   List<ObstaclePin> get obstaclePins => _obstaclePins;
@@ -168,6 +176,18 @@ class RobotSocket extends ChangeNotifier {
       // 4. GPS Position (G:)
       else if (message.startsWith("G:")) {
         _parseGps(message.substring(2));
+      }
+      // 5. SLAM map save result (MAPSAVED: / MAPERR:)
+      else if (message.startsWith("MAPSAVED:")) {
+        _isSavingMap = false;
+        _mapSaveResult = message.substring("MAPSAVED:".length);
+        _mapSaveError = null;
+        notifyListeners();
+      } else if (message.startsWith("MAPERR:")) {
+        _isSavingMap = false;
+        _mapSaveError = message.substring("MAPERR:".length);
+        _mapSaveResult = null;
+        notifyListeners();
       }
     }
   }
@@ -278,5 +298,22 @@ class RobotSocket extends ChangeNotifier {
 
   void clearWaypoint() {
     sendCommand("WP:CLEAR");
+  }
+
+  // ---- SLAM map save (see _handleMessage for the MAPSAVED:/MAPERR: reply) ----
+  void saveSlamMap() {
+    _isSavingMap = true;
+    _mapSaveResult = null;
+    _mapSaveError = null;
+    notifyListeners();
+    sendCommand("SAVEMAP");
+  }
+
+  /// Call once the result has been shown (e.g. in a SnackBar) so it doesn't
+  /// get shown again on the next rebuild.
+  void clearMapSaveResult() {
+    _mapSaveResult = null;
+    _mapSaveError = null;
+    notifyListeners();
   }
 }

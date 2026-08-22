@@ -31,6 +31,23 @@ class _LidarMapScreenState extends State<LidarMapScreen> {
   final List<LidarSnapshot> _snapshots = [];
   bool _saving = false;
 
+  // ---- SLAM map save (server-side -- ~/save_slam_map.sh on the Pi via the
+  // "SAVEMAP" WebSocket command, distinct from the point-cloud screenshot
+  // above which is purely client-side/session-only) ----
+  void _showSlamSnackBar(bool ok, String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: ok ? AppColors.lime : AppColors.offline,
+        content: Text(text,
+            style: GoogleFonts.rajdhani(
+                color: ok ? AppColors.onLime : Colors.white,
+                fontWeight: FontWeight.w700)),
+      ));
+  }
+
   Future<void> _save(int pointCount) async {
     if (_saving) return;
     setState(() => _saving = true);
@@ -90,6 +107,16 @@ class _LidarMapScreenState extends State<LidarMapScreen> {
       body: Consumer<RobotSocket>(
         builder: (context, socket, _) {
           final points = socket.lidarPoints;
+          if (socket.mapSaveResult != null || socket.mapSaveError != null) {
+            final ok = socket.mapSaveResult != null;
+            final text = ok
+                ? "SLAM map saved as \"${socket.mapSaveResult}\" — view it in Gallery → MAPS"
+                : "Couldn't save SLAM map: ${socket.mapSaveError}";
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _showSlamSnackBar(ok, text);
+              socket.clearMapSaveResult();
+            });
+          }
           return ListView(
             padding: const EdgeInsets.all(16),
             children: [
@@ -145,6 +172,33 @@ class _LidarMapScreenState extends State<LidarMapScreen> {
                       : () => _save(points.length),
                   icon: const Icon(Icons.save_alt),
                   label: Text(_saving ? "SAVING…" : "SAVE CURRENT MAP"),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: (!socket.isConnected || socket.isSavingMap)
+                      ? null
+                      : () => socket.saveSlamMap(),
+                  icon: socket.isSavingMap
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.map_outlined),
+                  label: Text(
+                      socket.isSavingMap ? "SAVING SLAM MAP…" : "SAVE SLAM MAP SNAPSHOT"),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  "Saves the actual SLAM-built map from the robot (slam_toolbox) "
+                  "into its gallery — needs SLAM running on the Pi "
+                  "(slam.launch.py). Different from the radar screenshot above.",
+                  style: GoogleFonts.rajdhani(color: AppColors.textLo, fontSize: 12),
                 ),
               ),
               const SizedBox(height: 24),
