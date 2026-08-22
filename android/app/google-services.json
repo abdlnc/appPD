@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "831805107393",
+    "project_id": "agv-lidar",
+    "storage_bucket": "agv-lidar.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:831805107393:android:8a3c48acd7f04addc97840",
+        "android_client_info": {
+          "package_name": "com.caluag.robot_controller"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCO1hPUQaH_aCCSwfKq_7Ya-a_jDVviwxU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
