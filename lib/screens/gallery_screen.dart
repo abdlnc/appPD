@@ -26,8 +26,8 @@ class GalleryImage {
 }
 
 /// Saved-images viewer: raw camera captures + AI-annotated detections +
-/// downward soil-camera snapshots, served by gallery_server.py (read-only
-/// HTTP file server on the Pi).
+/// downward soil-camera snapshots + saved SLAM maps, served by
+/// gallery_server.py (read-only HTTP file server on the Pi).
 class GalleryScreen extends StatefulWidget {
   const GalleryScreen({super.key});
   @override
@@ -41,7 +41,7 @@ class _GalleryScreenState extends State<GalleryScreen>
   @override
   void initState() {
     super.initState();
-    _tabs = TabController(length: 3, vsync: this);
+    _tabs = TabController(length: 4, vsync: this);
   }
 
   @override
@@ -72,6 +72,7 @@ class _GalleryScreenState extends State<GalleryScreen>
             Tab(text: "CAPTURES"),
             Tab(text: "DETECTIONS"),
             Tab(text: "SOIL"),
+            Tab(text: "MAPS"),
           ],
         ),
       ),
@@ -93,6 +94,7 @@ class _GalleryScreenState extends State<GalleryScreen>
                 _GalleryGrid(ip: ip, kind: "captures"),
                 _GalleryGrid(ip: ip, kind: "detections"),
                 _GalleryGrid(ip: ip, kind: "soil"),
+                _GalleryGrid(ip: ip, kind: "maps"),
               ],
             ),
     );
@@ -101,7 +103,7 @@ class _GalleryScreenState extends State<GalleryScreen>
 
 class _GalleryGrid extends StatefulWidget {
   final String ip;
-  final String kind; // "captures" | "detections" | "soil"
+  final String kind; // "captures" | "detections" | "soil" | "maps"
   const _GalleryGrid({required this.ip, required this.kind});
   @override
   State<_GalleryGrid> createState() => _GalleryGridState();
