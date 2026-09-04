@@ -77,6 +77,16 @@ class RobotSocket extends ChangeNotifier {
   String? get mapSaveResult => _mapSaveResult;
   String? get mapSaveError => _mapSaveError;
 
+  // ---- SLAM map reset ("RESETMAP" -> "MAPRESET:ok" / "MAPRESETERR:<reason>")
+  // Wipes the robot's LIVE mapped area (restarts slam_toolbox on the Pi).
+  // Already-saved snapshots in the gallery's MAPS tab are NOT touched. ----
+  bool _isResettingMap = false;
+  bool _mapResetOk = false; // true once a reset succeeded (one-shot flag)
+  String? _mapResetError; // failure reason, on error
+  bool get isResettingMap => _isResettingMap;
+  bool get mapResetOk => _mapResetOk;
+  String? get mapResetError => _mapResetError;
+
   // ---- Obstacle pins (GPS location logged each time a DANGER obstacle is seen) ----
   final List<ObstaclePin> _obstaclePins = [];
   List<ObstaclePin> get obstaclePins => _obstaclePins;
@@ -187,6 +197,19 @@ class RobotSocket extends ChangeNotifier {
         _isSavingMap = false;
         _mapSaveError = message.substring("MAPERR:".length);
         _mapSaveResult = null;
+        notifyListeners();
+      }
+      // 6. SLAM map reset result (MAPRESET: / MAPRESETERR:)
+      else if (message.startsWith("MAPRESET:")) {
+        _isResettingMap = false;
+        _mapResetOk = true;
+        _mapResetError = null;
+        _lidarPoints = []; // the live radar view is stale now too
+        notifyListeners();
+      } else if (message.startsWith("MAPRESETERR:")) {
+        _isResettingMap = false;
+        _mapResetError = message.substring("MAPRESETERR:".length);
+        _mapResetOk = false;
         notifyListeners();
       }
     }
@@ -314,6 +337,24 @@ class RobotSocket extends ChangeNotifier {
   void clearMapSaveResult() {
     _mapSaveResult = null;
     _mapSaveError = null;
+    notifyListeners();
+  }
+
+  // ---- SLAM map reset (see _handleMessage for the MAPRESET:/MAPRESETERR: reply)
+  /// Wipes the robot's live mapped area and starts mapping over from scratch.
+  /// Does NOT delete any snapshots already saved to the gallery's MAPS tab.
+  void resetSlamMap() {
+    _isResettingMap = true;
+    _mapResetOk = false;
+    _mapResetError = null;
+    notifyListeners();
+    sendCommand("RESETMAP");
+  }
+
+  /// Call once the reset result has been shown, so it doesn't re-show.
+  void clearMapResetResult() {
+    _mapResetOk = false;
+    _mapResetError = null;
     notifyListeners();
   }
 }

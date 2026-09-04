@@ -34,6 +34,42 @@ class _LidarMapScreenState extends State<LidarMapScreen> {
   // ---- SLAM map save (server-side -- ~/save_slam_map.sh on the Pi via the
   // "SAVEMAP" WebSocket command, distinct from the point-cloud screenshot
   // above which is purely client-side/session-only) ----
+  /// Destructive -- confirm before wiping the robot's mapped area.
+  Future<void> _confirmResetMap(RobotSocket socket) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text("RESET MAPPED AREA?",
+            style: GoogleFonts.rajdhani(
+                color: AppColors.textHi,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1)),
+        content: Text(
+          "This wipes the robot's current SLAM map and starts mapping over "
+          "from scratch.\n\nSnapshots you already saved (Gallery → MAPS) are "
+          "NOT deleted.",
+          style: GoogleFonts.rajdhani(color: AppColors.textLo, fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text("CANCEL",
+                style: GoogleFonts.rajdhani(
+                    color: AppColors.textLo, fontWeight: FontWeight.w700)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text("RESET",
+                style: GoogleFonts.rajdhani(
+                    color: AppColors.offline, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) socket.resetSlamMap();
+  }
+
   void _showSlamSnackBar(bool ok, String text) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -117,6 +153,16 @@ class _LidarMapScreenState extends State<LidarMapScreen> {
               socket.clearMapSaveResult();
             });
           }
+          if (socket.mapResetOk || socket.mapResetError != null) {
+            final ok = socket.mapResetOk;
+            final text = ok
+                ? "Mapped area reset — the robot is mapping from scratch now"
+                : "Couldn't reset the map: ${socket.mapResetError}";
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _showSlamSnackBar(ok, text);
+              socket.clearMapResetResult();
+            });
+          }
           return ListView(
             padding: const EdgeInsets.all(16),
             children: [
@@ -196,8 +242,38 @@ class _LidarMapScreenState extends State<LidarMapScreen> {
                 padding: const EdgeInsets.only(top: 6),
                 child: Text(
                   "Saves the actual SLAM-built map from the robot (slam_toolbox) "
-                  "into its gallery — needs SLAM running on the Pi "
-                  "(slam.launch.py). Different from the radar screenshot above.",
+                  "into its gallery. Different from the radar screenshot above.",
+                  style: GoogleFonts.rajdhani(color: AppColors.textLo, fontSize: 12),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: (!socket.isConnected || socket.isResettingMap)
+                      ? null
+                      : () => _confirmResetMap(socket),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppColors.offline,
+                    side: const BorderSide(color: AppColors.offline),
+                  ),
+                  icon: socket.isResettingMap
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.delete_sweep_outlined),
+                  label: Text(socket.isResettingMap
+                      ? "RESETTING…"
+                      : "RESET MAPPED AREA"),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  "Wipes the robot's current SLAM map and starts mapping over "
+                  "from scratch. Saved snapshots are not deleted.",
                   style: GoogleFonts.rajdhani(color: AppColors.textLo, fontSize: 12),
                 ),
               ),
