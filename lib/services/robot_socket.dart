@@ -52,6 +52,20 @@ class RobotSocket extends ChangeNotifier {
   String get obstacleZone => _obstacleZone;
   double get obstacleDist => _obstacleDist;
 
+  /// True when the robot reports it is boxed in -- forward, reverse AND
+  /// both turn directions all blocked, so its avoidance maneuver has no
+  /// move left to make. Sent as an optional 4th field on the obstacle
+  /// message ("DANGER|zone|dist|BLOCKED"), so older 3-field messages
+  /// still parse fine.
+  bool _pathBlocked = false;
+  bool get pathBlocked => _pathBlocked;
+
+  /// True when connected but the GPS has no fix right now. Uses the fix
+  /// flag rather than lat/lon, because lat/lon keep their LAST known
+  /// value after a fix is lost -- so checking those would wrongly report
+  /// "have GPS" while the signal is actually gone.
+  bool get noGpsSignal => _isConnected && _gpsFix < 1;
+
   // ---- Robot GPS position (gps_node -> /gps -> "G:" over WebSocket) ----
   double? _robotLat;
   double? _robotLon;
@@ -252,10 +266,14 @@ class RobotSocket extends ChangeNotifier {
       _obstacleLevel = "CLEAR";
       _obstacleZone = "";
       _obstacleDist = 0.0;
+      _pathBlocked = false;
     } else {
       _obstacleLevel = level;
       _obstacleZone = parts[1].trim();
       _obstacleDist = double.tryParse(parts[2].trim()) ?? 0.0;
+      // optional 4th field: "BLOCKED" = no escape route at all
+      _pathBlocked =
+          parts.length >= 4 && parts[3].trim().toUpperCase() == "BLOCKED";
     }
     if (_obstacleLevel == "DANGER" && hasGps) {
       _maybeAddObstaclePin(previousLevel);
