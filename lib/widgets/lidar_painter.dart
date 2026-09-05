@@ -32,12 +32,17 @@ class LidarPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
 
     for (var point in points) {
-      // Polar (angle/dist) -> Cartesian. RPLidar 0deg is front; shift -90.
+      // Polar (angle/dist) -> Cartesian. Robot convention (see the zone map
+      // in control_node.py): 0deg = FRONT, 90 = LEFT, 180 = BACK, 270 = RIGHT
+      // -- angles increase counter-clockwise (standard ROS REP-103).
+      // Flutter's canvas has +y pointing DOWN, which flips the handedness, so
+      // dx must be NEGATED -- otherwise left and right come out mirrored
+      // (front/back still look right, which is why this hid for so long).
       double radians = (point.x - 90) * (pi / 180.0);
       double dist = point.y;
       if (dist > 0 && dist < maxRange) {
         double r = dist * scale;
-        double dx = center.dx + r * cos(radians);
+        double dx = center.dx - r * cos(radians); // negated: CCW -> y-down canvas
         double dy = center.dy + r * sin(radians);
         canvas.drawCircle(Offset(dx, dy), 2.5, pointPaint);
       }
