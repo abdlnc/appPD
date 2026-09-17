@@ -1,0 +1,22 @@
+[Unit]
+Description=AGV ROS2 Full System (B.I.T.S.)
+# Start after the network + multi-user are up; the app connects over WiFi to the
+# bridge WebSocket (:8765), and USB lidar / serial GPS need time to enumerate.
+After=multi-user.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+# systemd does not reliably set HOME -- pin it so $HOME works in the wrapper.
+Environment=HOME=/home/admin
+WorkingDirectory=/home/admin
+# give USB lidar + serial GPS a few seconds to come up at boot
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/admin/start_agv.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
