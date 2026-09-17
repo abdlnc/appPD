@@ -7,6 +7,7 @@ import '../services/robot_socket.dart';
 import '../theme/app_theme.dart';
 import '../widgets/lidar_painter.dart';
 import '../widgets/obstacle_warning.dart';
+import '../widgets/detection_overlay.dart';
 import 'map_screen.dart';
 import 'gallery_screen.dart';
 import 'lidar_map_screen.dart';
@@ -141,6 +142,17 @@ class _ControlScreenState extends State<ControlScreen> {
                     ),
                   ),
           ),
+          // LAYER 1.5: AI detection boxes over the live camera. Deliberately
+          // only when there IS a camera feed -- boxes over the "no feed"
+          // placeholder would be meaningless.
+          if (hasCamera)
+            Positioned.fill(
+              child: DetectionOverlay(
+                boxes: socket.detectionBoxes,
+                frameAspect: socket.detectionFrameAspect,
+                age: socket.detectionAge,
+              ),
+            ),
           // LAYER 2: Lidar radar overlay -- only over the empty/no-camera state
           if (!hasCamera)
             Positioned.fill(
