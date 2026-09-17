@@ -52,6 +52,39 @@ class RobotSocket extends ChangeNotifier {
   String get obstacleZone => _obstacleZone;
   double get obstacleDist => _obstacleDist;
 
+  // ---- AI detection boxes ("B:<fw>,<fh>|x1,y1,x2,y2,conf;...") ----------
+  // Corners are normalised 0-1 against the frame the model inferred on, so
+  // they scale onto the video widget at any size.
+  //
+  // IMPORTANT: these are NOT live. Inference takes 1.1-1.7s on the Pi and only
+  // runs every ~3s, so a box is always at least a second behind the video and
+  // can be several seconds old. Running the model per-frame is not possible --
+  // 12fps needs 83ms/frame, inference needs 1100-1700ms. So we surface the age
+  // (detectionAge) and drop boxes entirely past _boxMaxAge rather than leaving
+  // them floating over a scene they no longer match.
+  List<List<double>> _boxes = []; // each: [x1, y1, x2, y2, conf] normalised
+  double _boxFrameAspect = 4 / 3; // source frame aspect, for BoxFit.cover math
+  DateTime? _boxesAt;
+  static const Duration _boxMaxAge = Duration(seconds: 6);
+
+  /// Boxes from the most recent inference, or empty once too stale to trust.
+  List<List<double>> get detectionBoxes {
+    final at = _boxesAt;
+    if (at == null) return const [];
+    if (DateTime.now().difference(at) > _boxMaxAge) return const [];
+    return _boxes;
+  }
+
+  /// How old the currently-shown boxes are, or null if there are none.
+  Duration? get detectionAge {
+    final at = _boxesAt;
+    if (at == null || _boxes.isEmpty) return null;
+    final age = DateTime.now().difference(at);
+    return age > _boxMaxAge ? null : age;
+  }
+
+  double get detectionFrameAspect => _boxFrameAspect;
+
   /// True when the robot reports it is boxed in -- forward, reverse AND
   /// both turn directions all blocked, so its avoidance maneuver has no
   /// move left to make. Sent as an optional 4th field on the obstacle
@@ -197,6 +230,10 @@ class RobotSocket extends ChangeNotifier {
       else if (message.startsWith("O:")) {
         _parseObstacle(message.substring(2));
       }
+      // 3b. AI detection boxes (B:)
+      else if (message.startsWith("B:")) {
+        _parseBoxes(message.substring(2));
+      }
       // 4. GPS Position (G:)
       else if (message.startsWith("G:")) {
         _parseGps(message.substring(2));
@@ -227,6 +264,33 @@ class RobotSocket extends ChangeNotifier {
         notifyListeners();
       }
     }
+  }
+
+  void _parseBoxes(String data) {
+    // "<fw>,<fh>|x1,y1,x2,y2,conf;..."  -- empty list after '|' is valid and
+    // means "model looked and saw nothing", so clear rather than keep stale.
+    final bar = data.indexOf('|');
+    if (bar < 0) return;
+    final dims = data.substring(0, bar).split(',');
+    if (dims.length >= 2) {
+      final fw = double.tryParse(dims[0]);
+      final fh = double.tryParse(dims[1]);
+      if (fw != null && fh != null && fh > 0) _boxFrameAspect = fw / fh;
+    }
+    final body = data.substring(bar + 1).trim();
+    final out = <List<double>>[];
+    if (body.isNotEmpty) {
+      for (final b in body.split(';')) {
+        final v = b.split(',');
+        if (v.length < 5) continue;
+        final nums = v.map(double.tryParse).toList();
+        if (nums.any((n) => n == null)) continue;
+        out.add([nums[0]!, nums[1]!, nums[2]!, nums[3]!, nums[4]!]);
+      }
+    }
+    _boxes = out;
+    _boxesAt = DateTime.now();
+    notifyListeners();
   }
 
   void _parseGps(String data) {
