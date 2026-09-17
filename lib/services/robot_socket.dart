@@ -61,9 +61,9 @@ class RobotSocket extends ChangeNotifier {
   bool get pathBlocked => _pathBlocked;
 
   /// True when connected but the GPS has no fix right now. Uses the fix
-  /// flag rather than lat/lon, because lat/lon keep their LAST known
-  /// value after a fix is lost -- so checking those would wrongly report
-  /// "have GPS" while the signal is actually gone.
+  /// flag directly rather than hasGps below -- functionally the same now
+  /// that _parseGps clears lat/lon on fix loss, but this is the more
+  /// direct signal and doesn't depend on that staying true elsewhere.
   bool get noGpsSignal => _isConnected && _gpsFix < 1;
 
   // ---- Robot GPS position (gps_node -> /gps -> "G:" over WebSocket) ----
@@ -251,7 +251,20 @@ class RobotSocket extends ChangeNotifier {
       if (p.length >= 5) _gpsFix = int.tryParse(p[4]) ?? _gpsFix;
       if (p.length >= 6) _gpsSats = int.tryParse(p[5]) ?? _gpsSats;
     } else {
-      // acquiring (no fix yet) -> just track satellites in view for the UI
+      // Acquiring / fix LOST -> CLEAR lat/lon/heading rather than holding the
+      // last value. Without this, hasGps (which only checks lat/lon != null)
+      // stays true forever after the first fix, so losing signal kept
+      // showing "GPS detected": the status badge, the robot's marker on
+      // map_screen (frozen at its last real position instead of
+      // disappearing), and _maybeAddObstaclePin below (which would keep
+      // dropping pins at that stale position on every DANGER reading) all
+      // silently kept using data from before the signal was lost. Same fix
+      // already applied Pi-side for this exact pattern in nav_node.py,
+      // camera_node.py and soil_camera_node.py -- a stale position is worse
+      // than an honest "no fix".
+      _robotLat = null;
+      _robotLon = null;
+      _hasHeading = false;
       _gpsFix = 0;
       if (p.length >= 6) _gpsSatsView = int.tryParse(p[5]) ?? _gpsSatsView;
     }
