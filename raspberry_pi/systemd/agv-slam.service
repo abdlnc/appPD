@@ -1,0 +1,38 @@
+[Unit]
+Description=AGV SLAM mapping (slam_toolbox) (B.I.T.S.)
+# Deliberately a SEPARATE unit from agv.service, not bundled into
+# agv_autostart.launch.py: slam_toolbox (this build) has no "reset map"
+# service, so the only way to clear the map is restarting the node. Keeping
+# it separate means the app's RESET MAPPED AREA button can restart JUST this
+# unit without dropping the app's WebSocket connection / camera / motors.
+#
+# Needs agv.service's sllidar_node publishing /scan -- SLAM does NOT open the
+# Lidar itself (a second Lidar driver would fight over the serial port).
+#
+# Wants= (pull-in) but deliberately NO After=agv.service: agv.service itself
+# declares After=multi-user.target, so ordering after it would transitively
+# order this unit after multi-user.target -- while multi-user.target is also
+# what pulls this unit in. That is an ordering CYCLE, and systemd resolves it
+# by silently DELETING this unit's start job (symptom: never starts at boot,
+# zero journal entries, "Found ordering cycle on agv-slam.service/start").
+# No ordering is needed anyway: ROS2 subscriptions do not care about start
+# order, slam_toolbox just waits for /scan to appear.
+Wants=agv.service
+
+[Service]
+Type=simple
+User=admin
+# systemd does not reliably set HOME -- pin it so $HOME works in the wrapper.
+Environment=HOME=/home/admin
+WorkingDirectory=/home/admin
+# brief settle only -- ROS2 subscriptions do not care about start order, so
+# SLAM can come up before /scan exists; it just waits. Kept short so the
+# app RESET MAPPED AREA button responds quickly.
+ExecStartPre=/bin/sleep 2
+ExecStart=/home/admin/start_slam.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
