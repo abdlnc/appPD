@@ -27,6 +27,7 @@ NO colcon build needed. Run:
 """
 
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -46,6 +47,21 @@ STEER_FULL_DEG = 45.0      # heading error that maps to full steer
 CRUISE_SPEED = 0.80        # forward speed when roughly aligned
 TURN_SPEED = 0.40          # forward speed while correcting heading
 LOOP_HZ = 5.0
+
+# ---- camera caution (deep-learning model) ----
+# Mirrors control_node.py's camera caution, for NAV mode. The camera can only
+# SLOW the robot, never stop or steer it: inference is ~3s/frame, so a
+# detection is 3-4s stale by arrival -- far too late to brake with, but
+# perfectly good for giving the Lidar (which IS fast enough) more reaction
+# distance. It also covers what a single 2D Lidar slice misses: low rocks,
+# tools on the ground, sparse seedlings.
+# Fail-safe: caution needs a FRESH detection, so if ai_detector_node is not
+# running the TTL lapses and NAV behaves exactly as it does today.
+# Keep these in step with control_node.py's copies (separate processes, so
+# they cannot share one constant).
+CAM_CAUTION_SPEED = 0.35   # forward speed while the model sees an obstacle
+CAM_MIN_CONF = 0.40        # ignore the model's marginal detections
+CAM_TTL = 4.0              # s; must exceed ai_detector's AI_MIN_INTERVAL (3s)
 
 # ---- obstacle (Lidar) ----
 ANGLE_OFFSET_DEG = 180.0   # lidar mounted rotated 180 (matches control_node)
@@ -82,6 +98,7 @@ class NavNode(Node):
         self.create_subscription(String, '/gps', self.gps_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.create_subscription(String, '/mode', self.mode_cb, 10)
+        self.create_subscription(String, '/ai_detections', self.ai_cb, 10)
 
         self.mode = "STOP"
         self.target = None              # (lat, lon)
@@ -89,6 +106,10 @@ class NavNode(Node):
         self.lon = None
         self.heading = None             # deg, or None if unknown
         self.front_dist = 9999.0
+        # camera caution state (see the constants above)
+        self._cam_time = 0.0
+        self._cam_conf = 0.0
+        self._was_cautious = False
         self.left_dist = 9999.0
         self.right_dist = 9999.0
         self._arrived_logged = False
@@ -149,6 +170,43 @@ class NavNode(Node):
         self.left_dist = min(left) if left else 9999.0
         self.right_dist = min(right) if right else 9999.0
 
+    def ai_cb(self, msg):
+        """ai_detector_node's "<count>|Obstacle:<conf>,..." -- count + best
+        confidence only."""
+        try:
+            head, _, tail = msg.data.strip().partition('|')
+            count = int(head)
+        except ValueError:
+            return
+        if count <= 0:
+            return
+        best = 0.0
+        for item in tail.split(','):
+            _, _, c = item.rpartition(':')
+            try:
+                best = max(best, float(c))
+            except ValueError:
+                continue
+        if best < CAM_MIN_CONF:
+            return
+        self._cam_time = time.time()
+        self._cam_conf = best
+
+    def cap_speed(self, v):
+        """Clamp a FORWARD speed to CAM_CAUTION_SPEED while the camera sees
+        an obstacle. Only ever lowers it -- reverse/stop/turn commands and
+        anything already slower pass through untouched."""
+        cautious = (time.time() - self._cam_time) < CAM_TTL
+        if cautious != self._was_cautious:
+            self._was_cautious = cautious
+            if cautious:
+                self.get_logger().warn(
+                    "CAMERA obstacle (conf %.2f) -- capping NAV speed at %.2f"
+                    % (self._cam_conf, CAM_CAUTION_SPEED))
+            else:
+                self.get_logger().info("camera clear -- NAV speed uncapped")
+        return min(v, CAM_CAUTION_SPEED) if (cautious and v > 0.0) else v
+
     def send(self, lx, az):
         t = Twist()
         t.linear.x = float(max(-1.0, min(1.0, lx)))
@@ -193,7 +251,7 @@ class NavNode(Node):
         err = norm180(brg - self.heading)          # + = target to the RIGHT
         steer = max(-1.0, min(1.0, -err / STEER_FULL_DEG))  # +angular.z = LEFT
         speed = CRUISE_SPEED if abs(err) < HEADING_TOL else TURN_SPEED
-        self.send(speed, steer)
+        self.send(self.cap_speed(speed), steer)
 
 
 def main():

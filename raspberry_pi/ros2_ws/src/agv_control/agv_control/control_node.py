@@ -3,8 +3,9 @@
 AGV Control Node  (ROS2 / rclpy)  --  AUTONOMOUS DECISION ONLY (no GPIO).
 
 Subscribes:
-    /scan  (sensor_msgs/LaserScan)
-    /mode  (std_msgs/String)        only acts while mode == "AUTO"
+    /scan           (sensor_msgs/LaserScan)
+    /mode           (std_msgs/String)   only acts while mode == "AUTO"
+    /ai_detections  (std_msgs/String)   camera caution (see CAMERA CAUTION)
 
 Publishes:
     /cmd_vel (geometry_msgs/Twist)  linear.x = throttle (-1..1),
@@ -13,6 +14,30 @@ Publishes:
 Bins the scan into 6 zones and runs reactive obstacle avoidance. A 10 Hz timer
 streams the current command so the motor_node's command watchdog stays fed.
 Reactive logic ported from agv_main.py.
+
+CAMERA CAUTION (deep-learning model feeding into the driving decision)
+----------------------------------------------------------------------
+The Lidar remains the sole authority on STOPPING and on which way to turn.
+The camera can only ever do one thing here: make the robot DRIVE SLOWER.
+
+Why it is limited to that: inference takes ~3s per frame (AI_MIN_INTERVAL),
+so by the time a detection arrives it describes the world 3-4s ago. At
+FWD_SPEED the robot has already travelled well past MIN_DIST_FRONT in that
+time, so a camera detection is far too late to be a stop trigger -- treating
+it as one would give the illusion of camera safety while actually braking
+for things that are no longer there. Slowing down, by contrast, is useful
+precisely because it is not time-critical: it buys back reaction distance
+for the Lidar, which IS fast enough to stop.
+
+What this gains: the Lidar is a single 2D slice at mount height, so a trowel
+on the ground, a low rock or a sparse seedling can return almost nothing to
+/scan while being obvious to the model. Those now at least slow the robot.
+
+Fail-safe by construction: caution needs a FRESH detection (within CAM_TTL).
+If ai_detector_node is not running, dies, or simply sees nothing, no
+messages arrive, the TTL expires and the speed returns to FWD_SPEED -- i.e.
+exactly today's Lidar-only behaviour. The camera cannot hold the robot
+still, cannot steer it, and cannot trigger or clear the boxed-in hold.
 """
 
 import math
@@ -46,6 +71,22 @@ FWD_SPEED  = 0.60
 REV_SPEED  = 0.60
 TURN_SPEED = 0.50
 
+# ----------- Camera caution (deep-learning model) -----------
+# Cruise speed used INSTEAD of FWD_SPEED while the model currently sees an
+# obstacle ahead. Deliberately not a stop: see CAMERA CAUTION in the header.
+# Effective duty = CAM_CAUTION_SPEED * motor_node's SPEED_SCALE (0.60).
+CAM_CAUTION_SPEED = 0.35
+# Minimum confidence of the model's BEST box before it slows the robot.
+# Higher than ai_detector_node's CONF_THRES (0.25) on purpose: ordinary
+# scenery produces a trickle of marginal 0.25-0.42 detections, and honouring
+# those would leave the robot crawling permanently in a planted field.
+CAM_MIN_CONF = 0.40
+# How long one detection keeps the robot cautious. Must comfortably exceed
+# ai_detector_node's AI_MIN_INTERVAL (3.0s) or caution would flicker off
+# between consecutive inferences of the same obstacle. This is also the
+# fail-safe: nothing arriving for this long = full speed again.
+CAM_TTL = 4.0
+
 # ----------- Obstacle WARNING thresholds (meters) -----------
 WARN_CAUTION = 1.00     # yellow: heads-up
 WARN_DANGER  = 0.60     # red: very close
@@ -73,10 +114,17 @@ class AGVControl(Node):
         self.blocked_hold = False   # True = boxed in, refuse to drive
         self._clear_scans = 0       # consecutive clear scans while held
 
+        # --- camera caution (see CAMERA CAUTION in the header) ---
+        self._cam_time = 0.0        # when the last qualifying detection arrived
+        self._cam_conf = 0.0        # its best-box confidence
+        self._cam_count = 0         # how many boxes that detection had
+        self._was_cautious = False  # edge-trigger guard for the log line
+
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.obstacle_pub = self.create_publisher(String, '/obstacle', 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.create_subscription(String, '/mode', self.mode_cb, 10)
+        self.create_subscription(String, '/ai_detections', self.ai_cb, 10)
         self.create_timer(0.1, self.tick)      # 10 Hz command stream
 
         self.get_logger().info(
@@ -111,6 +159,58 @@ class AGVControl(Node):
             self.pub.publish(Twist())
             return
         self.pub.publish(self.cmd)
+
+    # ----------------------- camera caution -----------------------
+    def ai_cb(self, msg: String):
+        """ai_detector_node's "<count>|Obstacle:<conf>,Obstacle:<conf>,..."
+
+        Only the count and the BEST confidence are used. The class name is
+        already "Obstacle" for every box by the time it gets here (the model's
+        real 24 classes are overwritten in ai_detector_node), so there is no
+        per-class policy to apply -- every detection is treated the same.
+        """
+        raw = msg.data.strip()
+        try:
+            head, _, tail = raw.partition('|')
+            count = int(head)
+        except ValueError:
+            return                      # malformed -> ignore, stay uncautious
+        if count <= 0:
+            return                      # nothing seen; let the TTL lapse
+        best = 0.0
+        for item in tail.split(','):
+            _, _, c = item.rpartition(':')
+            try:
+                best = max(best, float(c))
+            except ValueError:
+                continue
+        if best < CAM_MIN_CONF:
+            return                      # too marginal to slow down for
+        self._cam_time = time.time()
+        self._cam_conf = best
+        self._cam_count = count
+
+    def camera_caution(self):
+        """True while a FRESH, confident camera detection should slow us."""
+        return (time.time() - self._cam_time) < CAM_TTL
+
+    def cruise_speed(self):
+        """FWD_SPEED normally; CAM_CAUTION_SPEED while the model sees
+        something ahead. This is the ONLY place the camera influences
+        driving."""
+        cautious = self.camera_caution()
+        if cautious != self._was_cautious:
+            self._was_cautious = cautious
+            if cautious:
+                self.get_logger().warn(
+                    f"CAMERA sees {self._cam_count} obstacle(s) "
+                    f"(conf {self._cam_conf:.2f}) -- slowing "
+                    f"{FWD_SPEED:.2f} -> {CAM_CAUTION_SPEED:.2f}")
+            else:
+                self.get_logger().info(
+                    f"camera clear for {CAM_TTL:.0f}s -- back to "
+                    f"{FWD_SPEED:.2f}")
+        return CAM_CAUTION_SPEED if cautious else FWD_SPEED
 
     # ----------------------- scan processing -----------------------
     def scan_cb(self, msg: LaserScan):
@@ -168,7 +268,10 @@ class AGVControl(Node):
             threading.Thread(target=self.avoid, args=(dict(z),),
                              daemon=True).start()
         else:
-            self.set_cmd(FWD_SPEED, 0.0)        # cruise forward, centered
+            # cruise forward, centered -- at reduced speed if the camera
+            # currently sees an obstacle (avoid() speeds are left alone:
+            # those maneuvers are already slow and Lidar-governed).
+            self.set_cmd(self.cruise_speed(), 0.0)
 
     # ----------------------- no-way-out detection -----------------------
     def path_blocked(self):

@@ -80,6 +80,20 @@ SAVE_MAP_TIMEOUT  = 35.0   # s; bounds save_slam_map.sh's own internal retries
 # unchanged across an agv-slam restart.
 RESET_MAP_CMD     = ["sudo", "-n", "systemctl", "restart", "agv-slam.service"]
 RESET_MAP_TIMEOUT = 30.0   # s; the unit itself settles in ~2s, this is just a bound
+
+# Top forward/reverse speed for MANUAL driving, as a fraction of full stick.
+# Set to match AUTO mode's cruise speed (control_node.py's FWD_SPEED = 0.60)
+# so the robot drives at the same pace whether a human or the obstacle
+# avoidance is steering -- client request. Without it, full stick sent 1.0
+# and manual was noticeably FASTER than AUTO.
+# This scales the stick rather than clipping it, so the full throw still maps
+# smoothly onto 0..MANUAL_SPEED instead of going dead past 60%.
+# Kept as its own constant because bridge_node can't import control_node's:
+# they are separate nodes in separate processes. If FWD_SPEED changes there,
+# change this too. NAV mode is deliberately different (nav_node.py's
+# CRUISE_SPEED = 0.80) -- set 0.80 here instead to match NAV.
+# Steering (angular.z) is NOT scaled: it's an angle, not a speed.
+MANUAL_SPEED = 0.60
                             # (map_saver_cli can transiently fail right after
                             # a restart -- the script retries up to 3x itself)
 
@@ -159,7 +173,7 @@ class BridgeNode(Node):
     def set_manual(self, x, y):
         # joystick screen coords -> ROS: forward = -y, left = -x
         t = Twist()
-        t.linear.x = max(-1.0, min(1.0, -y))
+        t.linear.x = max(-1.0, min(1.0, -y)) * MANUAL_SPEED
         t.angular.z = max(-1.0, min(1.0, -x))
         self.manual_cmd = t
 
