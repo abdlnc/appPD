@@ -3,10 +3,12 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
+import 'package:latlong2/latlong.dart';
+import '../models/geo_image.dart';
+import '../services/gallery_api.dart';
 import '../services/robot_socket.dart';
 import '../theme/app_theme.dart';
-
-const int _galleryPort = 8080; // gallery_server.py on the Pi
+import 'map_screen.dart';
 
 /// One entry from gallery_server.py's `/list/<kind>` response.
 class GalleryImage {
@@ -23,6 +25,15 @@ class GalleryImage {
 
   DateTime get time =>
       DateTime.fromMillisecondsSinceEpoch((mtime * 1000).round());
+
+  /// Capture time + GPS position, parsed out of the filename (the Pi encodes
+  /// both there -- see GeoImage). Null for anything that isn't one of the
+  /// robot's photos, e.g. a saved SLAM map.
+  GeoImage? get geo => GeoImage.parse(name);
+
+  /// Prefer the filename's stamp over the file's mtime: mtime changes when
+  /// the folder is copied or synced, the stamp is when the photo was taken.
+  DateTime get captureTime => geo?.time ?? time;
 }
 
 /// Saved-images viewer: raw camera captures + AI-annotated detections +
@@ -124,7 +135,7 @@ class _GalleryGridState extends State<_GalleryGrid>
 
   Future<List<GalleryImage>> _load() async {
     final uri =
-        Uri.parse('http://${widget.ip}:$_galleryPort/list/${widget.kind}');
+        Uri.parse('http://${widget.ip}:$kGalleryPort/list/${widget.kind}');
     final res = await http.get(uri).timeout(const Duration(seconds: 6));
     if (res.statusCode != 200) {
       throw Exception('Gallery server returned HTTP ${res.statusCode}');
@@ -142,7 +153,7 @@ class _GalleryGridState extends State<_GalleryGrid>
   }
 
   String _imgUrl(GalleryImage img) =>
-      'http://${widget.ip}:$_galleryPort/img/${widget.kind}/${img.name}';
+      'http://${widget.ip}:$kGalleryPort/img/${widget.kind}/${img.name}';
 
   @override
   Widget build(BuildContext context) {
@@ -199,7 +210,10 @@ class _GalleryGridState extends State<_GalleryGrid>
                 ),
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: Image.network(
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Image.network(
                     url,
                     fit: BoxFit.cover,
                     loadingBuilder: (context, child, progress) =>
@@ -216,11 +230,21 @@ class _GalleryGridState extends State<_GalleryGrid>
                                   ),
                                 ),
                               ),
-                    errorBuilder: (context, error, stack) => Container(
-                      color: AppColors.surfaceHi,
-                      child:
-                          const Icon(Icons.broken_image, color: AppColors.textLo),
-                    ),
+                        errorBuilder: (context, error, stack) => Container(
+                          color: AppColors.surfaceHi,
+                          child: const Icon(Icons.broken_image,
+                              color: AppColors.textLo),
+                        ),
+                      ),
+                      // Geotag badge: at a glance, which photos carry a
+                      // position and can therefore appear on the map.
+                      if (images[i].geo != null)
+                        Positioned(
+                          left: 4,
+                          bottom: 4,
+                          child: _GeoBadge(geo: images[i].geo!),
+                        ),
+                    ],
                   ),
                 ),
               );
@@ -303,6 +327,28 @@ class _ImageViewerState extends State<_ImageViewer> {
         title: Text(img.name,
             overflow: TextOverflow.ellipsis,
             style: GoogleFonts.rajdhani(fontSize: 15)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.place_outlined),
+            tooltip: (img.geo?.hasFix ?? false)
+                ? "Show where this was taken"
+                : "No GPS fix for this photo",
+            // Disabled rather than hidden: a greyed-out pin tells you the
+            // photo has no position, which is information; a missing button
+            // just looks like the feature is broken.
+            onPressed: (img.geo?.hasFix ?? false)
+                ? () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => MapScreen(
+                          focus: LatLng(img.geo!.lat!, img.geo!.lon!),
+                          focusLabel: img.name,
+                        ),
+                      ),
+                    )
+                : null,
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -334,10 +380,82 @@ class _ImageViewerState extends State<_ImageViewer> {
             width: double.infinity,
             padding: const EdgeInsets.symmetric(vertical: 10),
             color: const Color(0xFF111111),
-            child: Text(
-              "${_index + 1} / ${widget.images.length}   •   ${_fmtTime(img.time)}",
-              textAlign: TextAlign.center,
-              style: GoogleFonts.rajdhani(color: Colors.white70),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  "${_index + 1} / ${widget.images.length}   •   "
+                  "${_fmtTime(img.captureTime)}",
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.rajdhani(color: Colors.white70),
+                ),
+                if (img.geo != null) ...[
+                  const SizedBox(height: 2),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        img.geo!.hasFix
+                            ? Icons.place
+                            : Icons.location_disabled,
+                        size: 14,
+                        color: img.geo!.hasFix
+                            ? AppColors.lime
+                            : Colors.white30,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        img.geo!.coordLabel,
+                        style: GoogleFonts.rajdhani(
+                          color: img.geo!.hasFix
+                              ? AppColors.lime
+                              : Colors.white38,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+/// Small overlay on a gallery thumbnail: does this photo carry a position?
+class _GeoBadge extends StatelessWidget {
+  final GeoImage geo;
+  const _GeoBadge({required this.geo});
+
+  @override
+  Widget build(BuildContext context) {
+    final fix = geo.hasFix;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            fix ? Icons.place : Icons.location_disabled,
+            size: 11,
+            color: fix ? AppColors.lime : Colors.white38,
+          ),
+          const SizedBox(width: 3),
+          Text(
+            "${geo.time.hour.toString().padLeft(2, '0')}:"
+            "${geo.time.minute.toString().padLeft(2, '0')}",
+            style: GoogleFonts.rajdhani(
+              color: Colors.white,
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
             ),
           ),
         ],

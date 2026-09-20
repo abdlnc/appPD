@@ -12,6 +12,9 @@ stack.
 
 Endpoints:
     GET /list/captures    -> JSON array of {name,size,mtime}, newest first
+                             (newest MAX_LIST by default; ?limit=N for more,
+                             which the app's map screen uses so older
+                             geotagged photos still appear on the field map)
     GET /list/detections  -> same, for ~/agv_detections
     GET /list/soil        -> same, for ~/agv_soil_images (soil_camera_node.py)
     GET /list/maps        -> same, for ~/agv_maps (save_slam_map.sh's .png output;
@@ -28,9 +31,15 @@ NO colcon build. Run:
 import os
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 PORT = 8080
-MAX_LIST = 200                  # newest N images per folder (avoid huge payloads)
+MAX_LIST = 200                  # default: newest N images per folder
+# The map screen needs EVERY geotagged photo, not just the newest 200, or
+# older runs silently vanish from the field map. It asks for a bigger slice
+# with /list/<kind>?limit=N. Capped so a malformed request can't ask the Pi
+# to serialize an unbounded directory listing.
+MAX_LIST_CAP = 5000
 ALLOWED_EXT = (".jpg", ".jpeg", ".png")
 
 DIRS = {
@@ -47,7 +56,7 @@ DIRS = {
 CONTENT_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 
 
-def _list_dir(path):
+def _list_dir(path, limit=MAX_LIST):
     if not os.path.isdir(path):
         return []
     entries = []
@@ -61,7 +70,7 @@ def _list_dir(path):
             continue
         entries.append({"name": name, "size": st.st_size, "mtime": st.st_mtime})
     entries.sort(key=lambda e: e["mtime"], reverse=True)
-    return entries[:MAX_LIST]
+    return entries[:limit]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -78,13 +87,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parts = [p for p in self.path.split("?")[0].split("/") if p]
+        query = parse_qs(urlparse(self.path).query)
 
         if len(parts) == 2 and parts[0] == "list":
             kind = parts[1]
             if kind not in DIRS:
                 self._send_json({"error": "unknown kind"}, 404)
                 return
-            self._send_json(_list_dir(DIRS[kind]))
+            # ?limit=N -- opt-in bigger listing (see MAX_LIST_CAP). Anything
+            # unparseable falls back to the default rather than erroring.
+            limit = MAX_LIST
+            try:
+                limit = max(1, min(MAX_LIST_CAP, int(query.get("limit", [MAX_LIST])[0])))
+            except (ValueError, TypeError):
+                pass
+            self._send_json(_list_dir(DIRS[kind], limit))
             return
 
         if len(parts) == 3 and parts[0] == "img":

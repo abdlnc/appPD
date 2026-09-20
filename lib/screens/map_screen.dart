@@ -4,6 +4,8 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../models/geo_image.dart';
+import '../services/gallery_api.dart';
 import '../services/robot_socket.dart';
 import '../theme/app_theme.dart';
 
@@ -11,7 +13,11 @@ import '../theme/app_theme.dart';
 /// - GO starts navigation and shows a live NAVIGATING state + STOP button.
 /// - The map FOLLOWS the robot so the arrow always stays on the real GPS.
 class MapScreen extends StatefulWidget {
-  const MapScreen({super.key});
+  /// Optional: open centred on one spot (used by the gallery's
+  /// "show where this was taken" action).
+  final LatLng? focus;
+  final String? focusLabel;
+  const MapScreen({super.key, this.focus, this.focusLabel});
   @override
   State<MapScreen> createState() => _MapScreenState();
 }
@@ -35,6 +41,21 @@ class _MapScreenState extends State<MapScreen> {
   static const int _trailMaxPoints = 5000; // cap so the list can't grow forever
   static const double _trailMaxJumpM = 40.0; // ignore isolated GPS spikes
 
+  // --- Geotagged photo pins (objective: map captured images to lat/lon) ---
+  // Loaded over HTTP from gallery_server.py, NOT over the robot's WebSocket:
+  // these are files on disk, so they are fetched on demand rather than
+  // streamed while driving.
+  PhotoIndex _photoIndex = PhotoIndex.empty;
+  List<PhotoCluster> _photoPins = [];
+  bool _showPhotos = true;
+  bool _photosLoading = false;
+  String? _photoError;
+  bool _photosRequested = false;
+  // Photos within this distance share one pin. The robot saves a soil image
+  // every 60s, so a session leaves hundreds; one marker each would bury the
+  // map, and while it is stationary they all land on the same spot anyway.
+  static const double _photoClusterM = 2.0;
+
   static const double _arrivalM = 3.0;
   static const LatLng _fallback = LatLng(14.7481338, 121.0616677);
 
@@ -53,6 +74,17 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    if (widget.focus != null) {
+      // Opened to show ONE photo's location: don't let the first GPS fix or
+      // the follow-the-robot behaviour yank the camera away from it.
+      _firstFix = true;
+      _follow = false;
+    }
+  }
+
+  @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final s = context.read<RobotSocket>();
@@ -61,7 +93,51 @@ class _MapScreenState extends State<MapScreen> {
       _socket = s;
       _socket!.addListener(_onTrailUpdate);
     }
+    if (!_photosRequested && s.hostIp != null) {
+      _photosRequested = true;
+      _loadPhotos();
+    }
   }
+
+  /// Fetch the photo list and turn it into map pins.
+  ///
+  /// Deliberately manual (on open + refresh button) rather than polled: the
+  /// list only changes when the robot saves a photo, and polling would eat
+  /// bandwidth shared with the live camera feed.
+  Future<void> _loadPhotos() async {
+    final ip = _socket?.hostIp;
+    if (ip == null || _photosLoading) return;
+    setState(() {
+      _photosLoading = true;
+      _photoError = null;
+    });
+    try {
+      final idx = await fetchPhotoIndex(ip);
+      if (!mounted) return;
+      setState(() {
+        _photoIndex = idx;
+        _photoPins = clusterPhotos(
+          idx.photos.map((p) => p.geo).toList(),
+          radiusM: _photoClusterM,
+        );
+        _photosLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      // Pins are an extra layer: if the gallery server is unreachable the map
+      // keeps working on live WebSocket data alone.
+      setState(() {
+        _photoError = e.toString();
+        _photosLoading = false;
+      });
+    }
+  }
+
+  /// Which kind a photo came from, so its thumbnail can be fetched.
+  String _kindOf(GeoImage g) => _photoIndex.photos
+      .firstWhere((p) => p.geo.name == g.name,
+          orElse: () => GalleryPhoto(g, g.kind == 'soil' ? 'soil' : 'captures'))
+      .kind;
 
   @override
   void dispose() {
@@ -205,6 +281,29 @@ class _MapScreenState extends State<MapScreen> {
       }
     }
 
+    if (_showPhotos) {
+      for (final pin in _photoPins) {
+        markers.add(Marker(
+          point: LatLng(pin.lat, pin.lon),
+          width: 34,
+          height: 34,
+          child: GestureDetector(
+            onTap: () => _showPhotoPin(pin),
+            child: _PhotoPinIcon(cluster: pin),
+          ),
+        ));
+      }
+    }
+    if (widget.focus != null) {
+      markers.add(Marker(
+        point: widget.focus!,
+        width: 46,
+        height: 46,
+        child: const Icon(Icons.my_location,
+            color: Color(0xFF22D3EE), size: 40),
+      ));
+    }
+
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(
@@ -237,6 +336,31 @@ class _MapScreenState extends State<MapScreen> {
             onPressed: () => setState(() => _showObstacles = !_showObstacles),
           ),
           IconButton(
+            icon: _photosLoading
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: AppColors.lime),
+                  )
+                : Icon(Icons.photo_camera_outlined,
+                    color: _photoError != null
+                        ? const Color(0xFFFFB300)
+                        : (_showPhotos ? AppColors.lime : Colors.white38)),
+            tooltip: _photoError != null
+                ? "Photo pins unavailable - tap to retry"
+                : (_showPhotos
+                    ? "Hide photo pins (${_photoPins.length})"
+                    : "Show photo pins"),
+            onPressed: () {
+              if (_photoError != null || _photoPins.isEmpty) {
+                _loadPhotos();
+              } else {
+                setState(() => _showPhotos = !_showPhotos);
+              }
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.layers_clear),
             tooltip: "Clear trail & obstacle pins",
             onPressed: (_trail.isEmpty && socket.obstaclePins.isEmpty)
@@ -258,7 +382,7 @@ class _MapScreenState extends State<MapScreen> {
           FlutterMap(
             mapController: _map,
             options: MapOptions(
-              initialCenter: robot ?? _fallback,
+              initialCenter: widget.focus ?? robot ?? _fallback,
               initialZoom: 18,
               onTap: (tapPos, point) => setState(() {
                 _waypoint = point;
@@ -298,6 +422,39 @@ class _MapScreenState extends State<MapScreen> {
             ],
           ),
           Positioned(top: 10, left: 10, right: 10, child: _gpsCard(socket)),
+          // Photos that exist but carry no position. Stated explicitly:
+          // if they just silently vanished from the map it would look like
+          // a bug rather than the honest "there was no fix at that moment".
+          if (_showPhotos && _photoIndex.noFixCount > 0)
+            Positioned(
+              top: 96,
+              right: 10,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppColors.surface.withValues(alpha: 0.88),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.location_disabled,
+                        size: 13, color: Color(0xFFFFB300)),
+                    const SizedBox(width: 5),
+                    Text(
+                      "${_photoIndex.noFixCount} photo"
+                      "${_photoIndex.noFixCount == 1 ? '' : 's'} without GPS",
+                      style: GoogleFonts.rajdhani(
+                          color: AppColors.textLo,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           Positioned(
             bottom: 0,
             left: 0,
@@ -306,6 +463,96 @@ class _MapScreenState extends State<MapScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  /// Tapping a photo pin: what was photographed here, and when.
+  void _showPhotoPin(PhotoCluster cluster) {
+    final ip = _socket?.hostIp;
+    if (ip == null) return;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) {
+        final imgs = cluster.images;
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.place, color: AppColors.lime, size: 18),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        cluster.cover.coordLabel,
+                        style: GoogleFonts.rajdhani(
+                          color: AppColors.textHi,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      imgs.length == 1 ? "1 photo" : "${imgs.length} photos",
+                      style: GoogleFonts.rajdhani(color: AppColors.textLo),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  height: 108,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: imgs.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 8),
+                    itemBuilder: (_, i) {
+                      final g = imgs[i];
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.network(
+                              galleryImgUrl(ip, _kindOf(g), g.name),
+                              width: 128,
+                              height: 84,
+                              fit: BoxFit.cover,
+                              errorBuilder: (_, __, ___) => Container(
+                                width: 128,
+                                height: 84,
+                                color: AppColors.surfaceHi,
+                                child: const Icon(Icons.broken_image,
+                                    color: AppColors.textLo),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            "${g.time.hour.toString().padLeft(2, '0')}:"
+                            "${g.time.minute.toString().padLeft(2, '0')}:"
+                            "${g.time.second.toString().padLeft(2, '0')}"
+                            "${g.kind == 'soil' ? '  soil' : ''}"
+                            "${g.annotated ? '  AI' : ''}",
+                            style: GoogleFonts.rajdhani(
+                                color: AppColors.textLo, fontSize: 12),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -513,6 +760,55 @@ class _MapScreenState extends State<MapScreen> {
       child: Text("CLEAR",
           style: GoogleFonts.rajdhani(
               color: AppColors.textLo, fontWeight: FontWeight.w700)),
+    );
+  }
+}
+
+/// Map marker for a group of photos taken at one spot. Soil photos and
+/// front-camera photos are coloured differently so the map shows at a glance
+/// which is which; the badge counts how many collapsed into this pin.
+class _PhotoPinIcon extends StatelessWidget {
+  final PhotoCluster cluster;
+  const _PhotoPinIcon({required this.cluster});
+
+  @override
+  Widget build(BuildContext context) {
+    final soil = cluster.cover.kind == 'soil';
+    final color = soil ? const Color(0xFF8D6E63) : const Color(0xFF29B6F6);
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Container(
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.92),
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 1.5),
+          ),
+          child: Icon(soil ? Icons.grass : Icons.photo_camera,
+              color: Colors.white, size: 17),
+        ),
+        if (cluster.count > 1)
+          Positioned(
+            right: -3,
+            top: -3,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.black87,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white24),
+              ),
+              child: Text(
+                cluster.count > 99 ? "99+" : "${cluster.count}",
+                style: GoogleFonts.rajdhani(
+                  color: Colors.white,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
