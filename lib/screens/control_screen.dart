@@ -3,6 +3,7 @@ import 'package:flutter_joystick/flutter_joystick.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import '../services/dev_settings.dart';
 import '../services/robot_socket.dart';
 import '../theme/app_theme.dart';
 import '../widgets/lidar_painter.dart';
@@ -20,6 +21,138 @@ class ControlScreen extends StatefulWidget {
 
 class _ControlScreenState extends State<ControlScreen> {
   bool isAutoMode = false;
+
+  // --- Hidden developer settings (see DevSettings) ---
+  bool _showJoystick = false; // hidden unless enabled in developer settings
+  int _devTaps = 0;
+  DateTime? _lastDevTap;
+  static const int _devTapsNeeded = 7;
+  static const Duration _devTapWindow = Duration(milliseconds: 1500);
+
+  @override
+  void initState() {
+    super.initState();
+    DevSettings.loadShowJoystick().then((v) {
+      if (mounted) setState(() => _showJoystick = v);
+    });
+  }
+
+  /// 7 quick taps on the mode pill open the developer settings. Taps more
+  /// than [_devTapWindow] apart start the count again, so ordinary
+  /// accidental taps never add up to anything.
+  void _onModePillTap(RobotSocket socket) {
+    final now = DateTime.now();
+    if (_lastDevTap == null || now.difference(_lastDevTap!) > _devTapWindow) {
+      _devTaps = 0;
+    }
+    _lastDevTap = now;
+    _devTaps++;
+
+    final left = _devTapsNeeded - _devTaps;
+    if (left <= 0) {
+      _devTaps = 0;
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      _openDevSettings(socket);
+      return;
+    }
+    // Only start counting down once it is clearly deliberate.
+    if (_devTaps >= 3) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(milliseconds: 900),
+            margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            content: Text(
+              "$left more tap${left == 1 ? '' : 's'} to developer settings",
+              style: GoogleFonts.rajdhani(fontWeight: FontWeight.w600),
+            ),
+          ),
+        );
+    }
+  }
+
+  Future<void> _setShowJoystick(bool value, RobotSocket socket) async {
+    setState(() => _showJoystick = value);
+    await DevSettings.saveShowJoystick(value);
+    // Hiding the joystick must not leave a stale drive command behind: the
+    // Pi keeps re-sending the LAST joystick position while in MANUAL. Zero
+    // it -- but only in manual, because any "x,y" message also switches the
+    // robot INTO manual, which must never happen to a robot running AUTO.
+    if (!value && !isAutoMode) {
+      socket.sendCommand("0,0");
+    }
+  }
+
+  void _openDevSettings(RobotSocket socket) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.developer_mode,
+                      color: AppColors.amber,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      "DEVELOPER SETTINGS",
+                      style: GoogleFonts.rajdhani(
+                        color: AppColors.textHi,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                        letterSpacing: 1.5,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  "For bench testing and calibration.",
+                  style: GoogleFonts.rajdhani(color: AppColors.textLo),
+                ),
+                const SizedBox(height: 8),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _showJoystick,
+                  onChanged: (v) {
+                    _setShowJoystick(v, socket);
+                    setSheet(() {});
+                  },
+                  title: Text(
+                    "Manual joystick",
+                    style: GoogleFonts.rajdhani(
+                      color: AppColors.textHi,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 15,
+                    ),
+                  ),
+                  subtitle: Text(
+                    "Show the on-screen joystick for driving by hand. "
+                    "Hidden by default so the robot runs in AUTO / NAV.",
+                    style: GoogleFonts.rajdhani(color: AppColors.textLo),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   void _logEvent(String action) {
     try {
@@ -166,41 +299,46 @@ class _ControlScreenState extends State<ControlScreen> {
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
               child: Row(
                 children: [
-                  // Mode pill (left) -- shrinks gracefully, never overflows
+                  // Mode pill (left) -- shrinks gracefully, never overflows.
+                  // Also the hidden developer-settings unlock: 7 quick taps.
                   Flexible(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 11),
-                      decoration: BoxDecoration(
-                        color: AppColors.surface.withValues(alpha: 0.85),
-                        borderRadius: BorderRadius.circular(40),
-                        border:
-                            Border.all(color: accent.withValues(alpha: 0.6)),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            isAutoMode
-                                ? Icons.smart_toy
-                                : Icons.sports_esports,
-                            color: accent,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 8),
-                          Flexible(
-                            child: Text(
-                              isAutoMode ? "AUTO" : "MANUAL",
-                              overflow: TextOverflow.ellipsis,
-                              style: GoogleFonts.rajdhani(
-                                color: accent,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 15,
-                                letterSpacing: 1.5,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => _onModePillTap(socket),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 11),
+                        decoration: BoxDecoration(
+                          color: AppColors.surface.withValues(alpha: 0.85),
+                          borderRadius: BorderRadius.circular(40),
+                          border:
+                              Border.all(color: accent.withValues(alpha: 0.6)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              isAutoMode
+                                  ? Icons.smart_toy
+                                  : Icons.sports_esports,
+                              color: accent,
+                              size: 18,
+                            ),
+                            const SizedBox(width: 8),
+                            Flexible(
+                              child: Text(
+                                isAutoMode ? "AUTO" : "MANUAL",
+                                overflow: TextOverflow.ellipsis,
+                                style: GoogleFonts.rajdhani(
+                                  color: accent,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 15,
+                                  letterSpacing: 1.5,
+                                ),
                               ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -371,31 +509,35 @@ class _ControlScreenState extends State<ControlScreen> {
                         ],
                       ),
                     ),
-                    const SizedBox(width: 16),
-                    Opacity(
-                      opacity: isAutoMode ? 0.3 : 1.0,
-                      child: Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: AppColors.surface.withValues(alpha: 0.6),
-                          shape: BoxShape.circle,
-                          border: Border.all(color: AppColors.border),
-                        ),
-                        child: SizedBox(
-                          width: 130,
-                          height: 130,
-                          child: Joystick(
-                            mode: JoystickMode.all,
-                            listener: (details) {
-                              if (!isAutoMode) {
-                                socket.sendCommand(
-                                    "${details.x},${details.y}");
-                              }
-                            },
+                    // Manual joystick: hidden unless turned on in the
+                    // developer settings (7 taps on the mode pill).
+                    if (_showJoystick) ...[
+                      const SizedBox(width: 16),
+                      Opacity(
+                        opacity: isAutoMode ? 0.3 : 1.0,
+                        child: Container(
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: AppColors.surface.withValues(alpha: 0.6),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: AppColors.border),
+                          ),
+                          child: SizedBox(
+                            width: 130,
+                            height: 130,
+                            child: Joystick(
+                              mode: JoystickMode.all,
+                              listener: (details) {
+                                if (!isAutoMode) {
+                                  socket.sendCommand(
+                                      "${details.x},${details.y}");
+                                }
+                              },
+                            ),
                           ),
                         ),
                       ),
-                    ),
+                    ],
                   ],
                 ),
               ),
