@@ -84,7 +84,11 @@ class _BoxPainter extends CustomPainter {
       canvas.drawRRect(
           RRect.fromRectAndRadius(rect, const Radius.circular(4)), stroke);
 
-      final label = "Obstacle ${b[4].toStringAsFixed(2)}";
+      // Every box is "Obstacle" with no score. The model's 24 classes are
+      // already collapsed to one label on the robot, and the confidence
+      // number told the operator nothing they could act on: the decision to
+      // report a box was already made against a threshold before it got here.
+      const label = "Obstacle";
       final tp = TextPainter(
         text: TextSpan(
           text: label,

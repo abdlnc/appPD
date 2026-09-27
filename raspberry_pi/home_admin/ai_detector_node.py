@@ -32,6 +32,12 @@ control_node.py -- these two are deliberately independent.
   * Every box is labeled "Obstacle" regardless of the model's own 24 class
     names -- see _relabel_obstacle(). The real class name is
     thrown away entirely, not just hidden; only count/confidence/box survive.
+  * The confidence SCORE is not drawn on the saved image either (conf=False
+    when plotting): every box reads simply "Obstacle". The score is still
+    used where it changes behaviour -- SAVE_CONF here, CAM_MIN_CONF in
+    control_node -- but on a finished photo it is a number the viewer cannot
+    act on, and the decision to draw the box was already made against a
+    threshold before it got there.
 
 Filenames also carry a SESSION TAG -- "_s<YYYYmmdd-HHMM>", fixed when the
 node starts -- so every photo taken in one run of the robot is identifiable as
@@ -129,7 +135,7 @@ def run_test(image_path):
     _relabel_obstacle(r)
     count, summary = _summarize(r)
     out = os.path.join(DETECT_DIR, "selftest_detected.jpg")
-    r.save(filename=out)               # writes annotated image
+    r.save(filename=out, conf=False)   # annotated; labels, no scores
     print(f"=== INFERENCE OK in {dt:.1f}s ===")
     print(f"Detections: {count}  [{summary}]")
     print("Annotated image saved:", out)
@@ -262,7 +268,7 @@ def run_node():
                 raw = os.path.join(CAPTURE_DIR, base + ".jpg")
                 out = os.path.join(DETECT_DIR, base + "_detected.jpg")
                 cv2.imwrite(raw, frame)     # untouched frame, no overlay
-                r.save(filename=out)        # annotated copy
+                r.save(filename=out, conf=False)   # labels, no scores
                 self.get_logger().info(
                     f"[{dt:.1f}s] {count} detection(s): {summary}  -> {out}")
             except Exception as e:

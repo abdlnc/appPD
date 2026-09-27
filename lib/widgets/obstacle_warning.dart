@@ -8,6 +8,8 @@ import '../services/robot_socket.dart';
 ///   * NO PATH        - robot boxed in; avoidance has no move left to make
 ///   * DANGER/CAUTION - closest Lidar obstacle
 ///   * NO GPS SIGNAL  - no fix, so NAV mode cannot drive at all
+///   * UNSUPPORTED FIELD TYPE - raised with it: no position means the field
+///     cannot be identified or mapped
 /// All hidden while disconnected.
 class ObstacleWarning extends StatelessWidget {
   const ObstacleWarning({super.key});
@@ -131,6 +133,15 @@ class ObstacleWarning extends StatelessWidget {
             icon: Icons.satellite_alt,
             title: 'NO GPS SIGNAL',
             detail: sats,
+          ));
+          // Same cause, separate consequence: without a position the field
+          // cannot be identified or mapped, so it is called out on its own
+          // line rather than buried in the GPS banner's detail text.
+          banners.add(_banner(
+            color: const Color(0xFF546E7A),
+            icon: Icons.grass,
+            title: 'UNSUPPORTED FIELD TYPE',
+            detail: 'field mapping needs a GPS fix',
           ));
         }
 
