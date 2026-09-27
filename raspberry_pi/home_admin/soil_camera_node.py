@@ -35,6 +35,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 import cv2
+import numpy as np
 
 # ----------------- camera settings -----------------
 # Preferred index for the soil camera. NOT relied upon: USB cameras
@@ -56,6 +57,28 @@ CAPTURE_DIR       = os.path.expanduser("~/agv_soil_images")
 # Written into every filename as "_s<YYYYmmdd-HHMM>" so the app can group and
 # filter a run's photos together. Matches ai_detector_node's tag format.
 SESSION_ID        = datetime.now().strftime("%Y%m%d-%H%M")
+
+# ---- field-type classifier (TFLite) ----
+# A 2-class image classifier run on each soil snapshot: is the robot over a
+# field type this system supports? Output is [supported, unsupported] and
+# sums to 1.0; index 0 is SUPPORTED (confirmed by the client).
+#
+# TFLite rather than PyTorch on purpose: the interpreter is a few MB against
+# the ~1GB the YOLO process holds, and this model runs in 7.5 ms -- so at one
+# frame a minute it costs about 0.01% of a core and cannot disturb the front
+# camera's obstacle detection.
+#
+# Runtime is ai_edge_litert: the older tflite-runtime 2.14 refuses this file
+# ("FULLY_CONNECTED version 12"). Install it with numpy pinned --
+#     pip install ai-edge-litert "numpy<2"
+# -- because unpinned it pulls numpy 2, which breaks ROS2, OpenCV and Torch.
+FIELD_MODEL_PATH = os.path.expanduser("~/agv_models/agv_field_classifier.tflite")
+FIELD_INPUT_SIZE = 224
+# Pixel scaling used at training time. 0-1 (Keras rescale=1./255) is the
+# assumption; the three plausible scalings agreed to within 0.03 on real soil
+# images, so this is safe but worth correcting if the training code differs.
+FIELD_SCALE_0_1 = True
+FIELD_LABELS = ("supported", "unsupported")   # index order of the output
 
 # ----------------- stamp burned onto each image -----------------
 # Soil photos get the capture time (and GPS, when there is a fix) drawn onto
@@ -88,6 +111,12 @@ class SoilCameraNode(Node):
         self.gps_lon = None
         self.create_subscription(String, '/gps', self.gps_cb, 10)
 
+        # field-type classifier: optional, and a failure here must never stop
+        # the node from doing its main job of saving soil images
+        self.field_pub = self.create_publisher(String, '/field_type', 10)
+        self.field = self._load_field_model()
+        self.field_label = None      # last verdict, burned into the next image
+
         # background reader so cap.read() never blocks the ROS executor
         self.reader = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader.start()
@@ -116,6 +145,40 @@ class SoilCameraNode(Node):
             return "_nogps"
         return f"_lat{self.gps_lat:.6f}_lon{self.gps_lon:.6f}"
 
+    def _load_field_model(self):
+        try:
+            from ai_edge_litert.interpreter import Interpreter
+            it = Interpreter(model_path=FIELD_MODEL_PATH)
+            it.allocate_tensors()
+            self.get_logger().info(
+                f"Field classifier loaded: {os.path.basename(FIELD_MODEL_PATH)}")
+            return it
+        except Exception as e:
+            self.get_logger().warn(
+                f"Field classifier unavailable ({type(e).__name__}: {e}) -- "
+                f"soil images will still be saved, without a field type")
+            return None
+
+    def classify_field(self, frame):
+        """Return (label, confidence) for this frame, or (None, 0.0)."""
+        if self.field is None:
+            return None, 0.0
+        try:
+            inp = self.field.get_input_details()[0]
+            out = self.field.get_output_details()[0]
+            x = cv2.resize(frame, (FIELD_INPUT_SIZE, FIELD_INPUT_SIZE))
+            x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32)
+            if FIELD_SCALE_0_1:
+                x /= 255.0
+            self.field.set_tensor(inp['index'], x[None, ...])
+            self.field.invoke()
+            probs = self.field.get_tensor(out['index']).ravel()
+            idx = int(np.argmax(probs))
+            return FIELD_LABELS[idx], float(probs[idx])
+        except Exception as e:
+            self.get_logger().warn(f"Field classification failed: {e}")
+            return None, 0.0
+
     def _stamp(self, frame, when):
         """Burn "<time>  |  <gps>" into the bottom-left corner. Drawn twice --
         thick black first, then white on top -- so it stays readable over both
@@ -125,11 +188,21 @@ class SoilCameraNode(Node):
         else:
             gps = f"GPS {self.gps_lat:.6f}, {self.gps_lon:.6f}"
         text = when.strftime("%Y-%m-%d %H:%M:%S") + "   |   " + gps
-        org = (STAMP_MARGIN, frame.shape[0] - STAMP_MARGIN)
-        for color, thick in ((0, 0, 0), STAMP_THICKNESS + 2), \
-                            ((255, 255, 255), STAMP_THICKNESS):
-            cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX,
-                        STAMP_SCALE, color, thick, cv2.LINE_AA)
+        # Only an UNSUPPORTED verdict is drawn. "Supported" is the normal
+        # case and stamping it on every image adds a line that says nothing --
+        # the absence of the warning is the answer. On its OWN line above the
+        # time+GPS, which already fills the width at 640px.
+        lines = [text]
+        if self.field_label == "unsupported":
+            lines.insert(0, "FIELD: UNSUPPORTED")
+        y = frame.shape[0] - STAMP_MARGIN
+        for line in reversed(lines):          # bottom line first, upwards
+            org = (STAMP_MARGIN, y)
+            for color, thick in ((0, 0, 0), STAMP_THICKNESS + 2), \
+                                ((255, 255, 255), STAMP_THICKNESS):
+                cv2.putText(frame, line, org, cv2.FONT_HERSHEY_SIMPLEX,
+                            STAMP_SCALE, color, thick, cv2.LINE_AA)
+            y -= int(26 * STAMP_SCALE / 0.5)  # line spacing follows the scale
         return frame
 
     def _try_index(self, idx):
@@ -197,6 +270,19 @@ class SoilCameraNode(Node):
             return
         self.last_capture = now
         when = datetime.now()
+
+        # Classify BEFORE stamping, so the verdict can be burned into the
+        # image and published while it still describes this frame.
+        label, conf = self.classify_field(frame)
+        if label is not None:
+            self.field_label = label
+            m = String()
+            m.data = f"{label}|{conf:.3f}"
+            self.field_pub.publish(m)
+            if label == "unsupported":
+                self.get_logger().warn(
+                    f"FIELD TYPE UNSUPPORTED ({conf:.2f}) -- see the app's "
+                    f"warning banner")
         fname = os.path.join(
             CAPTURE_DIR,
             when.strftime("soil_%Y%m%d_%H%M%S") + self._gps_suffix()

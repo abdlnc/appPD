@@ -8,8 +8,9 @@ import '../services/robot_socket.dart';
 ///   * NO PATH        - robot boxed in; avoidance has no move left to make
 ///   * DANGER/CAUTION - closest Lidar obstacle
 ///   * NO GPS SIGNAL  - no fix, so NAV mode cannot drive at all
-///   * UNSUPPORTED FIELD TYPE - raised with it: no position means the field
-///     cannot be identified or mapped
+///   * UNSUPPORTED FIELD TYPE - from two independent causes: no GPS (the
+///     field cannot be identified or mapped), or the soil camera's
+///     classifier reporting ground this system does not support
 /// All hidden while disconnected.
 class ObstacleWarning extends StatelessWidget {
   const ObstacleWarning({super.key});
@@ -142,6 +143,18 @@ class ObstacleWarning extends StatelessWidget {
             icon: Icons.grass,
             title: 'UNSUPPORTED FIELD TYPE',
             detail: 'field mapping needs a GPS fix',
+          ));
+        } else if (socket.unsupportedField) {
+          // The soil camera's classifier says the ground under the robot is
+          // not a field type this system handles. Only shown when GPS is
+          // present, since the banner above already covers the other case and
+          // two copies of the same title would just be noise.
+          final pct = (socket.fieldConfidence * 100).round();
+          banners.add(_banner(
+            color: const Color(0xFF546E7A),
+            icon: Icons.grass,
+            title: 'UNSUPPORTED FIELD TYPE',
+            detail: 'soil camera: not a supported field ($pct%)',
           ));
         }
 

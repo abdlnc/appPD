@@ -20,6 +20,7 @@ Keeps the EXISTING Flutter app protocol, so NO app changes are needed:
 Translates to ROS2:
     publishes  /cmd_vel (geometry_msgs/Twist)  manual joystick, only while MANUAL
     publishes  /mode    (std_msgs/String)      AUTO / MANUAL / STOP
+    relays     /field_type -> "F:<supported|unsupported>|<conf>" to the app
     subscribes /image_raw/compressed (sensor_msgs/CompressedImage)
                -> relayed to the app as "C:<base64>"  (filled by camera_node)
     subscribes /scan (sensor_msgs/LaserScan)
@@ -105,6 +106,7 @@ class BridgeNode(Node):
         self.mode = "STOP"
         self.latest_obstacle = "CLEAR"
         self.latest_boxes = None         # "<fw>,<fh>|..." from /ai_boxes
+        self.latest_field = None         # "supported|0.96" from /field_type
         self.latest_gps = None
         self.manual_cmd = Twist()
         self.latest_jpeg = None          # bytes: compressed JPEG from camera_node
@@ -120,6 +122,7 @@ class BridgeNode(Node):
 
         self.create_subscription(String, '/obstacle', self.obstacle_cb, 10)
         self.create_subscription(String, '/ai_boxes', self.boxes_cb, 10)
+        self.create_subscription(String, '/field_type', self.field_cb, 10)
         self.create_subscription(String, '/gps', self.gps_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.get_logger().info(f"Bridge node ready. WebSocket on :{WS_PORT}")
@@ -133,6 +136,9 @@ class BridgeNode(Node):
 
     def boxes_cb(self, msg: String):
         self.latest_boxes = msg.data
+
+    def field_cb(self, msg: String):
+        self.latest_field = msg.data
 
     def gps_cb(self, msg: String):
         self.latest_gps = msg.data
@@ -280,6 +286,22 @@ async def ws_handler(websocket, node: BridgeNode):
         except websockets.exceptions.ConnectionClosed:
             pass
 
+    async def send_field():
+        # Field type from the soil camera's classifier, as "F:<label>|<conf>".
+        # Send-on-change: a new verdict only exists once a minute, when a soil
+        # snapshot is taken, so there is nothing to poll for in between.
+        delay = 1.0
+        last = None
+        try:
+            while True:
+                f = node.latest_field
+                if f is not None and f != last:
+                    await websocket.send("F:" + f)
+                    last = f
+                await asyncio.sleep(delay)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
     async def send_boxes():
         # Send-on-change: the detector only produces a new result every
         # AI_MIN_INTERVAL (~3s), so polling faster would just resend the same
@@ -313,6 +335,7 @@ async def ws_handler(websocket, node: BridgeNode):
     gps_task = asyncio.create_task(send_gps())
     lidar_task = asyncio.create_task(send_lidar())
     boxes_task = asyncio.create_task(send_boxes())
+    field_task = asyncio.create_task(send_field())
     try:
         async for message in websocket:
             msg = message.strip()
@@ -373,6 +396,7 @@ async def ws_handler(websocket, node: BridgeNode):
         gps_task.cancel()
         lidar_task.cancel()
         boxes_task.cancel()
+        field_task.cancel()
         # app gone -> STOP for safety
         node.set_mode("STOP")
         node.manual_cmd = Twist()

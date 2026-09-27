@@ -99,6 +99,40 @@ class RobotSocket extends ChangeNotifier {
   /// direct signal and doesn't depend on that staying true elsewhere.
   bool get noGpsSignal => _isConnected && _gpsFix < 1;
 
+  // ---- Field type (soil camera's classifier -> /field_type -> "F:") ----
+  String? _fieldType; // "supported" | "unsupported"
+  double _fieldConf = 0.0;
+  DateTime? _fieldAt;
+
+  /// How long a verdict stands. The soil camera classifies once a minute, so
+  /// this allows two missed frames before the answer is treated as unknown
+  /// rather than leaving a stale "unsupported" on screen indefinitely.
+  static const Duration _fieldMaxAge = Duration(minutes: 3);
+
+  bool get _fieldFresh =>
+      _fieldAt != null && DateTime.now().difference(_fieldAt!) < _fieldMaxAge;
+
+  /// The field under the robot is one this system does not support.
+  /// False when there is no recent verdict -- an unknown field is not
+  /// reported as a bad one.
+  bool get unsupportedField =>
+      _isConnected && _fieldFresh && _fieldType == 'unsupported';
+
+  /// Confidence of the latest verdict, 0 when there isn't a fresh one.
+  double get fieldConfidence => _fieldFresh ? _fieldConf : 0.0;
+
+  void _parseField(String payload) {
+    // "<label>|<confidence>"
+    final parts = payload.split('|');
+    if (parts.isEmpty) return;
+    final label = parts[0].trim().toLowerCase();
+    if (label != 'supported' && label != 'unsupported') return;
+    _fieldType = label;
+    _fieldConf = parts.length > 1 ? (double.tryParse(parts[1]) ?? 0.0) : 0.0;
+    _fieldAt = DateTime.now();
+    notifyListeners();
+  }
+
   // ---- Robot GPS position (gps_node -> /gps -> "G:" over WebSocket) ----
   double? _robotLat;
   double? _robotLon;
@@ -233,6 +267,10 @@ class RobotSocket extends ChangeNotifier {
       // 3b. AI detection boxes (B:)
       else if (message.startsWith("B:")) {
         _parseBoxes(message.substring(2));
+      }
+      // 3.5 Field type from the soil camera's classifier (F:)
+      else if (message.startsWith("F:")) {
+        _parseField(message.substring(2));
       }
       // 4. GPS Position (G:)
       else if (message.startsWith("G:")) {
