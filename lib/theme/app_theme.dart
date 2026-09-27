@@ -16,6 +16,16 @@ class AppColors {
   static const offline = Color(0xFFE5533D); // disconnected (warm, not harsh)
   static const border = Color(0xFF2A4632);
 
+  // Reserved for DEVELOPER-only controls. Deliberately a violet, outside the
+  // lime/amber/red family every user-facing control uses, so a dev affordance
+  // can never be mistaken for a normal one at a glance.
+  static const dev = Color(0xFFB388FF);
+  static const devDim = Color(0xFF7C4DFF);
+
+  // Lidar returns. Red so the points read as "something is there" rather than
+  // blending into the lime UI chrome around them.
+  static const lidarPoint = Color(0xFFFF3B30);
+
   // Dark text to place ON the lime/amber accent buttons
   static const onLime = Color(0xFF06210C);
   static const onAmber = Color(0xFF2A1B00);

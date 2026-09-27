@@ -25,9 +25,11 @@ class LidarPainter extends CustomPainter {
     // Robot center (amber)
     canvas.drawCircle(center, 5.0, Paint()..color = AppColors.amber);
 
-    // Detected points (lime)
+    // Detected points: RED dots. The rings and the robot marker stay lime and
+    // amber, so the returns are the only red thing on the view and read as
+    // obstacles instead of as decoration.
     final pointPaint = Paint()
-      ..color = AppColors.lime
+      ..color = AppColors.lidarPoint
       ..strokeWidth = 2.0
       ..strokeCap = StrokeCap.round;
 

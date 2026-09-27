@@ -104,7 +104,7 @@ class _ControlScreenState extends State<ControlScreen> {
                   children: [
                     const Icon(
                       Icons.developer_mode,
-                      color: AppColors.amber,
+                      color: AppColors.dev,
                       size: 20,
                     ),
                     const SizedBox(width: 8),
@@ -127,6 +127,12 @@ class _ControlScreenState extends State<ControlScreen> {
                 const SizedBox(height: 8),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
+                  // Dev hue, so even the switch reads as "not a user setting"
+                  thumbColor: const WidgetStatePropertyAll(AppColors.dev),
+                  trackColor: WidgetStateProperty.resolveWith((s) =>
+                      s.contains(WidgetState.selected)
+                          ? AppColors.devDim.withValues(alpha: 0.5)
+                          : AppColors.surfaceHi),
                   value: _showJoystick,
                   onChanged: (v) {
                     _setShowJoystick(v, socket);
@@ -343,6 +349,22 @@ class _ControlScreenState extends State<ControlScreen> {
                     ),
                   ),
                   const Spacer(),
+                  // DEVELOPER button, shown only once a dev setting is on.
+                  // Violet, unlike every user-facing control (lime / amber /
+                  // red), so a dev affordance is never mistaken for a normal
+                  // one -- and it gives a way back into the settings without
+                  // the 7-tap unlock.
+                  if (_showJoystick) ...[
+                    _circleBtn(
+                      icon: Icons.developer_mode,
+                      iconColor: AppColors.dev,
+                      bg: AppColors.surface.withValues(alpha: 0.85),
+                      borderColor: AppColors.devDim,
+                      tooltip: "Developer settings (on)",
+                      onTap: () => _openDevSettings(socket),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
                   // Right action cluster -- consistent circular buttons
                   _circleBtn(
                     icon: online ? Icons.wifi : Icons.wifi_off,
@@ -520,7 +542,10 @@ class _ControlScreenState extends State<ControlScreen> {
                           decoration: BoxDecoration(
                             color: AppColors.surface.withValues(alpha: 0.6),
                             shape: BoxShape.circle,
-                            border: Border.all(color: AppColors.border),
+                            // Violet ring: this control is only on screen
+                            // because a developer setting turned it on.
+                            border: Border.all(
+                                color: AppColors.devDim, width: 1.5),
                           ),
                           child: SizedBox(
                             width: 130,
