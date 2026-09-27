@@ -67,11 +67,9 @@ class GeoImage {
   /// sitting exactly on top of each other.
   String get eventKey => '$kind|${time.millisecondsSinceEpoch}|$lat|$lon';
 
-  /// e.g. "14.632479, 121.090634" -- 6 decimals is ~0.1 m, past what the
-  /// receiver resolves, and matches the precision the Pi writes.
-  String get coordLabel => hasFix
-      ? '${lat!.toStringAsFixed(6)}, ${lon!.toStringAsFixed(6)}'
-      : 'no GPS fix';
+  /// e.g. "14.632, 121.091" -- see [formatCoord].
+  String get coordLabel =>
+      hasFix ? '${formatCoord(lat!)}, ${formatCoord(lon!)}' : 'no GPS fix';
 
   static final RegExp _re = RegExp(
     r'^(capture|soil)_(\d{8})_(\d{6})_'
@@ -134,6 +132,17 @@ double metersBetween(double lat1, double lon1, double lat2, double lon2) {
 }
 
 double _rad(double deg) => deg * math.pi / 180.0;
+
+/// Decimal places used when a coordinate is SHOWN.
+///
+/// Display only. What is stored keeps its full precision: filenames carry 6
+/// decimals, and a waypoint is sent to the robot with 7, because navigation
+/// works on the number itself rather than on what the screen says.
+const int kCoordDecimals = 3;
+
+/// A coordinate as it appears on screen, rounded to the nearest
+/// [kCoordDecimals] places (121.090634 shows as 121.091).
+String formatCoord(double value) => value.toStringAsFixed(kCoordDecimals);
 
 /// A group of photos taken close enough together to share one map pin.
 class PhotoCluster {

@@ -58,10 +58,27 @@ void main() {
       expect(GeoImage.parse('capture_2026_lat1_lon2.jpg'), isNull);
     });
 
-    test('coordLabel matches the Pi\'s 6-decimal precision', () {
+    test('coordLabel shows 3 decimals, rounded to nearest', () {
       final g = GeoImage.parse(
           'capture_20260906_134003_lat14.632479_lon121.090634.jpg')!;
-      expect(g.coordLabel, '14.632479, 121.090634');
+      // 14.632479 -> 14.632 (down), 121.090634 -> 121.091 (up)
+      expect(g.coordLabel, '14.632, 121.091');
+    });
+
+    test('the stored position keeps full precision', () {
+      // Only the DISPLAY is rounded -- pins, distances and waypoints must
+      // still use the real number.
+      final g = GeoImage.parse(
+          'capture_20260906_134003_lat14.632479_lon121.090634.jpg')!;
+      expect(g.lat, closeTo(14.632479, 1e-9));
+      expect(g.lon, closeTo(121.090634, 1e-9));
+    });
+
+    test('formatCoord rounds half away from zero, and handles negatives', () {
+      expect(formatCoord(14.6325), '14.633');
+      expect(formatCoord(14.6324), '14.632');
+      expect(formatCoord(-33.86885), '-33.869');
+      expect(formatCoord(0), '0.000');
     });
   });
 

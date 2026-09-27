@@ -589,8 +589,8 @@ class _MapScreenState extends State<MapScreen> {
       ),
       child: socket.hasGps
           ? Text(
-              "LAT ${socket.robotLat!.toStringAsFixed(6)}   "
-              "LON ${socket.robotLon!.toStringAsFixed(6)}\n"
+              "LAT ${formatCoord(socket.robotLat!)}   "
+              "LON ${formatCoord(socket.robotLon!)}\n"
               "HDG ${socket.hasHeading ? '${socket.robotHeading.toStringAsFixed(0)}\u00B0' : '\u2014'}"
               "   FIX ${socket.gpsFix}   SAT ${socket.gpsSats}"
               "${_trail.isNotEmpty ? '   \u2022   TRAIL ${_trail.length}' : ''}",
@@ -636,7 +636,7 @@ class _MapScreenState extends State<MapScreen> {
         title: "WAYPOINT",
         titleColor: AppColors.textLo,
         subtitle:
-            "${_waypoint!.latitude.toStringAsFixed(6)}, ${_waypoint!.longitude.toStringAsFixed(6)}"
+            "${formatCoord(_waypoint!.latitude)}, ${formatCoord(_waypoint!.longitude)}"
             "${distLabel.isNotEmpty ? '   \u2022   $distLabel' : ''}",
         actions: [
           _clearBtn(socket),
