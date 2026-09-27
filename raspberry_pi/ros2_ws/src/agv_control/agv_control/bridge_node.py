@@ -41,6 +41,7 @@ Requires:  pip install websockets
 
 import asyncio
 import base64
+import signal
 import math
 import os
 import subprocess
@@ -387,10 +388,43 @@ async def publisher_loop(node: BridgeNode):
 
 
 async def ws_main(node: BridgeNode):
+    """Serve the app until a shutdown signal arrives.
+
+    The obvious form of this -- `async with websockets.serve(...)` wrapped
+    around publisher_loop -- hangs on exit while the phone still holds a
+    connection: leaving the context manager waits for open connections to
+    finish, and this one never does. systemd then waits out its full 90s stop
+    timeout on every restart before killing the process, which also delays
+    the STOP the robot should get promptly when the bridge goes down.
+
+    So the signals are handled here: they set `stop`, the publisher task is
+    cancelled, and the server is closed with a hard 2s bound on waiting for
+    connections to drain."""
     async def handler(websocket):
         await ws_handler(websocket, node)
-    async with websockets.serve(handler, WS_HOST, WS_PORT):
-        await publisher_loop(node)      # runs forever alongside the server
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass          # not all platforms/loops allow this; fall back to
+                          # the default behaviour rather than failing to start
+
+    server = await websockets.serve(handler, WS_HOST, WS_PORT)
+    pub = asyncio.create_task(publisher_loop(node))
+    try:
+        await stop.wait()
+    finally:
+        node.get_logger().info("Bridge shutting down")
+        pub.cancel()
+        server.close()
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass          # a client that will not let go must not hold up
+                          # the whole service's shutdown
 
 
 def main(args=None):
