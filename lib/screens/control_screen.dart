@@ -24,7 +24,6 @@ class _ControlScreenState extends State<ControlScreen> {
 
   // --- Hidden developer settings (see DevSettings) ---
   bool _showJoystick = false; // hidden unless enabled in developer settings
-  bool _devUnlocked = false; // dev settings reachable (7 taps, remembered)
   int _devTaps = 0;
   DateTime? _lastDevTap;
   static const int _devTapsNeeded = 7;
@@ -35,9 +34,6 @@ class _ControlScreenState extends State<ControlScreen> {
     super.initState();
     DevSettings.loadShowJoystick().then((v) {
       if (mounted) setState(() => _showJoystick = v);
-    });
-    DevSettings.loadUnlocked().then((v) {
-      if (mounted) setState(() => _devUnlocked = v);
     });
   }
 
@@ -56,10 +52,6 @@ class _ControlScreenState extends State<ControlScreen> {
     if (left <= 0) {
       _devTaps = 0;
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
-      if (!_devUnlocked) {
-        setState(() => _devUnlocked = true);
-        DevSettings.saveUnlocked(true);
-      }
       _openDevSettings(socket);
       return;
     }
@@ -256,6 +248,11 @@ class _ControlScreenState extends State<ControlScreen> {
   Widget build(BuildContext context) {
     final socket = Provider.of<RobotSocket>(context);
     final Color accent = isAutoMode ? AppColors.amber : AppColors.lime;
+    // MANUAL's icon is violet, not green. Manual driving is the developer
+    // path (its joystick lives behind a dev setting), and this icon is also
+    // the hidden way into those settings -- so it must not look like one of
+    // the green controls the operator is meant to press.
+    final Color modeIconColor = isAutoMode ? AppColors.amber : AppColors.dev;
     final bool hasCamera = socket.cameraImage != null;
     final bool online = socket.isConnected;
 
@@ -335,7 +332,7 @@ class _ControlScreenState extends State<ControlScreen> {
                               isAutoMode
                                   ? Icons.smart_toy
                                   : Icons.sports_esports,
-                              color: accent,
+                              color: modeIconColor,
                               size: 18,
                             ),
                             const SizedBox(width: 8),
@@ -362,19 +359,6 @@ class _ControlScreenState extends State<ControlScreen> {
                   // red), so a dev affordance is never mistaken for a normal
                   // one -- and it gives a way back into the settings without
                   // the 7-tap unlock.
-                  // Violet, never green: green marks the buttons the
-                  // operator is meant to press, so this reads as not theirs.
-                  if (_devUnlocked) ...[
-                    _circleBtn(
-                      icon: Icons.developer_mode,
-                      iconColor: AppColors.dev,
-                      bg: AppColors.surface.withValues(alpha: 0.85),
-                      borderColor: AppColors.devDim,
-                      tooltip: "Developer settings",
-                      onTap: () => _openDevSettings(socket),
-                    ),
-                    const SizedBox(width: 8),
-                  ],
                   // Right action cluster -- consistent circular buttons
                   // Status, not a button (no onTap). Deliberately NOT green:
                   // green marks the icons the operator can actually press.
