@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:robot_controller/models/geo_image.dart';
 
 void main() {
+  sessionTests();
   group('GeoImage.parse', () {
     test('GPS-tagged capture', () {
       final g = GeoImage.parse(
@@ -118,6 +119,111 @@ void main() {
 
     test('zero distance for identical points', () {
       expect(metersBetween(14.6, 121.0, 14.6, 121.0), closeTo(0, 1e-6));
+    });
+  });
+}
+
+// ---------------------------------------------------------------- sessions
+void sessionTests() {
+  group('session tag', () {
+    test('parses the session out of the filename', () {
+      final g = GeoImage.parse(
+          'capture_20260927_190210_nogps_s20260927-1858.jpg')!;
+      expect(g.session, '20260927-1858');
+      expect(g.hasFix, isFalse);
+      expect(g.time, DateTime(2026, 9, 27, 19, 2, 10));
+    });
+
+    test('session + GPS + annotated all together', () {
+      final g = GeoImage.parse('capture_20260927_190210'
+          '_lat14.207668_lon121.382832_s20260927-1858_detected.jpg')!;
+      expect(g.session, '20260927-1858');
+      expect(g.annotated, isTrue);
+      expect(g.lat, closeTo(14.207668, 1e-9));
+    });
+
+    test('soil image with a session', () {
+      final g = GeoImage.parse('soil_20260927_190300_nogps_s20260927-1858.jpg')!;
+      expect(g.kind, 'soil');
+      expect(g.session, '20260927-1858');
+    });
+
+    test('older untagged photos still parse, with a null session', () {
+      final g = GeoImage.parse(
+          'capture_20260906_134003_lat14.632479_lon121.090634.jpg')!;
+      expect(g.session, isNull);
+    });
+
+    test('a malformed session tag is not accepted as one', () {
+      // Wrong shape -> the whole name fails to match, rather than being read
+      // as an untagged photo with junk in it.
+      expect(GeoImage.parse('capture_20260927_190210_nogps_s2026.jpg'), isNull);
+    });
+  });
+
+  group('groupBySession', () {
+    GeoImage tagged(String session, int hh, int mm) => GeoImage.parse(
+        'capture_20260927_${hh.toString().padLeft(2, '0')}'
+        '${mm.toString().padLeft(2, '0')}00_nogps_s$session.jpg')!;
+    GeoImage untagged(int day, int hh, int mm) => GeoImage.parse(
+        'soil_202609${day.toString().padLeft(2, '0')}_'
+        '${hh.toString().padLeft(2, '0')}${mm.toString().padLeft(2, '0')}'
+        '00_nogps.jpg')!;
+
+    test('tagged photos group by their tag, not by time', () {
+      final s = groupBySession([
+        tagged('20260927-1800', 18, 5),
+        tagged('20260927-1800', 18, 40), // 35 min later, same run
+        tagged('20260927-1900', 19, 2),
+      ]);
+      expect(s.length, 2);
+      expect(s.first.key, '20260927-1900'); // newest first
+      expect(s.firstWhere((x) => x.key == '20260927-1800').count, 2);
+      expect(s.every((x) => x.inferred), isFalse);
+    });
+
+    test('untagged photos split on a gap longer than kSessionGap', () {
+      final s = groupBySession([
+        untagged(20, 10, 0),
+        untagged(20, 10, 1), // 1 min later: same run
+        untagged(20, 14, 0), // hours later: new run
+      ]);
+      expect(s.length, 2);
+      expect(s.every((x) => x.inferred), isTrue);
+      expect(s.map((x) => x.count).toList()..sort(), [1, 2]);
+    });
+
+    test('tagged and untagged are never merged into one session', () {
+      final s = groupBySession([
+        tagged('20260927-1900', 19, 0),
+        untagged(27, 19, 1), // one minute apart, but no tag
+      ]);
+      expect(s.length, 2);
+      expect(s.where((x) => x.inferred).length, 1);
+    });
+
+    test('session start/end and label come from the photos', () {
+      final s = groupBySession([
+        tagged('20260927-1800', 18, 30),
+        tagged('20260927-1800', 18, 5),
+      ]).single;
+      expect(s.start, DateTime(2026, 9, 27, 18, 5));
+      expect(s.end, DateTime(2026, 9, 27, 18, 30));
+      expect(s.label, '27 Sep, 18:05');
+    });
+
+    test('counts how many of a session have GPS', () {
+      final s = groupBySession([
+        GeoImage.parse('capture_20260927_190210_lat14.2_lon121.3'
+            '_s20260927-1858.jpg')!,
+        tagged('20260927-1858', 19, 3),
+      ]).single;
+      expect(s.count, 2);
+      expect(s.withFix, 1);
+    });
+
+    test('empty input gives no sessions', () {
+      expect(groupBySession([]), isEmpty);
     });
   });
 }

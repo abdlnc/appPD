@@ -331,8 +331,8 @@ class _MapScreenState extends State<MapScreen> {
                     ? const Color(0xFFE53935)
                     : Colors.white38),
             tooltip: _showObstacles
-                ? "Hide obstacle pins (${socket.obstaclePins.length})"
-                : "Show obstacle pins",
+                ? "Hide Lidar obstacle pins (${socket.obstaclePins.length})"
+                : "Show Lidar obstacle pins",
             onPressed: () => setState(() => _showObstacles = !_showObstacles),
           ),
           IconButton(
@@ -348,10 +348,10 @@ class _MapScreenState extends State<MapScreen> {
                         ? const Color(0xFFFFB300)
                         : (_showPhotos ? AppColors.lime : Colors.white38)),
             tooltip: _photoError != null
-                ? "Photo pins unavailable - tap to retry"
+                ? "Obstacle pins unavailable - tap to retry"
                 : (_showPhotos
-                    ? "Hide photo pins (${_photoPins.length})"
-                    : "Show photo pins"),
+                    ? "Hide obstacle photos (${_photoPins.length})"
+                    : "Show obstacle photos"),
             onPressed: () {
               if (_photoError != null || _photoPins.isEmpty) {
                 _loadPhotos();
@@ -362,7 +362,7 @@ class _MapScreenState extends State<MapScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.layers_clear),
-            tooltip: "Clear trail & obstacle pins",
+            tooltip: "Clear trail & Lidar pins",
             onPressed: (_trail.isEmpty && socket.obstaclePins.isEmpty)
                 ? null
                 : () {
@@ -444,7 +444,7 @@ class _MapScreenState extends State<MapScreen> {
                         size: 13, color: Color(0xFFFFB300)),
                     const SizedBox(width: 5),
                     Text(
-                      "${_photoIndex.noFixCount} photo"
+                      "${_photoIndex.noFixCount} obstacle photo"
                       "${_photoIndex.noFixCount == 1 ? '' : 's'} without GPS",
                       style: GoogleFonts.rajdhani(
                           color: AppColors.textLo,
@@ -487,7 +487,8 @@ class _MapScreenState extends State<MapScreen> {
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.place, color: AppColors.lime, size: 18),
+                    const Icon(Icons.warning_amber_rounded,
+                        color: Color(0xFFFFB300), size: 18),
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
@@ -500,7 +501,9 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                     ),
                     Text(
-                      imgs.length == 1 ? "1 photo" : "${imgs.length} photos",
+                      imgs.length == 1
+                          ? "1 obstacle"
+                          : "${imgs.length} obstacles",
                       style: GoogleFonts.rajdhani(color: AppColors.textLo),
                     ),
                   ],
@@ -764,17 +767,18 @@ class _MapScreenState extends State<MapScreen> {
   }
 }
 
-/// Map marker for a group of photos taken at one spot. Soil photos and
-/// front-camera photos are coloured differently so the map shows at a glance
-/// which is which; the badge counts how many collapsed into this pin.
+/// Map marker for the obstacles found at one spot.
+///
+/// Amber with a camera icon, deliberately not the red warning used by the
+/// Lidar's own DANGER pins: both mark obstacles, but one is a photographed
+/// finding you can open and the other is a live range reading.
 class _PhotoPinIcon extends StatelessWidget {
   final PhotoCluster cluster;
   const _PhotoPinIcon({required this.cluster});
 
   @override
   Widget build(BuildContext context) {
-    final soil = cluster.cover.kind == 'soil';
-    final color = soil ? const Color(0xFF8D6E63) : const Color(0xFF29B6F6);
+    const color = Color(0xFFFFB300);
     return Stack(
       clipBehavior: Clip.none,
       children: [
@@ -784,8 +788,8 @@ class _PhotoPinIcon extends StatelessWidget {
             shape: BoxShape.circle,
             border: Border.all(color: Colors.white, width: 1.5),
           ),
-          child: Icon(soil ? Icons.grass : Icons.photo_camera,
-              color: Colors.white, size: 17),
+          child: const Icon(Icons.photo_camera,
+              color: Color(0xFF1A1200), size: 17),
         ),
         if (cluster.count > 1)
           Positioned(

@@ -9,9 +9,17 @@ import '../models/geo_image.dart';
 /// and nothing here can send the robot a command.
 const int kGalleryPort = 8080;
 
-/// Image kinds the server exposes. "maps" is the saved SLAM maps, which are
-/// not per-photo geotagged and so are not used for map pins.
+/// Image kinds the server exposes, for the gallery's tabs.
 const List<String> kPhotoKinds = ['captures', 'detections', 'soil'];
+
+/// What the GPS map pins: OBSTACLES only.
+///
+/// The map answers "where did the robot find obstructions?", so only the AI's
+/// annotated detections are pinned. Soil photos are a timed log taken every
+/// 60s regardless of what is there, and raw captures are the un-annotated
+/// twins of these same detections -- pinning either buries the obstacles under
+/// points that carry no finding. Both are still browsable in the gallery.
+const List<String> kMapPinKinds = ['detections'];
 
 String galleryImgUrl(String ip, String kind, String name) =>
     'http://$ip:$kGalleryPort/img/$kind/$name';
@@ -49,12 +57,11 @@ class GalleryPhoto {
   String url(String ip) => galleryImgUrl(ip, kind, geo.name);
 }
 
-/// Every photo the Pi holds, parsed, de-duplicated and ready to map.
+/// Every OBSTACLE photo the Pi holds, parsed, de-duplicated and ready to map.
 ///
-/// De-duplication matters: the AI saves BOTH a raw capture and an annotated
-/// `_detected` copy of the same moment, so without this every obstacle would
-/// get two pins stacked on the same spot. The annotated one wins -- on a map
-/// of obstructions, the image with the boxes drawn on it is the useful one.
+/// De-duplication still matters even now that only detections are fetched: a
+/// single capture moment can only produce one annotated file, but the eventKey
+/// also collapses any duplicate the folder happens to hold.
 class PhotoIndex {
   final List<GalleryPhoto> photos; // geotagged only
   final int noFixCount; // parsed fine, but had no GPS fix
@@ -68,10 +75,10 @@ class PhotoIndex {
 /// A kind that fails is skipped rather than failing the whole load: a missing
 /// soil camera shouldn't wipe the obstacle pins off the map.
 Future<PhotoIndex> fetchPhotoIndex(String ip) async {
-  // Asks for kMapListLimit per kind so the map reflects the whole archive,
-  // not just the most recent 200 photos per folder.
+  // Asks for kMapListLimit so the map reflects the whole archive, not just
+  // the most recent 200 photos in the folder.
   final results = await Future.wait(
-    kPhotoKinds.map((k) async {
+    kMapPinKinds.map((k) async {
       try {
         return MapEntry(
             k, await fetchGalleryNames(ip, k, limit: kMapListLimit));

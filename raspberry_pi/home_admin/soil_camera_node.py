@@ -44,6 +44,10 @@ CAMERA_INDEX  = 2           # /dev/video2 -- the second UVC camera (soil-facing)
 # ----------------- snapshot capture -----------------
 CAPTURE_INTERVAL = 60.0     # seconds between saved snapshots
 CAPTURE_DIR       = os.path.expanduser("~/agv_soil_images")
+# One session = one run of this node, i.e. one time the robot was switched on.
+# Written into every filename as "_s<YYYYmmdd-HHMM>" so the app can group and
+# filter a run's photos together. Matches ai_detector_node's tag format.
+SESSION_ID        = datetime.now().strftime("%Y%m%d-%H%M")
 
 # ----------------- stamp burned onto each image -----------------
 # Soil photos get the capture time (and GPS, when there is a fix) drawn onto
@@ -156,7 +160,8 @@ class SoilCameraNode(Node):
         when = datetime.now()
         fname = os.path.join(
             CAPTURE_DIR,
-            when.strftime("soil_%Y%m%d_%H%M%S") + self._gps_suffix() + ".jpg")
+            when.strftime("soil_%Y%m%d_%H%M%S") + self._gps_suffix()
+            + "_s" + SESSION_ID + ".jpg")
         try:
             cv2.imwrite(fname, self._stamp(frame, when))
             self.get_logger().info(f"Saved soil snapshot: {fname}")

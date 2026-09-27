@@ -2,7 +2,7 @@
 """
 AGV AI Detector Node  (ROS2 / rclpy)  --  contract 2.3 DEPLOYMENT/EXECUTION
 
-Runs the CLIENT-PROVIDED YOLOv8 model (best.pt -- ~/agv_models/best.pt,
+Runs the YOLOv8 model (best.pt -- ~/agv_models/best.pt,
 trained on a 24-class custom obstruction dataset: plants/rocks/trees/
 gardening tools/etc.) on the FRONT camera's live feed, and saves a photo
 only when the model actually SEES an obstacle.
@@ -25,17 +25,26 @@ only when the model actually SEES an obstacle.
     only refresh every AI_MIN_INTERVAL; see the app side, which labels their
     age and expires them rather than pretending they are live.
 
-THE CAMERA decides what an obstacle is here, not the Lidar (client request).
+THE CAMERA decides what an obstacle is here, not the Lidar.
 The Lidar's own obstacle warning is separate and still drives avoidance in
 control_node.py -- these two are deliberately independent.
 
   * Every box is labeled "Obstacle" regardless of the model's own 24 class
-    names (client request) -- see _relabel_obstacle(). The real class name is
+    names -- see _relabel_obstacle(). The real class name is
     thrown away entirely, not just hidden; only count/confidence/box survive.
 
+Filenames also carry a SESSION TAG -- "_s<YYYYmmdd-HHMM>", fixed when the
+node starts -- so every photo taken in one run of the robot is identifiable as
+belonging to that run, and the app can group and filter by it. A session is
+simply "one run of this node", which is what an operator means by a session:
+it starts when the robot is switched on and ends when it is switched off.
+Kept in the FILENAME rather than a per-session subfolder on purpose -- the
+gallery server serves flat directories with a path-traversal guard that only
+accepts a bare basename, so subfolders would mean loosening that check.
+
 Filenames carry the GPS position when there is a fix:
-    capture_20260905_120000_lat14.748134_lon121.061668.jpg
-    capture_20260905_120000_nogps.jpg          (no fix at that moment)
+    capture_20260905_120000_lat14.748134_lon121.061668_s20260905-1158.jpg
+    capture_20260905_120000_nogps_s20260905-1158.jpg    (no fix right then)
 The position is CLEARED when the fix is lost rather than kept at its last
 value -- tagging a photo with a stale position is worse than "nogps".
 
@@ -87,7 +96,7 @@ def _load_model():
 
 
 def _relabel_obstacle(result):
-    """Overwrite every class name in this result with "Obstacle" (client
+    """Overwrite every class name in this result with "Obstacle" (a
     request) -- affects BOTH the saved annotated image (r.save() reads
     result.names to draw box labels) and _summarize()'s output below, since
     both read from the same result.names dict. Confidence/box position are
@@ -147,6 +156,9 @@ def run_node():
             self.busy = False
             self.last_infer = 0.0
             self.last_save = 0.0
+            # One session = one run of this node (see the header). Fixed here,
+            # never recomputed, so a run that spans midnight keeps one tag.
+            self.session = datetime.now().strftime("%Y%m%d-%H%M")
 
             # latest GPS fix, or (None, None) when there is no fix RIGHT NOW.
             # Cleared on loss rather than held, so a photo is never tagged with
@@ -227,7 +239,7 @@ def run_node():
                 self.box_pub.publish(bmsg)
 
                 if count == 0:
-                    # Camera sees nothing -> save nothing (client request).
+                    # Camera sees nothing -> save nothing.
                     self.get_logger().debug(f"[{dt:.1f}s] no obstacle in view")
                     return
 
@@ -246,7 +258,7 @@ def run_node():
                 self.last_save = time.time()
 
                 base = ("capture_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-                        + self._gps_suffix())
+                        + self._gps_suffix() + "_s" + self.session)
                 raw = os.path.join(CAPTURE_DIR, base + ".jpg")
                 out = os.path.join(DETECT_DIR, base + "_detected.jpg")
                 cv2.imwrite(raw, frame)     # untouched frame, no overlay

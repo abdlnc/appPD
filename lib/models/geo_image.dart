@@ -11,6 +11,11 @@ import 'dart:math' as math;
 ///   capture_20260906_135211_lat14.632454_lon121.090589_detected.jpg
 ///   capture_20260920_173737_nogps.jpg
 ///   soil_20260920_174146_nogps.jpg
+///   capture_20260927_190210_nogps_s20260927-1858.jpg      (session-tagged)
+///
+/// The `_s<YYYYmmdd-HHMM>` tag is the SESSION: one run of the robot, stamped
+/// when the capturing node started. Photos saved before that tag existed have
+/// no session in the name, so [sessionOf] falls back to grouping by time gap.
 ///
 /// "_nogps" means there was NO fix at that moment. The robot deliberately
 /// writes that instead of the last known position -- a photo tagged with a
@@ -41,6 +46,10 @@ class GeoImage {
   /// moment as its raw `capture_...jpg` twin.
   final bool annotated;
 
+  /// Session tag from the filename ("20260927-1858"), or null on the older
+  /// photos saved before sessions were recorded.
+  final String? session;
+
   const GeoImage({
     required this.name,
     required this.kind,
@@ -48,6 +57,7 @@ class GeoImage {
     required this.lat,
     required this.lon,
     required this.annotated,
+    this.session,
   });
 
   bool get hasFix => lat != null && lon != null;
@@ -66,6 +76,7 @@ class GeoImage {
   static final RegExp _re = RegExp(
     r'^(capture|soil)_(\d{8})_(\d{6})_'
     r'(?:nogps|lat(-?\d+(?:\.\d+)?)_lon(-?\d+(?:\.\d+)?))'
+    r'(?:_s(\d{8}-\d{4}))?'
     r'(_detected)?\.(?:jpg|jpeg|png)$',
     caseSensitive: false,
   );
@@ -106,7 +117,8 @@ class GeoImage {
       time: time,
       lat: lat,
       lon: lon,
-      annotated: m.group(6) != null,
+      session: m.group(6),
+      annotated: m.group(7) != null,
     );
   }
 }
@@ -178,4 +190,94 @@ class _MutableCluster {
   final double lon;
   final List<GeoImage> images;
   _MutableCluster(this.lat, this.lon, this.images);
+}
+
+/// One run of the robot: the photos saved between switching it on and off.
+class PhotoSession {
+  /// Session tag ("20260927-1858") for tagged photos, or a synthetic
+  /// `gap:<epoch>` key for older untagged ones.
+  final String key;
+
+  /// True when this session was inferred from time gaps rather than read from
+  /// the filenames — worth showing differently, since its boundaries are a
+  /// guess about photos saved before sessions were recorded.
+  final bool inferred;
+
+  final List<GeoImage> images; // newest first
+  const PhotoSession(
+      {required this.key, required this.inferred, required this.images});
+
+  DateTime get start => images.last.time;
+  DateTime get end => images.first.time;
+  int get count => images.length;
+  int get withFix => images.where((i) => i.hasFix).length;
+
+  /// "27 Sep, 18:58" — the session's own start, which is what an operator
+  /// remembers it by.
+  String get label {
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    final t = start;
+    return '${t.day} ${months[t.month - 1]}, '
+        '${t.hour.toString().padLeft(2, '0')}:'
+        '${t.minute.toString().padLeft(2, '0')}';
+  }
+}
+
+/// Photos more than this far apart belong to different sessions, when the
+/// filenames carry no session tag. The robot saves a soil photo every 60s and
+/// an obstacle photo at most every 15s while running, so a gap this long means
+/// it was switched off in between.
+const Duration kSessionGap = Duration(minutes: 20);
+
+/// Groups photos into sessions, newest session first.
+///
+/// Prefers the session tag in the filename. Untagged photos (saved before the
+/// tag existed) are grouped by time gap instead, so old runs still appear as
+/// separate sessions rather than one undifferentiated pile. The two kinds are
+/// never mixed into one session: a tagged photo and an untagged one are from
+/// different software versions, so a shared session would be a guess.
+List<PhotoSession> groupBySession(List<GeoImage> images,
+    {Duration gap = kSessionGap}) {
+  final sorted = [...images]..sort((a, b) => b.time.compareTo(a.time));
+
+  final tagged = <String, List<GeoImage>>{};
+  final untagged = <GeoImage>[];
+  for (final img in sorted) {
+    if (img.session != null) {
+      tagged.putIfAbsent(img.session!, () => []).add(img);
+    } else {
+      untagged.add(img);
+    }
+  }
+
+  final out = <PhotoSession>[
+    for (final e in tagged.entries)
+      PhotoSession(key: e.key, inferred: false, images: e.value),
+  ];
+
+  // Walk the untagged ones newest-first, breaking a session whenever the step
+  // back in time exceeds the gap.
+  var run = <GeoImage>[];
+  void flush() {
+    if (run.isEmpty) return;
+    out.add(PhotoSession(
+        key: 'gap:${run.first.time.millisecondsSinceEpoch}',
+        inferred: true,
+        images: List.of(run)));
+    run = [];
+  }
+
+  for (final img in untagged) {
+    if (run.isNotEmpty && run.last.time.difference(img.time).abs() > gap) {
+      flush();
+    }
+    run.add(img);
+  }
+  flush();
+
+  out.sort((a, b) => b.end.compareTo(a.end)); // newest session first
+  return out;
 }

@@ -124,6 +124,9 @@ class _GalleryGridState extends State<_GalleryGrid>
     with AutomaticKeepAliveClientMixin {
   late Future<List<GalleryImage>> _future;
 
+  /// Session key currently being shown, or null for all of them.
+  String? _sessionFilter;
+
   @override
   bool get wantKeepAlive => true;
 
@@ -134,8 +137,12 @@ class _GalleryGridState extends State<_GalleryGrid>
   }
 
   Future<List<GalleryImage>> _load() async {
-    final uri =
-        Uri.parse('http://${widget.ip}:$kGalleryPort/list/${widget.kind}');
+    // Sessions only make sense over the whole archive: with the server's
+    // default 200-image window, an older run would appear half-empty or not
+    // at all, and the grouping would silently lie about what a session held.
+    final uri = Uri.parse(
+        'http://${widget.ip}:$kGalleryPort/list/${widget.kind}'
+        '?limit=$kMapListLimit');
     final res = await http.get(uri).timeout(const Duration(seconds: 6));
     if (res.statusCode != 200) {
       throw Exception('Gallery server returned HTTP ${res.statusCode}');
@@ -185,24 +192,165 @@ class _GalleryGridState extends State<_GalleryGrid>
             ),
           );
         }
+        final sections = _sections(images);
+        final shown = _sessionFilter == null
+            ? sections
+            : sections.where((s) => s.key == _sessionFilter).toList();
         return RefreshIndicator(
           onRefresh: _refresh,
-          child: GridView.builder(
-            padding: const EdgeInsets.all(10),
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 3,
-              crossAxisSpacing: 6,
-              mainAxisSpacing: 6,
+          child: CustomScrollView(
+            slivers: [
+              // Only worth a filter when there is more than one session.
+              if (sections.length > 1)
+                SliverToBoxAdapter(child: _filterRow(sections)),
+              for (final s in shown) ...[
+                if (!(sections.length == 1 && s.session == null))
+                  SliverToBoxAdapter(child: _sessionHeader(s)),
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(10, 0, 10, 14),
+                  sliver: SliverGrid(
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 3,
+                      crossAxisSpacing: 6,
+                      mainAxisSpacing: 6,
+                    ),
+                    delegate: SliverChildBuilderDelegate(
+                      childCount: s.items.length,
+                      (context, i) => _tile(s.items, i),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// A session and the images in it, as the grid renders them.
+  _Section _sectionOf(PhotoSession? session, List<GalleryImage> items) =>
+      _Section(session: session, items: items);
+
+  /// Groups this tab's images into sessions, newest first.
+  ///
+  /// Files whose names don't parse at all -- the SLAM maps in the MAPS tab --
+  /// have no capture time to group by, so they land in one trailing section
+  /// that renders without a header.
+  List<_Section> _sections(List<GalleryImage> images) {
+    final byName = {for (final g in images) g.name: g};
+    final geos = <GeoImage>[
+      for (final g in images)
+        if (g.geo != null) g.geo!,
+    ];
+    final out = <_Section>[
+      for (final s in groupBySession(geos))
+        _sectionOf(s, <GalleryImage>[
+          for (final g in s.images)
+            if (byName[g.name] != null) byName[g.name]!,
+        ]),
+    ];
+    final unparsed = images.where((g) => g.geo == null).toList();
+    if (unparsed.isNotEmpty) out.add(_sectionOf(null, unparsed));
+    return out.where((s) => s.items.isNotEmpty).toList();
+  }
+
+  Widget _filterRow(List<_Section> sections) {
+    return SizedBox(
+      height: 52,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
+        children: [
+          _chip("ALL", null, sections.fold<int>(0, (n, s) => n + s.count)),
+          for (final s in sections)
+            _chip(s.label.toUpperCase(), s.key, s.count,
+                inferred: s.session?.inferred ?? false),
+        ],
+      ),
+    );
+  }
+
+  Widget _chip(String label, String? key, int count, {bool inferred = false}) {
+    final on = _sessionFilter == key;
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: GestureDetector(
+        onTap: () => setState(() => _sessionFilter = key),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+          decoration: BoxDecoration(
+            color: on ? AppColors.lime : AppColors.surface,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: on ? AppColors.lime : AppColors.border),
+          ),
+          child: Row(
+            children: [
+              if (inferred) ...[
+                Icon(Icons.schedule,
+                    size: 12,
+                    color: on ? AppColors.onLime : AppColors.textLo),
+                const SizedBox(width: 4),
+              ],
+              Text("$label  $count",
+                  style: GoogleFonts.rajdhani(
+                    color: on ? AppColors.onLime : AppColors.textHi,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                  )),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _sessionHeader(_Section s) {
+    final ses = s.session;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+      child: Row(
+        children: [
+          Container(width: 3, height: 16, color: AppColors.lime),
+          const SizedBox(width: 8),
+          Text(
+            ses == null ? "NOT SESSION-TAGGED" : s.label.toUpperCase(),
+            style: GoogleFonts.rajdhani(
+              color: AppColors.textHi,
+              fontWeight: FontWeight.w700,
+              fontSize: 14,
+              letterSpacing: 1.1,
             ),
-            itemCount: images.length,
-            itemBuilder: (context, i) {
-              final url = _imgUrl(images[i]);
-              return GestureDetector(
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              ses == null
+                  ? "${s.count} file${s.count == 1 ? '' : 's'}"
+                  : "${s.count} photo${s.count == 1 ? '' : 's'}"
+                      "${ses.withFix > 0 ? ' · ${ses.withFix} with GPS' : ''}"
+                      "${ses.inferred ? ' · grouped by time' : ''}",
+              overflow: TextOverflow.ellipsis,
+              style: GoogleFonts.rajdhani(
+                  color: AppColors.textLo, fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// One thumbnail. The viewer opens on THIS session's images, so swiping
+  /// stays inside the run the photo came from.
+  Widget _tile(List<GalleryImage> items, int i) {
+    final url = _imgUrl(items[i]);
+    return GestureDetector(
                 onTap: () => Navigator.push(
                   context,
                   MaterialPageRoute(
                     builder: (_) => _ImageViewer(
-                      images: images,
+                      images: items,
                       startIndex: i,
                       urlBuilder: _imgUrl,
                     ),
@@ -238,20 +386,15 @@ class _GalleryGridState extends State<_GalleryGrid>
                       ),
                       // Geotag badge: at a glance, which photos carry a
                       // position and can therefore appear on the map.
-                      if (images[i].geo != null)
+                      if (items[i].geo != null)
                         Positioned(
                           left: 4,
                           bottom: 4,
-                          child: _GeoBadge(geo: images[i].geo!),
+                          child: _GeoBadge(geo: items[i].geo!),
                         ),
                     ],
                   ),
                 ),
-              );
-            },
-          ),
-        );
-      },
     );
   }
 
@@ -462,4 +605,16 @@ class _GeoBadge extends StatelessWidget {
       ),
     );
   }
+}
+
+/// One session's worth of images, as the gallery renders them. `session` is
+/// null for files with no capture time in the name (the SLAM maps).
+class _Section {
+  final PhotoSession? session;
+  final List<GalleryImage> items;
+  const _Section({required this.session, required this.items});
+
+  String get key => session?.key ?? 'untagged';
+  String get label => session?.label ?? 'Other';
+  int get count => items.length;
 }
