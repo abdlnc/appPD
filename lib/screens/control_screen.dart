@@ -248,11 +248,6 @@ class _ControlScreenState extends State<ControlScreen> {
   Widget build(BuildContext context) {
     final socket = Provider.of<RobotSocket>(context);
     final Color accent = isAutoMode ? AppColors.amber : AppColors.lime;
-    // MANUAL's icon is violet, not green. Manual driving is the developer
-    // path (its joystick lives behind a dev setting), and this icon is also
-    // the hidden way into those settings -- so it must not look like one of
-    // the green controls the operator is meant to press.
-    final Color modeIconColor = isAutoMode ? AppColors.amber : AppColors.dev;
     final bool hasCamera = socket.cameraImage != null;
     final bool online = socket.isConnected;
 
@@ -320,10 +315,18 @@ class _ControlScreenState extends State<ControlScreen> {
                         padding: const EdgeInsets.symmetric(
                             horizontal: 14, vertical: 11),
                         decoration: BoxDecoration(
-                          color: AppColors.surface.withValues(alpha: 0.85),
+                          // MANUAL is filled violet, AUTO keeps the dark
+                          // surface with an amber edge. A solid block of a
+                          // colour used nowhere else marks the whole control
+                          // as developer territory, not just its icon.
+                          color: isAutoMode
+                              ? AppColors.surface.withValues(alpha: 0.85)
+                              : AppColors.devDim,
                           borderRadius: BorderRadius.circular(40),
-                          border:
-                              Border.all(color: accent.withValues(alpha: 0.6)),
+                          border: Border.all(
+                              color: isAutoMode
+                                  ? accent.withValues(alpha: 0.6)
+                                  : AppColors.dev),
                         ),
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
@@ -332,33 +335,34 @@ class _ControlScreenState extends State<ControlScreen> {
                               isAutoMode
                                   ? Icons.smart_toy
                                   : Icons.sports_esports,
-                              color: modeIconColor,
+                              // White on the violet fill; amber on the dark.
+                              color: isAutoMode ? accent : Colors.white,
                               size: 18,
                             ),
-                            const SizedBox(width: 8),
-                            Flexible(
-                              child: Text(
-                                isAutoMode ? "AUTO" : "MANUAL",
-                                overflow: TextOverflow.ellipsis,
-                                style: GoogleFonts.rajdhani(
-                                  color: accent,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 15,
-                                  letterSpacing: 1.5,
+                            // Only AUTO is labelled. MANUAL is the developer
+                            // path, so it stays an unlabelled violet marker
+                            // rather than reading as a mode on offer.
+                            if (isAutoMode) ...[
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  "AUTO",
+                                  overflow: TextOverflow.ellipsis,
+                                  style: GoogleFonts.rajdhani(
+                                    color: accent,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 15,
+                                    letterSpacing: 1.5,
+                                  ),
                                 ),
                               ),
-                            ),
+                            ],
                           ],
                         ),
                       ),
                     ),
                   ),
                   const Spacer(),
-                  // DEVELOPER button, shown only once a dev setting is on.
-                  // Violet, unlike every user-facing control (lime / amber /
-                  // red), so a dev affordance is never mistaken for a normal
-                  // one -- and it gives a way back into the settings without
-                  // the 7-tap unlock.
                   // Right action cluster -- consistent circular buttons
                   // Status, not a button (no onTap). Deliberately NOT green:
                   // green marks the icons the operator can actually press.
