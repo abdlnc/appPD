@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// calibration, not for someone operating the robot in the field.
 class DevSettings {
   static const String _kShowJoystick = 'dev.show_joystick';
+  static const String _kUnlocked = 'dev.unlocked';
 
   /// Whether the manual-drive joystick is shown. Off by default: in normal
   /// use the robot is driven in AUTO or NAV, and a joystick on screen invites
@@ -20,5 +21,21 @@ class DevSettings {
   static Future<void> saveShowJoystick(bool value) async {
     final p = await SharedPreferences.getInstance();
     await p.setBool(_kShowJoystick, value);
+  }
+
+  /// Whether the developer settings have ever been unlocked on this phone.
+  ///
+  /// Kept apart from [loadShowJoystick] so the developer button stays visible
+  /// -- and can show whether dev mode is on or off -- even when every dev
+  /// setting is switched off. Otherwise turning the joystick off would hide
+  /// the way back in, and the 7-tap unlock would be needed again.
+  static Future<bool> loadUnlocked() async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(_kUnlocked) ?? false;
+  }
+
+  static Future<void> saveUnlocked(bool value) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kUnlocked, value);
   }
 }

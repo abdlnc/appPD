@@ -24,6 +24,7 @@ class _ControlScreenState extends State<ControlScreen> {
 
   // --- Hidden developer settings (see DevSettings) ---
   bool _showJoystick = false; // hidden unless enabled in developer settings
+  bool _devUnlocked = false; // dev settings reachable (7 taps, remembered)
   int _devTaps = 0;
   DateTime? _lastDevTap;
   static const int _devTapsNeeded = 7;
@@ -34,6 +35,9 @@ class _ControlScreenState extends State<ControlScreen> {
     super.initState();
     DevSettings.loadShowJoystick().then((v) {
       if (mounted) setState(() => _showJoystick = v);
+    });
+    DevSettings.loadUnlocked().then((v) {
+      if (mounted) setState(() => _devUnlocked = v);
     });
   }
 
@@ -52,6 +56,10 @@ class _ControlScreenState extends State<ControlScreen> {
     if (left <= 0) {
       _devTaps = 0;
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      if (!_devUnlocked) {
+        setState(() => _devUnlocked = true);
+        DevSettings.saveUnlocked(true);
+      }
       _openDevSettings(socket);
       return;
     }
@@ -354,21 +362,25 @@ class _ControlScreenState extends State<ControlScreen> {
                   // red), so a dev affordance is never mistaken for a normal
                   // one -- and it gives a way back into the settings without
                   // the 7-tap unlock.
-                  if (_showJoystick) ...[
+                  // Violet, never green: green marks the buttons the
+                  // operator is meant to press, so this reads as not theirs.
+                  if (_devUnlocked) ...[
                     _circleBtn(
                       icon: Icons.developer_mode,
                       iconColor: AppColors.dev,
                       bg: AppColors.surface.withValues(alpha: 0.85),
                       borderColor: AppColors.devDim,
-                      tooltip: "Developer settings (on)",
+                      tooltip: "Developer settings",
                       onTap: () => _openDevSettings(socket),
                     ),
                     const SizedBox(width: 8),
                   ],
                   // Right action cluster -- consistent circular buttons
+                  // Status, not a button (no onTap). Deliberately NOT green:
+                  // green marks the icons the operator can actually press.
                   _circleBtn(
                     icon: online ? Icons.wifi : Icons.wifi_off,
-                    iconColor: online ? AppColors.online : AppColors.offline,
+                    iconColor: online ? AppColors.textHi : AppColors.offline,
                     bg: AppColors.surface.withValues(alpha: 0.85),
                     borderColor: AppColors.border,
                     tooltip: online ? "Connected" : "Disconnected",
