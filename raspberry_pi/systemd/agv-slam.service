@@ -1,5 +1,5 @@
 [Unit]
-Description=AGV SLAM mapping (slam_toolbox) (B.I.T.S.)
+Description=AGV SLAM mapping (slam_toolbox)
 # Deliberately a SEPARATE unit from agv.service, not bundled into
 # agv_autostart.launch.py: slam_toolbox (this build) has no "reset map"
 # service, so the only way to clear the map is restarting the node. Keeping

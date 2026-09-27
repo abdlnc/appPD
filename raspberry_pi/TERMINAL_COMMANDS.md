@@ -1,4 +1,4 @@
-# AGV — Complete Terminal Commands Guide (B.I.T.S.)
+# AGV — Complete Terminal Commands Guide
 
 Every command you need to run, test, and maintain the AGV system on the
 Raspberry Pi. (Login user: `admin`.)
@@ -261,4 +261,3 @@ curl -s localhost:8080/list/maps         # are saved SLAM maps showing up?
 ```
 
 ---
-*B.I.T.S. — Bacolod Information Technology Solutions*

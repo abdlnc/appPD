@@ -11,7 +11,7 @@ Owns the USB webcam (the ONLY node that opens it). Two jobs:
 
 This node no longer SAVES anything itself. Captures are written by
 ai_detector_node, and only when the model actually sees an obstacle in the
-frame (client request: the CAMERA decides what is an obstacle, not the Lidar).
+frame (the CAMERA decides what is an obstacle, not the Lidar).
 A separate full-res topic is used rather than reusing the app's live view
 because that one is deliberately downscaled and heavily compressed -- fine for
 a human eye, needlessly lossy for the detector.

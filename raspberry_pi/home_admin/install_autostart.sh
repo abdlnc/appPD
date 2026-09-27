@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B.I.T.S. AGV auto-start INSTALLER
+# AGV auto-start INSTALLER
 # Patakbuhin sa Pi pagkatapos mong i-WinSCP ang 3 files sa ~/:
 #     agv_autostart.launch.py   start_agv.sh   agv.service
 # Tapos:   sudo bash ~/install_autostart.sh

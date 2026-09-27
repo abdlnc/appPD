@@ -51,7 +51,11 @@ from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 
 # ----------- Distance thresholds (METERS - LaserScan is in meters) -----------
-MIN_DIST_FRONT     = 0.60     # obstacle trigger in the front zones
+# Raised 0.60 -> 0.90 alongside FWD_SPEED 0.60 -> 1.00 (2026-09-24). The
+# robot now closes on an obstacle ~1.7x faster, so triggering at the old
+# distance would leave it noticeably less room to stop than it had before.
+# This buys that room back. Lower it again only if FWD_SPEED comes down too.
+MIN_DIST_FRONT     = 0.90     # obstacle trigger in the front zones
 MIN_CLEARANCE_TURN = 0.40
 MIN_CLEARANCE_REAR = 0.40
 MIN_VALID_DIST     = 0.15     # ignore closer than this = own chassis / noise
@@ -60,14 +64,18 @@ MIN_VALID_DIST     = 0.15     # ignore closer than this = own chassis / noise
 ANGLE_OFFSET_DEG = 180.0
 
 # ----------- Drive speeds (normalized -1..1; motor_node scales to PWM) -----------
-# FWD_SPEED raised 0.40 -> 0.60 (client request: faster autonomous driving).
+# FWD_SPEED raised 0.40 -> 0.60 (faster autonomous driving).
 # Effective duty = FWD_SPEED * motor_node's SPEED_SCALE (0.60), so 24% -> 36%.
 # SAFETY TRADEOFF: avoidance still triggers at MIN_DIST_FRONT (0.60m) on a
 # 10Hz loop, so going faster leaves less room to react. If it starts clipping
 # obstacles, either bring this back down or raise MIN_DIST_FRONT to buy back
 # the reaction distance. Reverse/turn speeds deliberately left alone -- those
 # happen in tight spots where more speed is not an improvement.
-FWD_SPEED  = 0.60
+# 2026-09-24: FWD_SPEED 0.60 -> 1.00, the last of the software headroom
+# (motor_node's SPEED_SCALE is already 1.00, so this is now literally full
+# duty). MIN_DIST_FRONT was raised with it -- see below. REV/TURN left alone:
+# those happen in tight spots where speed is not an improvement.
+FWD_SPEED  = 1.00
 REV_SPEED  = 0.60
 TURN_SPEED = 0.50
 
@@ -88,8 +96,12 @@ CAM_MIN_CONF = 0.40
 CAM_TTL = 4.0
 
 # ----------- Obstacle WARNING thresholds (meters) -----------
-WARN_CAUTION = 1.00     # yellow: heads-up
-WARN_DANGER  = 0.60     # red: very close
+# Kept in step with MIN_DIST_FRONT: DANGER is meant to light up exactly when
+# avoidance triggers, and CAUTION comfortably before it. Leaving DANGER at
+# 0.60 while avoidance fired at 0.90 would have the robot swerving while the
+# app still showed amber.
+WARN_CAUTION = 1.40     # yellow: heads-up
+WARN_DANGER  = 0.90     # red: very close (= MIN_DIST_FRONT)
 
 # ----------- No-path safety hold -----------
 # Consecutive CLEAR scans required before driving again after being boxed in.
@@ -284,6 +296,15 @@ class AGVControl(Node):
         Uses the same thresholds avoid() makes its decisions with, so the
         warning fires exactly when those decisions have run out of options --
         not on some separate, looser guess.
+
+        Tried and REVERTED on 2026-09-25: requiring all six zones inside the
+        DANGER ring (0.90m) instead. It fired earlier and read more simply,
+        but it stopped the robot in places avoid() could still have driven out
+        of -- it will reverse with 0.5m behind it -- and "NO PATH" has to mean
+        the robot genuinely cannot move, or a human gets called to a robot
+        that was never stuck. The asymmetry below is the point: the front
+        needs room to DRIVE (MIN_DIST_FRONT), the sides and rear only need
+        room to TURN or BACK OUT (MIN_CLEARANCE_*), which is less.
         """
         z = self.zones
         fwd_blocked = (z['front'] < MIN_DIST_FRONT

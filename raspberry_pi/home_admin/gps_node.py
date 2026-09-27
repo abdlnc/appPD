@@ -6,6 +6,9 @@ Publishes:
     /gps  (std_msgs/String) : "lat,lon,heading,speed_kmh,fix,sats"
 
   * With a FIX  -> "lat,lon,heading,speed,fix,sats"   (sats = used in solution)
+    ...but only a fix that passes the QUALITY FILTER (enough satellites, low
+    enough HDOP -- see MIN_SATS_ACCEPT). A weak fix is published exactly like
+    no fix, because a position that jumps metres is worse than none.
   * ACQUIRING   -> ",,,0.0,0,<sats_in_view>"          (no fix yet; live feedback)
     The empty lat/lon tells the app "still acquiring", while <sats_in_view>
     (parsed from GSV) lets the app show a rising count instead of a blank card.
@@ -34,6 +37,27 @@ from geometry_msgs.msg import Twist
 
 PORT = "/dev/ttyAMA0"
 BAUD = 9600
+
+# ---- fix QUALITY filter ----
+# A receiver will report a "fix" from as few as 4 satellites, but with that
+# little geometry a tiny timing error swings the answer by metres, and a
+# satellite entering or leaving view makes the position JUMP -- seen on this
+# robot as a marker hopping around while parked (4 used, 5 in view).
+# A wrong position is worse than none (the same rule the photo tagging
+# follows), so a fix below this quality is published as NO fix.
+#
+# HDOP = the receiver's own estimate of how bad its satellite geometry is
+# (1 = ideal, <2 good, >5 poor). It is in the GGA sentence alongside the
+# satellite count, which is all that was read before.
+#
+# Two thresholds (hysteresis), like the no-path hold in control_node: a fix
+# has to be clearly GOOD to be accepted, but once accepted it is only dropped
+# when clearly BAD. A single threshold would flicker fix/no-fix every second
+# whenever reception sits right on it, and every flicker stops NAV mode.
+MIN_SATS_ACCEPT = 6        # to START trusting the fix
+MAX_HDOP_ACCEPT = 2.5
+MIN_SATS_KEEP   = 5        # to KEEP trusting a fix already accepted
+MAX_HDOP_KEEP   = 3.5
 
 # Simulation start point (Quezon City) + virtual robot limits
 SIM_START_LAT = 14.7481338
@@ -75,6 +99,8 @@ class GPSNode(Node):
         self.speed_kmh = 0.0
         self.fix = 0
         self.sats = 0
+        self.hdop = None            # None = not reported yet
+        self.quality_ok = False     # passes the filter (see MIN_SATS_*)
         self.sats_in_view = {}      # per-talker (GP/GL/GA/GB) satellites in view
         self.ser = serial.Serial(PORT, BAUD, timeout=1.0)
         self.running = True
@@ -103,6 +129,11 @@ class GPSNode(Node):
                         self.lon = lon
                     self.fix = int(parts[6]) if parts[6] else 0
                     self.sats = int(parts[7]) if parts[7] else 0
+                    try:
+                        self.hdop = float(parts[8]) if (len(parts) > 8
+                                                         and parts[8]) else None
+                    except ValueError:
+                        self.hdop = None
                 elif tag == 'RMC' and len(parts) >= 9:
                     if parts[7]:
                         try:
@@ -129,15 +160,45 @@ class GPSNode(Node):
             except Exception:
                 pass
 
+    def _quality_check(self):
+        """Apply the fix-quality filter, with hysteresis. Returns (ok, why)."""
+        if self.lat is None or self.lon is None or self.fix < 1:
+            return False, "no fix"
+        # No HDOP reported = geometry unknown = not trusted. The NEO-M8N always
+        # sends it with a fix, so this only bites on a malformed sentence.
+        hdop = self.hdop if self.hdop is not None else 99.0
+        if self.quality_ok:
+            min_sats, max_hdop = MIN_SATS_KEEP, MAX_HDOP_KEEP
+        else:
+            min_sats, max_hdop = MIN_SATS_ACCEPT, MAX_HDOP_ACCEPT
+        if self.sats < min_sats:
+            return False, f"only {self.sats} sats (need {min_sats})"
+        if hdop > max_hdop:
+            return False, f"HDOP {hdop:.1f} (need <= {max_hdop})"
+        return True, ""
+
     def publish_gps(self):
         msg = String()
-        if self.lat is not None and self.lon is not None and self.fix >= 1:
+        ok, why = self._quality_check()
+        if ok != self.quality_ok:
+            self.quality_ok = ok
+            hd = f"{self.hdop:.1f}" if self.hdop is not None else "?"
+            if ok:
+                self.get_logger().info(
+                    f"GPS fix ACCEPTED: {self.sats} sats, HDOP {hd}")
+            elif self.fix >= 1:
+                self.get_logger().warn(
+                    f"GPS fix REJECTED as unreliable: {why} -- publishing as "
+                    f"no fix rather than a position that may be metres off")
+        if ok:
             # real fix -> full position
             msg.data = (f"{self.lat:.7f},{self.lon:.7f},{self.heading},"
                         f"{self.speed_kmh:.1f},{self.fix},{self.sats}")
         else:
-            # no fix yet -> publish "acquiring" with satellites IN VIEW so the
-            # app shows a live, rising count instead of a blank screen.
+            # no fix, or a fix too poor to trust -> publish "acquiring" with
+            # satellites IN VIEW so the app shows a live, rising count instead
+            # of a blank screen. Every consumer (app, NAV, path recorder,
+            # photo tagging) already treats this as "no position".
             siv = sum(self.sats_in_view.values()) if self.sats_in_view else 0
             msg.data = f",,,0.0,0,{siv}"
         self.pub.publish(msg)
@@ -145,11 +206,16 @@ class GPSNode(Node):
         self._last_log += 1
         if self._last_log >= 10:
             self._last_log = 0
-            if self.lat is not None and self.fix >= 1:
+            hd = f"{self.hdop:.1f}" if self.hdop is not None else "?"
+            if self.quality_ok:
                 self.get_logger().info(
-                    f"FIX  sats={self.sats} lat={self.lat:.6f} "
+                    f"FIX  sats={self.sats} hdop={hd} lat={self.lat:.6f} "
                     f"lon={self.lon:.6f} hdg={self.heading or '-'} "
                     f"spd={self.speed_kmh:.1f}km/h")
+            elif self.lat is not None and self.fix >= 1:
+                self.get_logger().info(
+                    f"weak fix held back: sats={self.sats} hdop={hd} "
+                    f"(needs {MIN_SATS_ACCEPT}+ sats, HDOP <= {MAX_HDOP_ACCEPT})")
             else:
                 siv = sum(self.sats_in_view.values()) if self.sats_in_view else 0
                 self.get_logger().info(

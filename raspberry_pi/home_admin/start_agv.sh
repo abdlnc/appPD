@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B.I.T.S. AGV auto-start wrapper
+# AGV auto-start wrapper
 # Activates the RoboStack conda env (ros2_humble), sources the ROS2 workspace,
 # then launches the whole AGV system. Called by agv.service on boot.
 #

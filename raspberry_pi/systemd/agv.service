@@ -1,5 +1,5 @@
 [Unit]
-Description=AGV ROS2 Full System (B.I.T.S.)
+Description=AGV ROS2 Full System
 # Start after the network + multi-user are up; the app connects over WiFi to the
 # bridge WebSocket (:8765), and USB lidar / serial GPS need time to enumerate.
 After=multi-user.target network-online.target

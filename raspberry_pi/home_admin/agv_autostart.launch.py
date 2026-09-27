@@ -1,5 +1,5 @@
 """
-AGV AUTO-START master launch  --  B.I.T.S.
+AGV AUTO-START master launch
 
 Brings up the whole core system on boot:
   agv_full.launch.py (lidar + motor + control + bridge + camera)
@@ -28,7 +28,7 @@ GPS MODE TOGGLE (REAL is the default / production state):
   Buksan ang SIM:   touch ~/agv_use_sim   && sudo systemctl restart agv.service
   Ibalik sa REAL:   rm -f ~/agv_use_sim   && sudo systemctl restart agv.service
 
-  *** BAGO I-TURNOVER SA CLIENT: siguraduhing WALA ang ~/agv_use_sim (REAL). ***
+  *** BAGO GAMITIN SA FIELD: siguraduhing WALA ang ~/agv_use_sim (REAL). ***
 """
 
 import os
@@ -69,6 +69,6 @@ def generate_launch_description():
     if USE_SIM:
         actions.insert(0, LogInfo(msg=(
             "*** GPS NASA --sim MODE (may flag ~/agv_use_sim). HINDI totoong GPS. "
-            "Gawin: rm ~/agv_use_sim + restart, para ibalik sa REAL bago turnover. ***")))
+            "Gawin: rm ~/agv_use_sim + restart, para ibalik sa REAL bago gamitin sa field. ***")))
 
     return LaunchDescription(actions)

@@ -37,7 +37,15 @@ from std_msgs.msg import String
 import cv2
 
 # ----------------- camera settings -----------------
-CAMERA_INDEX  = 2           # /dev/video2 -- the second UVC camera (soil-facing)
+# Preferred index for the soil camera. NOT relied upon: USB cameras
+# re-enumerate, and this camera has already moved from /dev/video2 to
+# /dev/video3 across a replug. _open_camera() therefore probes candidates and
+# keeps the first that actually DELIVERS A FRAME -- cv2.VideoCapture happily
+# "opens" a non-existent index and then returns nothing, which looked exactly
+# like a working node that silently saved no images.
+CAMERA_INDEX  = 2           # first choice; others are tried if it yields nothing
+FRONT_CAMERA_INDEX = 0      # camera_node owns this one -- never take it
+MAX_CAMERA_INDEX   = 9      # how far to probe when searching
                              # (NOT 0/1: those belong to the front camera_node
                              # and its metadata node -- do not fall back onto them)
 
@@ -66,6 +74,7 @@ class SoilCameraNode(Node):
         super().__init__('soil_camera_node')
         os.makedirs(CAPTURE_DIR, exist_ok=True)
 
+        self.camera_index = CAMERA_INDEX      # updated by _open_camera()
         self.cap = self._open_camera()
         self.latest_frame = None        # full-res frame (BGR)
         self.lock = threading.Lock()
@@ -85,7 +94,7 @@ class SoilCameraNode(Node):
 
         self.create_timer(1.0, self.tick)      # check every second; save on interval
         self.get_logger().info(
-            f"Soil camera node ready (index {CAMERA_INDEX}). "
+            f"Soil camera node ready (index {self.camera_index}). "
             f"Saving snapshots to {CAPTURE_DIR} every {int(CAPTURE_INTERVAL)}s")
 
     def gps_cb(self, msg: String):
@@ -123,17 +132,47 @@ class SoilCameraNode(Node):
                         STAMP_SCALE, color, thick, cv2.LINE_AA)
         return frame
 
-    def _open_camera(self):
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self.get_logger().info(f"Soil camera opened at index {CAMERA_INDEX}")
-            return cap
+    def _try_index(self, idx):
+        """Open one index and require an actual frame from it.
+
+        Reading a frame is the whole point: isOpened() alone returns True for
+        an index with no device behind it, and for the metadata-only node some
+        UVC cameras expose alongside their capture node."""
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        for _ in range(5):                 # first read after open often fails
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap
+            time.sleep(0.15)
         cap.release()
+        return None
+
+    def _open_camera(self):
+        tried = []
+        for idx in [CAMERA_INDEX] + [i for i in range(MAX_CAMERA_INDEX + 1)
+                                     if i not in (CAMERA_INDEX,
+                                                  FRONT_CAMERA_INDEX)]:
+            if not os.path.exists(f"/dev/video{idx}"):
+                continue
+            tried.append(idx)
+            cap = self._try_index(idx)
+            if cap is not None:
+                self.camera_index = idx
+                if idx != CAMERA_INDEX:
+                    self.get_logger().warn(
+                        f"Soil camera not at index {CAMERA_INDEX}; using "
+                        f"index {idx} instead (USB re-enumeration)")
+                else:
+                    self.get_logger().info(f"Soil camera opened at index {idx}")
+                return cap
         self.get_logger().error(
-            f"No camera found at index {CAMERA_INDEX} - node will idle "
-            f"(check `v4l2-ctl --list-devices` / /dev/video{CAMERA_INDEX})")
+            f"No working soil camera found (probed {tried or 'nothing'}) - "
+            f"node will idle. Check `v4l2-ctl --list-devices`.")
         return None
 
     def _reader_loop(self):

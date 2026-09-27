@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B.I.T.S. AGV -- SLAM (slam_toolbox) start wrapper
+# AGV -- SLAM (slam_toolbox) start wrapper
 #
 # SLAM runs as its OWN systemd unit (agv-slam.service) rather than being
 # bundled into agv_autostart.launch.py, specifically so it can be restarted

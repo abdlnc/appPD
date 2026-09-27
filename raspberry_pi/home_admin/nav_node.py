@@ -39,12 +39,12 @@ from geometry_msgs.msg import Twist
 ARRIVAL_RADIUS = 3.0       # m; within this = arrived
 HEADING_TOL = 12.0         # deg; within this, go straight at cruise speed
 STEER_FULL_DEG = 45.0      # heading error that maps to full steer
-# Raised 0.60 -> 0.80 (client request: faster autonomous driving). Same
+# Raised 0.60 -> 0.80 (faster autonomous driving). Same
 # tradeoff as control_node's FWD_SPEED: the Lidar stop/reroute still kicks in
 # at FRONT_STOP_DIST (0.60m), so there is less room to react at speed. Only
 # the aligned-and-cruising case is faster; TURN_SPEED is left alone so heading
 # corrections stay controlled.
-CRUISE_SPEED = 0.80        # forward speed when roughly aligned
+CRUISE_SPEED = 1.00        # forward speed when roughly aligned (was 0.80)
 TURN_SPEED = 0.40          # forward speed while correcting heading
 LOOP_HZ = 5.0
 
@@ -65,7 +65,9 @@ CAM_TTL = 4.0              # s; must exceed ai_detector's AI_MIN_INTERVAL (3s)
 
 # ---- obstacle (Lidar) ----
 ANGLE_OFFSET_DEG = 180.0   # lidar mounted rotated 180 (matches control_node)
-FRONT_STOP_DIST = 0.60     # m; obstacle ahead within this -> stop/reroute
+# 0.60 -> 0.90 with CRUISE_SPEED 0.80 -> 1.00 (2026-09-24), matching
+# control_node's MIN_DIST_FRONT: same reasoning, more speed needs more room.
+FRONT_STOP_DIST = 0.90     # m; obstacle ahead within this -> stop/reroute
 MIN_VALID_DIST = 0.15      # ignore closer than this (own chassis / noise)
 
 R_EARTH = 6371000.0
@@ -106,6 +108,7 @@ class NavNode(Node):
         self.lon = None
         self.heading = None             # deg, or None if unknown
         self.front_dist = 9999.0
+        self._no_fix_logged = False     # edge guard for the NAV-paused log
         # camera caution state (see the constants above)
         self._cam_time = 0.0
         self._cam_conf = 0.0
@@ -142,6 +145,14 @@ class NavNode(Node):
             self.lat = float(p[0])
             self.lon = float(p[1])
         except ValueError:
+            # No fix -- or a fix gps_node rejected as too poor to trust.
+            # FORGET the position rather than keep the last one: navigating
+            # toward a waypoint on a stale position means driving blind, in a
+            # direction computed from where the robot used to be. tick() then
+            # stops the robot until a trustworthy fix returns.
+            self.lat = None
+            self.lon = None
+            self.heading = None
             return
         if len(p) >= 3 and p[2].strip():
             try:
@@ -215,8 +226,23 @@ class NavNode(Node):
 
     def tick(self):
         # only drive while in NAV mode with a target and a known position
-        if self.mode != "NAV" or self.target is None or self.lat is None:
+        if self.mode != "NAV" or self.target is None:
             return
+        if self.lat is None:
+            # NAV is active but there is no trustworthy position. Hold still
+            # with an explicit zero -- not by going silent and leaving it to
+            # motor_node's command watchdog, which would first coast for up to
+            # its 0.7s timeout on whatever was last sent.
+            self.send(0.0, 0.0)
+            if not self._no_fix_logged:
+                self._no_fix_logged = True
+                self.get_logger().warn(
+                    "NAV paused: no reliable GPS fix -- holding still until "
+                    "one returns")
+            return
+        if self._no_fix_logged:
+            self._no_fix_logged = False
+            self.get_logger().info("GPS fix back -- NAV resuming")
 
         tlat, tlon = self.target
         dist = distance_m(self.lat, self.lon, tlat, tlon)
