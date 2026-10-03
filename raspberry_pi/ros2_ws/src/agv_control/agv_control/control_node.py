@@ -60,7 +60,7 @@ from geometry_msgs.msg import Twist
 # avoiding roughly two thirds as far out as it did a day ago, so there is
 # less room to stop if it misreads a return. Raise these first if it starts
 # clipping obstacles.
-MIN_DIST_FRONT     = 0.63     # obstacle trigger in the front zones (was 0.90)
+MIN_DIST_FRONT     = 0.40     # obstacle trigger in the front zones (was 0.63)
 MIN_CLEARANCE_TURN = 0.28     # room needed to turn out of trouble (was 0.40)
 MIN_CLEARANCE_REAR = 0.28     # room needed to reverse out (was 0.40)
 MIN_VALID_DIST     = 0.15     # ignore closer than this = own chassis / noise
@@ -77,11 +77,12 @@ ANGLE_OFFSET_DEG = 180.0
 # the reaction distance. Reverse/turn speeds deliberately left alone -- those
 # happen in tight spots where more speed is not an improvement.
 # 2026-09-24: FWD_SPEED 0.60 -> 1.00, the last of the software headroom.
-# 2026-10-03: backed off to 0.80 -- 80% of full duty -- on request, after
-# driving it at 1.00. MIN_DIST_FRONT stays at the 0.90m raised for full
-# speed, so the margin is now slightly more generous than it was. REV/TURN
-# left alone: those happen in tight spots where speed is not an improvement.
-FWD_SPEED  = 0.80
+# 2026-10-03: 1.00 -> 0.80 -> 0.50 over the day's testing. At 0.50 the robot
+# drives at half the driver's output, which is also what makes the 0.40m
+# front trigger below workable: slower approach, less distance needed to
+# stop. REV/TURN left alone -- those happen in tight spots where speed is not
+# an improvement.
+FWD_SPEED  = 0.50
 REV_SPEED  = 0.60
 TURN_SPEED = 0.50
 
@@ -107,7 +108,7 @@ CAM_TTL = 4.0
 # 0.60 while avoidance fired at 0.90 would have the robot swerving while the
 # app still showed amber.
 WARN_CAUTION = 1.40     # yellow: heads-up (left wide on purpose)
-WARN_DANGER  = 0.63     # red: very close (tracks MIN_DIST_FRONT)
+WARN_DANGER  = 0.40     # red: very close (tracks MIN_DIST_FRONT)
 
 # ----------- Boxed-in ("NO PATH") distances -----------
 # The boxed-in test uses its OWN distances, larger than the ones avoid()

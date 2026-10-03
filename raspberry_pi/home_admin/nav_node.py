@@ -44,7 +44,9 @@ STEER_FULL_DEG = 45.0      # heading error that maps to full steer
 # at FRONT_STOP_DIST (0.60m), so there is less room to react at speed. Only
 # the aligned-and-cruising case is faster; TURN_SPEED is left alone so heading
 # corrections stay controlled.
-CRUISE_SPEED = 1.00        # forward speed when roughly aligned (was 0.80)
+CRUISE_SPEED = 0.50        # forward speed when roughly aligned; matches
+                           # AUTO's FWD_SPEED and MANUAL's MANUAL_SPEED, so
+                           # all three modes drive at the same pace
 TURN_SPEED = 0.40          # forward speed while correcting heading
 LOOP_HZ = 5.0
 
@@ -69,7 +71,7 @@ ANGLE_OFFSET_DEG = 180.0   # lidar mounted rotated 180 (matches control_node)
 # two are kept equal so AUTO and NAV react to an obstacle at the same
 # distance -- a robot that stops at different ranges depending on its mode is
 # hard to reason about from the outside.
-FRONT_STOP_DIST = 0.63     # m; obstacle ahead within this -> stop/reroute
+FRONT_STOP_DIST = 0.40     # m; obstacle ahead within this -> stop/reroute
 MIN_VALID_DIST = 0.15      # ignore closer than this (own chassis / noise)
 
 R_EARTH = 6371000.0
