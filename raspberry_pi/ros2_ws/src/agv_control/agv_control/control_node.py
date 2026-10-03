@@ -71,11 +71,12 @@ ANGLE_OFFSET_DEG = 180.0
 # obstacles, either bring this back down or raise MIN_DIST_FRONT to buy back
 # the reaction distance. Reverse/turn speeds deliberately left alone -- those
 # happen in tight spots where more speed is not an improvement.
-# 2026-09-24: FWD_SPEED 0.60 -> 1.00, the last of the software headroom
-# (motor_node's SPEED_SCALE is already 1.00, so this is now literally full
-# duty). MIN_DIST_FRONT was raised with it -- see below. REV/TURN left alone:
-# those happen in tight spots where speed is not an improvement.
-FWD_SPEED  = 1.00
+# 2026-09-24: FWD_SPEED 0.60 -> 1.00, the last of the software headroom.
+# 2026-10-03: backed off to 0.80 -- 80% of full duty -- on request, after
+# driving it at 1.00. MIN_DIST_FRONT stays at the 0.90m raised for full
+# speed, so the margin is now slightly more generous than it was. REV/TURN
+# left alone: those happen in tight spots where speed is not an improvement.
+FWD_SPEED  = 0.80
 REV_SPEED  = 0.60
 TURN_SPEED = 0.50
 

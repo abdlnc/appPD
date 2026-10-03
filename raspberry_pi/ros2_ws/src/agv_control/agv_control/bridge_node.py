@@ -84,7 +84,7 @@ RESET_MAP_CMD     = ["sudo", "-n", "systemctl", "restart", "agv-slam.service"]
 RESET_MAP_TIMEOUT = 30.0   # s; the unit itself settles in ~2s, this is just a bound
 
 # Top forward/reverse speed for MANUAL driving, as a fraction of full stick.
-# Set to match AUTO mode's cruise speed (control_node.py's FWD_SPEED = 1.00)
+# Set to match AUTO mode's cruise speed (control_node.py's FWD_SPEED = 0.80)
 # so the robot drives at the same pace whether a human or the obstacle
 # avoidance is steering. Without it, full stick sent 1.0
 # and manual was noticeably FASTER than AUTO.
@@ -95,7 +95,7 @@ RESET_MAP_TIMEOUT = 30.0   # s; the unit itself settles in ~2s, this is just a b
 # change this too. NAV mode is deliberately different (nav_node.py's
 # CRUISE_SPEED = 0.80) -- set 0.80 here instead to match NAV.
 # Steering (angular.z) is NOT scaled: it's an angle, not a speed.
-MANUAL_SPEED = 1.00
+MANUAL_SPEED = 0.80
                             # (map_saver_cli can transiently fail right after
                             # a restart -- the script retries up to 3x itself)
 
