@@ -65,9 +65,11 @@ CAM_TTL = 4.0              # s; must exceed ai_detector's AI_MIN_INTERVAL (3s)
 
 # ---- obstacle (Lidar) ----
 ANGLE_OFFSET_DEG = 180.0   # lidar mounted rotated 180 (matches control_node)
-# 0.60 -> 0.90 with CRUISE_SPEED 0.80 -> 1.00 (2026-09-24), matching
-# control_node's MIN_DIST_FRONT: same reasoning, more speed needs more room.
-FRONT_STOP_DIST = 0.90     # m; obstacle ahead within this -> stop/reroute
+# Cut 30% to 0.63 (2026-10-03) to match control_node's MIN_DIST_FRONT. The
+# two are kept equal so AUTO and NAV react to an obstacle at the same
+# distance -- a robot that stops at different ranges depending on its mode is
+# hard to reason about from the outside.
+FRONT_STOP_DIST = 0.63     # m; obstacle ahead within this -> stop/reroute
 MIN_VALID_DIST = 0.15      # ignore closer than this (own chassis / noise)
 
 R_EARTH = 6371000.0

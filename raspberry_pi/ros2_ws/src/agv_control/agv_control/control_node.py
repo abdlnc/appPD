@@ -51,13 +51,18 @@ from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 
 # ----------- Distance thresholds (METERS - LaserScan is in meters) -----------
-# Raised 0.60 -> 0.90 alongside FWD_SPEED 0.60 -> 1.00 (2026-09-24). The
-# robot now closes on an obstacle ~1.7x faster, so triggering at the old
-# distance would leave it noticeably less room to stop than it had before.
-# This buys that room back. Lower it again only if FWD_SPEED comes down too.
-MIN_DIST_FRONT     = 0.90     # obstacle trigger in the front zones
-MIN_CLEARANCE_TURN = 0.40
-MIN_CLEARANCE_REAR = 0.40
+# 2026-10-03: all three cut by 30% on request (0.90 -> 0.63, 0.40 -> 0.28),
+# which also suits FWD_SPEED coming back down to 0.80. These are avoid()'s
+# own working distances: when it starts a maneuver, and how much room it
+# needs to turn into or reverse into.
+#
+# This is the tightest the robot has driven. At 0.63m and 80% duty it begins
+# avoiding roughly two thirds as far out as it did a day ago, so there is
+# less room to stop if it misreads a return. Raise these first if it starts
+# clipping obstacles.
+MIN_DIST_FRONT     = 0.63     # obstacle trigger in the front zones (was 0.90)
+MIN_CLEARANCE_TURN = 0.28     # room needed to turn out of trouble (was 0.40)
+MIN_CLEARANCE_REAR = 0.28     # room needed to reverse out (was 0.40)
 MIN_VALID_DIST     = 0.15     # ignore closer than this = own chassis / noise
 
 # ----------- Lidar orientation (measured: mounted rotated 180 deg) -----------
@@ -101,8 +106,8 @@ CAM_TTL = 4.0
 # avoidance triggers, and CAUTION comfortably before it. Leaving DANGER at
 # 0.60 while avoidance fired at 0.90 would have the robot swerving while the
 # app still showed amber.
-WARN_CAUTION = 1.40     # yellow: heads-up
-WARN_DANGER  = 0.90     # red: very close (= MIN_DIST_FRONT)
+WARN_CAUTION = 1.40     # yellow: heads-up (left wide on purpose)
+WARN_DANGER  = 0.63     # red: very close (tracks MIN_DIST_FRONT)
 
 # ----------- Boxed-in ("NO PATH") distances -----------
 # The boxed-in test uses its OWN distances, larger than the ones avoid()
@@ -123,7 +128,10 @@ WARN_DANGER  = 0.90     # red: very close (= MIN_DIST_FRONT)
 # the binding constraint.
 BLOCKED_FRONT = 1.20          # was MIN_DIST_FRONT (0.90)
 BLOCKED_REAR  = 0.70          # was MIN_CLEARANCE_REAR (0.40)
-BLOCKED_SIDE  = MIN_CLEARANCE_TURN
+# Deliberately a number of its own, not MIN_CLEARANCE_TURN any more: that
+# shrank to 0.28 with the avoidance cut, and letting the NO PATH warning
+# follow it down would undo the widening asked for a day earlier.
+BLOCKED_SIDE  = 0.40
 
 # ----------- No-path safety hold -----------
 # Consecutive CLEAR scans required before driving again after being boxed in.
