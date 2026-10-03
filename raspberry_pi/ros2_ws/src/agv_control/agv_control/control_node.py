@@ -60,7 +60,7 @@ from geometry_msgs.msg import Twist
 # avoiding roughly two thirds as far out as it did a day ago, so there is
 # less room to stop if it misreads a return. Raise these first if it starts
 # clipping obstacles.
-MIN_DIST_FRONT     = 0.40     # obstacle trigger in the front zones (was 0.63)
+MIN_DIST_FRONT     = 0.70     # obstacle trigger in the front zones (was 0.40)
 MIN_CLEARANCE_TURN = 0.28     # room needed to turn out of trouble (was 0.40)
 MIN_CLEARANCE_REAR = 0.28     # room needed to reverse out (was 0.40)
 MIN_VALID_DIST     = 0.15     # ignore closer than this = own chassis / noise
@@ -108,7 +108,7 @@ CAM_TTL = 4.0
 # 0.60 while avoidance fired at 0.90 would have the robot swerving while the
 # app still showed amber.
 WARN_CAUTION = 1.40     # yellow: heads-up (left wide on purpose)
-WARN_DANGER  = 0.40     # red: very close (tracks MIN_DIST_FRONT)
+WARN_DANGER  = 0.70     # red: very close (tracks MIN_DIST_FRONT)
 
 # ----------- Boxed-in ("NO PATH") distances -----------
 # The boxed-in test uses its OWN distances, larger than the ones avoid()

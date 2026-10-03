@@ -71,7 +71,7 @@ ANGLE_OFFSET_DEG = 180.0   # lidar mounted rotated 180 (matches control_node)
 # two are kept equal so AUTO and NAV react to an obstacle at the same
 # distance -- a robot that stops at different ranges depending on its mode is
 # hard to reason about from the outside.
-FRONT_STOP_DIST = 0.40     # m; obstacle ahead within this -> stop/reroute
+FRONT_STOP_DIST = 0.70     # m; obstacle ahead within this -> stop/reroute
 MIN_VALID_DIST = 0.15      # ignore closer than this (own chassis / noise)
 
 R_EARTH = 6371000.0
