@@ -17,6 +17,10 @@ Endpoints:
                              geotagged photos still appear on the field map)
     GET /list/detections  -> same, for ~/agv_detections
     GET /list/soil        -> same, for ~/agv_soil_images (soil_camera_node.py)
+    DELETE /img/<kind>/<name>
+                          -> delete one image. The ONLY write this server
+                             does; see _resolve() for the guards, which are
+                             the same ones GET uses.
     GET /list/maps        -> same, for ~/agv_maps (save_slam_map.sh's .png output;
                               the .pgm/.yaml originals are filtered out, see below)
     GET /img/captures/<name>    -> the image bytes (jpg/jpeg/png)
@@ -74,6 +78,83 @@ def _list_dir(path, limit=MAX_LIST):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _resolve(self, kind, name):
+        """Validate kind+name and return the real path, or None after
+        sending the error.
+
+        Shared by GET and DELETE on purpose: a delete that validated its path
+        even slightly differently from the read path is exactly how a
+        traversal bug gets in. Three checks, all of which must pass:
+          1. the kind is one we serve
+          2. the name is a BARE basename with an allowed extension -- no
+             slashes, no "..", nothing that could climb out
+          3. the resolved real path is still inside the real directory, and
+             is a regular file
+        """
+        if kind not in DIRS:
+            self._send_json({"error": "unknown kind"}, 404)
+            return None
+        safe_name = os.path.basename(name)
+        if safe_name != name or not safe_name.lower().endswith(ALLOWED_EXT):
+            self._send_json({"error": "bad filename"}, 400)
+            return None
+        real_dir = os.path.realpath(DIRS[kind])
+        real_full = os.path.realpath(os.path.join(real_dir, safe_name))
+        if (not real_full.startswith(real_dir + os.sep)
+                or not os.path.isfile(real_full)):
+            self._send_json({"error": "not found"}, 404)
+            return None
+        return real_full
+
+    def do_DELETE(self):
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        if len(parts) != 3 or parts[0] != "img":
+            self._send_json({"error": "not found"}, 404)
+            return
+        kind, name = parts[1], parts[2]
+        real_full = self._resolve(kind, name)
+        if real_full is None:
+            return
+        try:
+            os.remove(real_full)
+        except OSError as e:
+            self._send_json({"error": f"delete failed: {e}"}, 500)
+            return
+        # A front-camera detection has a raw twin under a different kind;
+        # deleting only the annotated copy would leave the gallery showing
+        # the same moment in the CAPTURES tab, which is not what the person
+        # asked for when they deleted the obstacle photo.
+        also = []
+        twin_kind = {"detections": "captures", "captures": "detections"}.get(kind)
+        if twin_kind:
+            base = os.path.basename(real_full)
+            twin = (base.replace("_detected.", ".") if kind == "detections"
+                    else base.replace(".", "_detected.", 1))
+            twin_path = self._resolve_quiet(twin_kind, twin)
+            if twin_path:
+                try:
+                    os.remove(twin_path)
+                    also.append(f"{twin_kind}/{twin}")
+                except OSError:
+                    pass
+        self._send_json({"deleted": f"{kind}/{os.path.basename(real_full)}",
+                         "also_deleted": also})
+
+    def _resolve_quiet(self, kind, name):
+        """_resolve() without sending an error response -- for the twin
+        lookup, where "not there" is a normal outcome."""
+        if kind not in DIRS:
+            return None
+        safe_name = os.path.basename(name)
+        if safe_name != name or not safe_name.lower().endswith(ALLOWED_EXT):
+            return None
+        real_dir = os.path.realpath(DIRS[kind])
+        real_full = os.path.realpath(os.path.join(real_dir, safe_name))
+        if (not real_full.startswith(real_dir + os.sep)
+                or not os.path.isfile(real_full)):
+            return None
+        return real_full
+
     def log_message(self, fmt, *args):
         pass   # keep journalctl quiet; failures still come back as HTTP status codes
 
@@ -106,20 +187,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if len(parts) == 3 and parts[0] == "img":
             kind, name = parts[1], parts[2]
-            if kind not in DIRS:
-                self._send_json({"error": "unknown kind"}, 404)
+            real_full = self._resolve(kind, name)
+            if real_full is None:
                 return
-            # path-traversal guard: basename must match the original request
-            safe_name = os.path.basename(name)
-            if safe_name != name or not safe_name.lower().endswith(ALLOWED_EXT):
-                self._send_json({"error": "bad filename"}, 400)
-                return
-            real_dir = os.path.realpath(DIRS[kind])
-            real_full = os.path.realpath(os.path.join(real_dir, safe_name))
-            if (not real_full.startswith(real_dir + os.sep)
-                    or not os.path.isfile(real_full)):
-                self._send_json({"error": "not found"}, 404)
-                return
+            safe_name = os.path.basename(real_full)
             ext = os.path.splitext(safe_name)[1].lower()
             with open(real_full, "rb") as f:
                 data = f.read()

@@ -103,6 +103,27 @@ CAM_TTL = 4.0
 WARN_CAUTION = 1.40     # yellow: heads-up
 WARN_DANGER  = 0.90     # red: very close (= MIN_DIST_FRONT)
 
+# ----------- Boxed-in ("NO PATH") distances -----------
+# The boxed-in test uses its OWN distances, larger than the ones avoid()
+# makes its decisions with. Reason, from testing on the robot: sharing
+# avoid()'s thresholds meant NO PATH only appeared once an obstacle was
+# practically inside the chassis -- a hand had to be within the robot's own
+# frame before all four directions counted as blocked. Too late to be useful.
+#
+# The trade-off, stated plainly: NO PATH can now appear while avoid() still
+# has a maneuver it could attempt -- it will reverse with 0.5m behind it,
+# where this calls 0.70m blocked. The robot stops and asks for help slightly
+# sooner than it is strictly out of options, which is the right direction to
+# err in for a warning a human has to respond to.
+#
+# SIDES stay at MIN_CLEARANCE_TURN: turning out needs far less room than
+# driving or reversing. Note that with the AND in path_blocked(), whichever
+# distance is SMALLEST decides when the warning fires -- so the sides are now
+# the binding constraint.
+BLOCKED_FRONT = 1.20          # was MIN_DIST_FRONT (0.90)
+BLOCKED_REAR  = 0.70          # was MIN_CLEARANCE_REAR (0.40)
+BLOCKED_SIDE  = MIN_CLEARANCE_TURN
+
 # ----------- No-path safety hold -----------
 # Consecutive CLEAR scans required before driving again after being boxed in.
 # Asymmetric on purpose: the hold engages on a SINGLE blocked scan (stopping
@@ -302,17 +323,19 @@ class AGVControl(Node):
         but it stopped the robot in places avoid() could still have driven out
         of -- it will reverse with 0.5m behind it -- and "NO PATH" has to mean
         the robot genuinely cannot move, or a human gets called to a robot
-        that was never stuck. The asymmetry below is the point: the front
-        needs room to DRIVE (MIN_DIST_FRONT), the sides and rear only need
-        room to TURN or BACK OUT (MIN_CLEARANCE_*), which is less.
+        that was never stuck. The asymmetry is the point: the front needs
+        room to DRIVE, the sides and rear only need room to TURN or BACK OUT,
+        which is less. The distances are BLOCKED_* above, set wider than
+        avoid()'s own thresholds so the warning arrives before an obstacle is
+        inside the robot's frame.
         """
         z = self.zones
-        fwd_blocked = (z['front'] < MIN_DIST_FRONT
-                       and z['front_l'] < MIN_DIST_FRONT
-                       and z['front_r'] < MIN_DIST_FRONT)
-        rear_blocked = z['back'] < MIN_CLEARANCE_REAR
-        turn_blocked = (z['left'] < MIN_CLEARANCE_TURN
-                        and z['right'] < MIN_CLEARANCE_TURN)
+        fwd_blocked = (z['front'] < BLOCKED_FRONT
+                       and z['front_l'] < BLOCKED_FRONT
+                       and z['front_r'] < BLOCKED_FRONT)
+        rear_blocked = z['back'] < BLOCKED_REAR
+        turn_blocked = (z['left'] < BLOCKED_SIDE
+                        and z['right'] < BLOCKED_SIDE)
         return fwd_blocked and rear_blocked and turn_blocked
 
     # ----------------------- obstacle warning (to app) -----------------------

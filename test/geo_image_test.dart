@@ -52,10 +52,18 @@ void main() {
     });
 
     test('non-robot filenames return null', () {
-      expect(GeoImage.parse('map_20260918_155940.png'), isNull);
       expect(GeoImage.parse('IMG_1234.jpg'), isNull);
       expect(GeoImage.parse(''), isNull);
       expect(GeoImage.parse('capture_2026_lat1_lon2.jpg'), isNull);
+      expect(GeoImage.parse('map_2026_155940.png'), isNull); // malformed date
+    });
+
+    test('a saved SLAM map parses for its date', () {
+      final g = GeoImage.parse('map_20260918_155940.png')!;
+      expect(g.kind, 'map');
+      expect(g.time, DateTime(2026, 9, 18, 15, 59, 40));
+      expect(g.hasFix, isFalse);   // a map covers a run, not a moment
+      expect(g.session, isNull);
     });
 
     test('coordLabel shows 3 decimals, rounded to nearest', () {

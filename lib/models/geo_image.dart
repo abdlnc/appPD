@@ -71,6 +71,14 @@ class GeoImage {
   String get coordLabel =>
       hasFix ? '${formatCoord(lat!)}, ${formatCoord(lon!)}' : 'no GPS fix';
 
+  /// Saved SLAM maps: `map_20260926_180005.png`. No GPS and no session --
+  /// a map is the product of a whole run, not a moment in one -- but it does
+  /// carry a date, which is what the gallery groups them by.
+  static final RegExp _mapRe = RegExp(
+    r'^(map)_(\d{8})_(\d{6})\.(?:png|pgm|yaml)$',
+    caseSensitive: false,
+  );
+
   static final RegExp _re = RegExp(
     r'^(capture|soil)_(\d{8})_(\d{6})_'
     r'(?:nogps|lat(-?\d+(?:\.\d+)?)_lon(-?\d+(?:\.\d+)?))'
@@ -83,19 +91,21 @@ class GeoImage {
   /// SLAM maps (map_*.png), stray files, or a future naming scheme. Callers
   /// treat null as "no coordinates known", never as an error.
   static GeoImage? parse(String name) {
+    final mapMatch = _mapRe.firstMatch(name.trim());
+    if (mapMatch != null) {
+      return GeoImage(
+        name: name.trim(),
+        kind: 'map',
+        time: _stamp(mapMatch.group(2)!, mapMatch.group(3)!),
+        lat: null,
+        lon: null,
+        annotated: false,
+      );
+    }
     final m = _re.firstMatch(name.trim());
     if (m == null) return null;
 
-    final d = m.group(2)!; // yyyyMMdd
-    final t = m.group(3)!; // HHmmss
-    final time = DateTime(
-      int.parse(d.substring(0, 4)),
-      int.parse(d.substring(4, 6)),
-      int.parse(d.substring(6, 8)),
-      int.parse(t.substring(0, 2)),
-      int.parse(t.substring(2, 4)),
-      int.parse(t.substring(4, 6)),
-    );
+    final time = _stamp(m.group(2)!, m.group(3)!);
 
     final latS = m.group(4);
     final lonS = m.group(5);
@@ -132,6 +142,16 @@ double metersBetween(double lat1, double lon1, double lat2, double lon2) {
 }
 
 double _rad(double deg) => deg * math.pi / 180.0;
+
+/// "yyyyMMdd" + "HHmmss" -> DateTime.
+DateTime _stamp(String d, String t) => DateTime(
+      int.parse(d.substring(0, 4)),
+      int.parse(d.substring(4, 6)),
+      int.parse(d.substring(6, 8)),
+      int.parse(t.substring(0, 2)),
+      int.parse(t.substring(2, 4)),
+      int.parse(t.substring(4, 6)),
+    );
 
 /// Decimal places used when a coordinate is SHOWN.
 ///

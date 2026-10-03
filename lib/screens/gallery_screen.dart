@@ -244,6 +244,36 @@ class _GalleryGridState extends State<_GalleryGrid>
       for (final g in images)
         if (g.geo != null) g.geo!,
     ];
+
+    // SLAM maps are grouped by DATE, not by session: a map is the product of
+    // a whole run rather than a moment inside one, and several saved on the
+    // same day belong together as one album.
+    if (widget.kind == 'maps') {
+      final byDay = <String, List<GalleryImage>>{};
+      for (final g in geos) {
+        final d = g.time;
+        final key = '${d.year}-${d.month.toString().padLeft(2, '0')}'
+            '-${d.day.toString().padLeft(2, '0')}';
+        if (byName[g.name] != null) {
+          byDay.putIfAbsent(key, () => []).add(byName[g.name]!);
+        }
+      }
+      final days = byDay.keys.toList()..sort((a, b) => b.compareTo(a));
+      final out = <_Section>[
+        for (final k in days)
+          _Section(
+            session: null,
+            items: byDay[k]!..sort((a, b) =>
+                b.captureTime.compareTo(a.captureTime)),
+            titleOverride: _dayLabel(byDay[k]!.first.captureTime),
+            keyOverride: k,
+          ),
+      ];
+      final rest = images.where((g) => g.geo == null).toList();
+      if (rest.isNotEmpty) out.add(_sectionOf(null, rest));
+      return out.where((s) => s.items.isNotEmpty).toList();
+    }
+
     final out = <_Section>[
       for (final s in groupBySession(geos))
         _sectionOf(s, <GalleryImage>[
@@ -254,6 +284,78 @@ class _GalleryGridState extends State<_GalleryGrid>
     final unparsed = images.where((g) => g.geo == null).toList();
     if (unparsed.isNotEmpty) out.add(_sectionOf(null, unparsed));
     return out.where((s) => s.items.isNotEmpty).toList();
+  }
+
+  /// "26 September 2026" -- the album date on a group of saved maps.
+  static String _dayLabel(DateTime t) {
+    const months = [
+      'January', 'February', 'March', 'April', 'May', 'June', 'July',
+      'August', 'September', 'October', 'November', 'December',
+    ];
+    return '${t.day} ${months[t.month - 1]} ${t.year}';
+  }
+
+  /// Confirm, then delete on the Pi and refresh the tab.
+  Future<void> _confirmDelete(GalleryImage img) async {
+    final twin = widget.kind == 'detections' || widget.kind == 'captures';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text("Delete this image?",
+            style: GoogleFonts.rajdhani(
+                color: AppColors.textHi, fontWeight: FontWeight.w700)),
+        content: Text(
+          twin
+              ? "${img.name}\n\nIts matching raw/annotated copy goes too, so "
+                  "the same moment doesn't stay behind in the other tab.\n\n"
+                  "This cannot be undone."
+              : "${img.name}\n\nThis cannot be undone.",
+          style: GoogleFonts.rajdhani(color: AppColors.textLo),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text("CANCEL",
+                style: GoogleFonts.rajdhani(color: AppColors.textLo)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text("DELETE",
+                style: GoogleFonts.rajdhani(
+                    color: const Color(0xFFE53935),
+                    fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      final gone =
+          await deleteGalleryImage(widget.ip, widget.kind, img.name);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text(
+            gone.length > 1 ? "Deleted ${gone.length} files" : "Deleted",
+            style: GoogleFonts.rajdhani(fontWeight: FontWeight.w600),
+          ),
+        ));
+      await _refresh();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: const Color(0xFFE53935),
+          content: Text("Could not delete: $e",
+              style: GoogleFonts.rajdhani(
+                  color: Colors.white, fontWeight: FontWeight.w600)),
+        ));
+    }
   }
 
   Widget _filterRow(List<_Section> sections) {
@@ -315,7 +417,8 @@ class _GalleryGridState extends State<_GalleryGrid>
           Container(width: 3, height: 16, color: AppColors.lime),
           const SizedBox(width: 8),
           Text(
-            ses == null ? "NOT SESSION-TAGGED" : s.label.toUpperCase(),
+            s.titleOverride?.toUpperCase() ??
+                (ses == null ? "NOT SESSION-TAGGED" : s.label.toUpperCase()),
             style: GoogleFonts.rajdhani(
               color: AppColors.textHi,
               fontWeight: FontWeight.w700,
@@ -326,8 +429,10 @@ class _GalleryGridState extends State<_GalleryGrid>
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              ses == null
-                  ? "${s.count} file${s.count == 1 ? '' : 's'}"
+              s.titleOverride != null
+                  ? "${s.count} map${s.count == 1 ? '' : 's'}"
+                  : ses == null
+                      ? "${s.count} file${s.count == 1 ? '' : 's'}"
                   : "${s.count} photo${s.count == 1 ? '' : 's'}"
                       "${ses.withFix > 0 ? ' · ${ses.withFix} with GPS' : ''}"
                       "${ses.inferred ? ' · grouped by time' : ''}",
@@ -346,6 +451,7 @@ class _GalleryGridState extends State<_GalleryGrid>
   Widget _tile(List<GalleryImage> items, int i) {
     final url = _imgUrl(items[i]);
     return GestureDetector(
+                onLongPress: () => _confirmDelete(items[i]),
                 onTap: () => Navigator.push(
                   context,
                   MaterialPageRoute(
@@ -353,6 +459,7 @@ class _GalleryGridState extends State<_GalleryGrid>
                       images: items,
                       startIndex: i,
                       urlBuilder: _imgUrl,
+                      onDelete: _confirmDelete,
                     ),
                   ),
                 ),
@@ -427,10 +534,16 @@ class _ImageViewer extends StatefulWidget {
   final List<GalleryImage> images;
   final int startIndex;
   final String Function(GalleryImage) urlBuilder;
+
+  /// Delete the image being viewed. The viewer closes afterwards, because the
+  /// list it was paging through no longer matches what is on the Pi.
+  final Future<void> Function(GalleryImage)? onDelete;
+
   const _ImageViewer({
     required this.images,
     required this.startIndex,
     required this.urlBuilder,
+    this.onDelete,
   });
 
   @override
@@ -471,6 +584,16 @@ class _ImageViewerState extends State<_ImageViewer> {
             overflow: TextOverflow.ellipsis,
             style: GoogleFonts.rajdhani(fontSize: 15)),
         actions: [
+          if (widget.onDelete != null)
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              tooltip: "Delete this image",
+              onPressed: () async {
+                final nav = Navigator.of(context);
+                await widget.onDelete!(img);
+                if (nav.mounted) nav.pop();
+              },
+            ),
           IconButton(
             icon: const Icon(Icons.place_outlined),
             tooltip: (img.geo?.hasFix ?? false)
@@ -612,9 +735,19 @@ class _GeoBadge extends StatelessWidget {
 class _Section {
   final PhotoSession? session;
   final List<GalleryImage> items;
-  const _Section({required this.session, required this.items});
 
-  String get key => session?.key ?? 'untagged';
-  String get label => session?.label ?? 'Other';
+  /// Used by the MAPS tab, which groups by calendar date instead of session.
+  final String? titleOverride;
+  final String? keyOverride;
+
+  const _Section({
+    required this.session,
+    required this.items,
+    this.titleOverride,
+    this.keyOverride,
+  });
+
+  String get key => keyOverride ?? session?.key ?? 'untagged';
+  String get label => titleOverride ?? session?.label ?? 'Other';
   int get count => items.length;
 }

@@ -32,6 +32,25 @@ String galleryImgUrl(String ip, String kind, String name) =>
 /// Server-side cap is 5000.
 const int kMapListLimit = 5000;
 
+/// Delete one image on the Pi.
+///
+/// The server also removes the matching raw/annotated twin, so deleting an
+/// obstacle photo does not leave the same moment behind in the other tab.
+/// Returns the list of everything it removed.
+Future<List<String>> deleteGalleryImage(String ip, String kind, String name,
+    {Duration timeout = const Duration(seconds: 6)}) async {
+  final uri = Uri.parse('http://$ip:$kGalleryPort/img/$kind/$name');
+  final res = await http.delete(uri).timeout(timeout);
+  if (res.statusCode != 200) {
+    throw Exception('Delete failed: HTTP ${res.statusCode}');
+  }
+  final body = jsonDecode(res.body) as Map<String, dynamic>;
+  return [
+    body['deleted'] as String,
+    ...((body['also_deleted'] as List?) ?? const []).cast<String>(),
+  ];
+}
+
 /// Raw `/list/<kind>` -> the filenames it returned.
 Future<List<String>> fetchGalleryNames(String ip, String kind,
     {int? limit, Duration timeout = const Duration(seconds: 6)}) async {
