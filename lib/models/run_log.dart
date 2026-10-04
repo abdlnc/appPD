@@ -22,6 +22,13 @@ class RunLog {
   final double? endLat;
   final double? endLon;
 
+  /// Ground distance covered during the run, summed from the GPS fixes as
+  /// they arrived. Null when the run had no usable GPS.
+  ///
+  /// Unlike [displacementM] this follows the route, so a run that returns to
+  /// its start still reports the ground it covered.
+  final double? distanceM;
+
   const RunLog({
     required this.mode,
     required this.start,
@@ -30,9 +37,21 @@ class RunLog {
     this.startLon,
     this.endLat,
     this.endLon,
+    this.distanceM,
   });
 
   Duration get duration => end.difference(start);
+
+  bool get hasDistance => distanceM != null;
+
+  /// "42.3 m" below a kilometre, "1.24 km" above -- metres stop being
+  /// readable once a run covers a field.
+  String get distanceLabel {
+    final d = distanceM;
+    if (d == null) return 'no GPS';
+    return d >= 1000 ? '${(d / 1000).toStringAsFixed(2)} km'
+                     : '${d.toStringAsFixed(1)} m';
+  }
 
   bool get hasStartFix => startLat != null && startLon != null;
   bool get hasEndFix => endLat != null && endLon != null;
@@ -74,6 +93,7 @@ class RunLog {
         if (startLon != null) 'slon': startLon,
         if (endLat != null) 'elat': endLat,
         if (endLon != null) 'elon': endLon,
+        if (distanceM != null) 'dist': distanceM,
       };
 
   static RunLog? fromJson(Map<String, dynamic> j) {
@@ -89,6 +109,7 @@ class RunLog {
       startLon: d('slon'),
       endLat: d('elat'),
       endLon: d('elon'),
+      distanceM: d('dist'),
     );
   }
 

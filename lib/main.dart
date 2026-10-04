@@ -23,7 +23,13 @@ void main() async {
       providers: [
         ChangeNotifierProvider(create: (_) => RobotSocket()),
         // Run history, and any run still in progress from a previous launch.
-        ChangeNotifierProvider(create: (_) => RunLogStore()..load()),
+        // Bound to the socket so an active run keeps measuring distance no
+        // matter which screen is open.
+        ChangeNotifierProxyProvider<RobotSocket, RunLogStore>(
+          create: (_) => RunLogStore()..load(),
+          update: (_, socket, store) => (store ?? RunLogStore()..load())
+            ..bind(socket),
+        ),
       ],
       child: const MyApp(),
     ),

@@ -177,7 +177,33 @@ class LogsScreen extends StatelessWidget {
               run.hasStartFix),
           const SizedBox(height: 3),
           _point(Icons.place, "to", run.endCoordLabel, run.hasEndFix),
-          if (disp != null) ...[
+          if (run.hasDistance) ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                const Icon(Icons.route, size: 13, color: AppColors.lime),
+                const SizedBox(width: 6),
+                Text("travelled ${run.distanceLabel}",
+                    style: GoogleFonts.rajdhani(
+                        color: AppColors.textHi,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700)),
+                if (disp != null) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      disp < 1
+                          ? "(back where it started)"
+                          : "(${disp.toStringAsFixed(1)} m apart)",
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.rajdhani(
+                          color: AppColors.textLo, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ] else if (disp != null) ...[
             const SizedBox(height: 5),
             Text(
               disp < 1
