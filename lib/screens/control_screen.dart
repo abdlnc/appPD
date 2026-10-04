@@ -3,7 +3,11 @@ import 'package:flutter_joystick/flutter_joystick.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'dart:async';
+
 import '../services/dev_settings.dart';
+import '../services/run_log_store.dart';
+import 'logs_screen.dart';
 import '../services/robot_socket.dart';
 import '../theme/app_theme.dart';
 import '../widgets/lidar_painter.dart';
@@ -24,6 +28,7 @@ class _ControlScreenState extends State<ControlScreen> {
 
   // --- Hidden developer settings (see DevSettings) ---
   bool _showJoystick = false; // hidden unless enabled in developer settings
+  Timer? _tick; // 1Hz, only while a run is being recorded
   int _devTaps = 0;
   DateTime? _lastDevTap;
   static const int _devTapsNeeded = 7;
@@ -35,6 +40,49 @@ class _ControlScreenState extends State<ControlScreen> {
     DevSettings.loadShowJoystick().then((v) {
       if (mounted) setState(() => _showJoystick = v);
     });
+  }
+
+  void _syncTicker(RunLogStore store) {
+    if (store.isRecording && _tick == null) {
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else if (!store.isRecording && _tick != null) {
+      _tick!.cancel();
+      _tick = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  /// Start or stop a recorded run, stamping the robot's position at each end.
+  ///
+  /// The fix is read at the moment of the call rather than held from earlier:
+  /// a run that began indoors and ended outside keeps a real end point, and
+  /// one with no fix at all still records its duration.
+  Future<void> _record(bool start, String mode, RobotSocket socket) async {
+    final store = context.read<RunLogStore>();
+    final lat = socket.hasGps ? socket.robotLat : null;
+    final lon = socket.hasGps ? socket.robotLon : null;
+    if (start) {
+      await store.start(mode, lat: lat, lon: lon);
+    } else {
+      final run = await store.stop(lat: lat, lon: lon);
+      if (run != null && mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(
+            behavior: SnackBarBehavior.floating,
+            content: Text("${run.mode} run logged - ${run.durationLabel}",
+                style: GoogleFonts.rajdhani(fontWeight: FontWeight.w600)),
+          ));
+      }
+    }
+    if (mounted) setState(() {});
   }
 
   /// 7 quick taps on the mode pill open the developer settings. Taps more
@@ -177,9 +225,15 @@ class _ControlScreenState extends State<ControlScreen> {
     if (isAutoMode) {
       socket.sendCommand("MODE:AUTO");
       _logEvent("Switched to AUTO Mode");
+      _record(true, 'AUTO', socket);
     } else {
       socket.sendCommand("MODE:MANUAL");
       _logEvent("Switched to MANUAL Mode");
+      // Only close a run that AUTO opened. A manual recording running at the
+      // same time belongs to the operator and is theirs to stop.
+      if (context.read<RunLogStore>().activeMode == 'AUTO') {
+        _record(false, 'AUTO', socket);
+      }
     }
   }
 
@@ -187,6 +241,11 @@ class _ControlScreenState extends State<ControlScreen> {
     setState(() => isAutoMode = false);
     socket.sendCommand("MODE:STOP");
     _logEvent("EMERGENCY STOP");
+    // The robot has stopped driving, so an AUTO run has ended whatever the
+    // mode button says.
+    if (context.read<RunLogStore>().activeMode == 'AUTO') {
+      _record(false, 'AUTO', socket);
+    }
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
@@ -218,6 +277,16 @@ class _ControlScreenState extends State<ControlScreen> {
       );
   }
 
+  /// "00:42" / "1:04:12" -- a clock, not a sentence, so it stays readable
+  /// while it ticks in a narrow chip.
+  static String _elapsedLabel(Duration d) {
+    final s = d.inSeconds;
+    final h = s ~/ 3600, m = (s % 3600) ~/ 60, sec = s % 60;
+    final mm = m.toString().padLeft(2, '0');
+    final ss = sec.toString().padLeft(2, '0');
+    return h > 0 ? '$h:$mm:$ss' : '$mm:$ss';
+  }
+
   /// Consistent circular action button for the top bar.
   Widget _circleBtn({
     required IconData icon,
@@ -247,6 +316,8 @@ class _ControlScreenState extends State<ControlScreen> {
   @override
   Widget build(BuildContext context) {
     final socket = Provider.of<RobotSocket>(context);
+    final runs = context.watch<RunLogStore>();
+    _syncTicker(runs);
     final Color accent = isAutoMode ? AppColors.amber : AppColors.lime;
     final bool hasCamera = socket.cameraImage != null;
     final bool online = socket.isConnected;
@@ -362,6 +433,43 @@ class _ControlScreenState extends State<ControlScreen> {
                       ),
                     ),
                   ),
+                  // Live run timer. Only on screen while something is being
+                  // recorded, so it reads as state rather than decoration.
+                  if (runs.isRecording) ...[
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 9),
+                      decoration: BoxDecoration(
+                        color: AppColors.surface.withValues(alpha: 0.85),
+                        borderRadius: BorderRadius.circular(40),
+                        border: Border.all(
+                            color: runs.activeMode == 'AUTO'
+                                ? AppColors.amber
+                                : AppColors.dev),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.fiber_manual_record,
+                              size: 11,
+                              color: runs.activeMode == 'AUTO'
+                                  ? AppColors.amber
+                                  : AppColors.dev),
+                          const SizedBox(width: 6),
+                          Text(
+                            _elapsedLabel(runs.elapsed ?? Duration.zero),
+                            style: GoogleFonts.rajdhani(
+                              color: AppColors.textHi,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                   const Spacer(),
                   // Right action cluster -- consistent circular buttons
                   // Status, not a button (no onTap). Deliberately NOT green:
@@ -395,6 +503,18 @@ class _ControlScreenState extends State<ControlScreen> {
                     onTap: () => Navigator.push(
                       context,
                       MaterialPageRoute(builder: (_) => const LidarMapScreen()),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _circleBtn(
+                    icon: Icons.timer_outlined,
+                    iconColor: AppColors.lime,
+                    bg: AppColors.surface.withValues(alpha: 0.85),
+                    borderColor: AppColors.border,
+                    tooltip: "Run logs",
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const LogsScreen()),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -534,6 +654,54 @@ class _ControlScreenState extends State<ControlScreen> {
                     // Manual joystick: hidden unless turned on in the
                     // developer settings (7 taps on the mode pill).
                     if (_showJoystick) ...[
+                      const SizedBox(width: 12),
+                      // Manual driving has no start or stop the app can
+                      // detect, so a recorded manual run is marked by hand.
+                      // Violet, like everything else that appears only
+                      // because a developer setting is on.
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _circleBtn(
+                            icon: runs.activeMode == 'MANUAL'
+                                ? Icons.stop_circle
+                                : Icons.fiber_manual_record,
+                            iconColor: runs.activeMode == 'MANUAL'
+                                ? AppColors.dev
+                                : AppColors.textLo,
+                            bg: AppColors.surface.withValues(alpha: 0.85),
+                            borderColor: runs.activeMode == 'MANUAL'
+                                ? AppColors.dev
+                                : AppColors.border,
+                            tooltip: runs.activeMode == 'MANUAL'
+                                ? "Stop recording this run"
+                                : (runs.isRecording
+                                    ? "An AUTO run is already recording"
+                                    : "Record a manual run"),
+                            // Disabled while AUTO is recording: two runs at
+                            // once would make both durations meaningless.
+                            onTap: (runs.isRecording &&
+                                    runs.activeMode != 'MANUAL')
+                                ? null
+                                : () => _record(
+                                    runs.activeMode != 'MANUAL',
+                                    'MANUAL',
+                                    socket),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            runs.activeMode == 'MANUAL' ? "REC" : "LOG",
+                            style: GoogleFonts.rajdhani(
+                              color: runs.activeMode == 'MANUAL'
+                                  ? AppColors.dev
+                                  : AppColors.textLo,
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                        ],
+                      ),
                       const SizedBox(width: 16),
                       Opacity(
                         opacity: isAutoMode ? 0.3 : 1.0,

@@ -4,6 +4,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'theme/app_theme.dart';
 import 'screens/connection_screen.dart';
 import 'services/robot_socket.dart';
+import 'services/run_log_store.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -21,6 +22,8 @@ void main() async {
     MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => RobotSocket()),
+        // Run history, and any run still in progress from a previous launch.
+        ChangeNotifierProvider(create: (_) => RunLogStore()..load()),
       ],
       child: const MyApp(),
     ),
