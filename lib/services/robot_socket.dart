@@ -99,6 +99,32 @@ class RobotSocket extends ChangeNotifier {
   /// direct signal and doesn't depend on that staying true elsewhere.
   bool get noGpsSignal => _isConnected && _gpsFix < 1;
 
+  // ---- What the robot is DOING about an obstacle (-> /avoid_action) ----
+  String? _avoidAction;
+  DateTime? _actionAt;
+
+  /// An action older than this is treated as over. The node clears it
+  /// explicitly when a maneuver ends, so this only matters if that message is
+  /// lost -- without it the app could show "REVERSING" indefinitely.
+  static const Duration _actionMaxAge = Duration(seconds: 8);
+
+  /// "STOPPING", "REVERSING", "TURNING LEFT", "TURNING RIGHT", "HOLDING",
+  /// or null when the robot is not reacting to anything.
+  String? get avoidAction {
+    if (_avoidAction == null || _avoidAction!.isEmpty) return null;
+    if (_actionAt == null ||
+        DateTime.now().difference(_actionAt!) > _actionMaxAge) {
+      return null;
+    }
+    return _avoidAction;
+  }
+
+  void _parseAction(String payload) {
+    _avoidAction = payload.trim();
+    _actionAt = DateTime.now();
+    notifyListeners();
+  }
+
   // ---- Field type (soil camera's classifier -> /field_type -> "F:") ----
   String? _fieldType; // "supported" | "unsupported"
   double _fieldConf = 0.0;
@@ -267,6 +293,10 @@ class RobotSocket extends ChangeNotifier {
       // 3b. AI detection boxes (B:)
       else if (message.startsWith("B:")) {
         _parseBoxes(message.substring(2));
+      }
+      // 3.4 What the robot is doing about an obstacle (A:)
+      else if (message.startsWith("A:")) {
+        _parseAction(message.substring(2));
       }
       // 3.5 Field type from the soil camera's classifier (F:)
       else if (message.startsWith("F:")) {

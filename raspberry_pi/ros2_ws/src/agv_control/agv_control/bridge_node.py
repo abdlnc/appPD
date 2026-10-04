@@ -21,6 +21,7 @@ Translates to ROS2:
     publishes  /cmd_vel (geometry_msgs/Twist)  manual joystick, only while MANUAL
     publishes  /mode    (std_msgs/String)      AUTO / MANUAL / STOP
     relays     /field_type -> "F:<supported|unsupported>|<conf>" to the app
+    relays     /avoid_action -> "A:<STOPPING|REVERSING|TURNING LEFT|...>"
     subscribes /image_raw/compressed (sensor_msgs/CompressedImage)
                -> relayed to the app as "C:<base64>"  (filled by camera_node)
     subscribes /scan (sensor_msgs/LaserScan)
@@ -107,6 +108,7 @@ class BridgeNode(Node):
         self.latest_obstacle = "CLEAR"
         self.latest_boxes = None         # "<fw>,<fh>|..." from /ai_boxes
         self.latest_field = None         # "supported|0.96" from /field_type
+        self.latest_action = None        # "REVERSING" etc from /avoid_action
         self.latest_gps = None
         self.manual_cmd = Twist()
         self.latest_jpeg = None          # bytes: compressed JPEG from camera_node
@@ -123,6 +125,7 @@ class BridgeNode(Node):
         self.create_subscription(String, '/obstacle', self.obstacle_cb, 10)
         self.create_subscription(String, '/ai_boxes', self.boxes_cb, 10)
         self.create_subscription(String, '/field_type', self.field_cb, 10)
+        self.create_subscription(String, '/avoid_action', self.action_cb, 10)
         self.create_subscription(String, '/gps', self.gps_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.get_logger().info(f"Bridge node ready. WebSocket on :{WS_PORT}")
@@ -136,6 +139,9 @@ class BridgeNode(Node):
 
     def boxes_cb(self, msg: String):
         self.latest_boxes = msg.data
+
+    def action_cb(self, msg: String):
+        self.latest_action = msg.data
 
     def field_cb(self, msg: String):
         self.latest_field = msg.data
@@ -286,6 +292,23 @@ async def ws_handler(websocket, node: BridgeNode):
         except websockets.exceptions.ConnectionClosed:
             pass
 
+    async def send_action():
+        # What the robot is doing about an obstacle, as "A:<text>" (empty when
+        # the maneuver is over). Polled faster than the other streams because
+        # a turn lasts barely a second -- at 1Hz the app could miss it
+        # entirely and show nothing while the robot visibly swerved.
+        delay = 0.15
+        last = None
+        try:
+            while True:
+                a = node.latest_action
+                if a is not None and a != last:
+                    await websocket.send("A:" + a)
+                    last = a
+                await asyncio.sleep(delay)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
     async def send_field():
         # Field type from the soil camera's classifier, as "F:<label>|<conf>".
         # Send-on-change: a new verdict only exists once a minute, when a soil
@@ -336,6 +359,7 @@ async def ws_handler(websocket, node: BridgeNode):
     lidar_task = asyncio.create_task(send_lidar())
     boxes_task = asyncio.create_task(send_boxes())
     field_task = asyncio.create_task(send_field())
+    action_task = asyncio.create_task(send_action())
     try:
         async for message in websocket:
             msg = message.strip()
@@ -397,6 +421,7 @@ async def ws_handler(websocket, node: BridgeNode):
         lidar_task.cancel()
         boxes_task.cancel()
         field_task.cancel()
+        action_task.cancel()
         # app gone -> STOP for safety
         node.set_mode("STOP")
         node.manual_cmd = Twist()

@@ -141,6 +141,16 @@ BLOCKED_SIDE  = 0.40
 # the threshold can't make the robot lurch start-stop-start. ~0.5s at 10Hz.
 BLOCKED_RELEASE_SCANS = 5
 
+# ----------- Avoidance maneuver timing -----------
+# Come to a FULL STOP before reversing, and again before driving out of the
+# turn. motor_node enforces its own REVERSE_PAUSE at the hardware level to
+# protect the gears, but that one only triggers on a direction flip while
+# moving; this is the deliberate pause in the maneuver itself, long enough
+# that the robot is visibly stationary before it backs away from something it
+# just nearly hit.
+STOP_BEFORE_REVERSE = 0.8      # s; was 0.5
+STOP_AFTER_REVERSE  = 0.4      # s; was 0.2, before the turn begins
+
 
 class AGVControl(Node):
     def __init__(self):
@@ -165,6 +175,13 @@ class AGVControl(Node):
 
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.obstacle_pub = self.create_publisher(String, '/obstacle', 10)
+        # What the robot is DOING about an obstacle, in words, for the app:
+        # "STOPPING", "REVERSING", "TURNING LEFT", "TURNING RIGHT", "HOLDING",
+        # or "" when the maneuver is over. Separate from /obstacle, which says
+        # what the Lidar SEES -- seeing and reacting are different facts, and
+        # the app may want either without the other.
+        self.action_pub = self.create_publisher(String, '/avoid_action', 10)
+        self._last_action = None
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.create_subscription(String, '/mode', self.mode_cb, 10)
         self.create_subscription(String, '/ai_detections', self.ai_cb, 10)
@@ -181,6 +198,18 @@ class AGVControl(Node):
         self.mode = m
         if m != "AUTO":
             self.cmd = Twist()         # zero out (we won't publish anyway)
+
+    def publish_action(self, text):
+        """Announce the current avoidance action. Published on CHANGE only,
+        so the app sees transitions rather than a stream of repeats."""
+        if text == self._last_action:
+            return
+        self._last_action = text
+        m = String()
+        m.data = text
+        self.action_pub.publish(m)
+        if text:
+            self.get_logger().info(f"action: {text}")
 
     def set_cmd(self, lx, az):
         t = Twist()
@@ -368,10 +397,12 @@ class AGVControl(Node):
         if blocked != self._was_blocked:
             self._was_blocked = blocked
             if blocked:
+                self.publish_action("HOLDING")
                 self.get_logger().warn(
                     "NO PATH -- boxed in (front/rear/both sides all blocked)"
                     " -- HOLDING at zero until a way out opens")
             else:
+                self.publish_action("")
                 self.get_logger().info("path clear again -- resuming")
 
         m = String()
@@ -385,15 +416,22 @@ class AGVControl(Node):
     def avoid(self, z):
         log = self.get_logger()
         log.warn("OBSTACLE - avoiding")
-        self.set_cmd(0.0, 0.0)
-        time.sleep(0.5)
 
-        # reverse straight if the rear is clear
+        # 1. STOP, and be seen to stop, before anything else.
+        self.publish_action("STOPPING")
+        self.set_cmd(0.0, 0.0)
+        time.sleep(STOP_BEFORE_REVERSE)
+
+        # 2. reverse straight if the rear is clear, then stop AGAIN before the
+        #    turn -- the robot never goes straight from backwards into a
+        #    turning move.
         if self.mode == "AUTO" and z['back'] > MIN_CLEARANCE_REAR:
+            self.publish_action("REVERSING")
             self.set_cmd(-REV_SPEED, 0.0)
             time.sleep(1.2)
+            self.publish_action("STOPPING")
             self.set_cmd(0.0, 0.0)
-            time.sleep(0.2)
+            time.sleep(STOP_AFTER_REVERSE)
 
         # decide which way to turn AWAY from the obstacle
         # angular.z: +1.0 = LEFT, -1.0 = RIGHT
@@ -405,12 +443,15 @@ class AGVControl(Node):
             steer = +1.0 if z['right'] < z['left'] else -1.0
 
         if self.mode == "AUTO":
+            self.publish_action(
+                "TURNING LEFT" if steer > 0 else "TURNING RIGHT")
             self.set_cmd(0.0, steer)             # settle the steering first
             time.sleep(0.4)
             self.set_cmd(TURN_SPEED, steer)      # then drive while turned
             time.sleep(1.0)
 
         self.set_cmd(0.0, 0.0)                   # stop, re-center
+        self.publish_action("")                  # maneuver over
         self.is_avoiding = False
         log.info("resume")
 

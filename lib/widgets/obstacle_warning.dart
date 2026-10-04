@@ -7,6 +7,8 @@ import '../services/robot_socket.dart';
 /// Stacked top-centre, most severe first, each auto-hiding on its own:
 ///   * NO PATH        - robot boxed in; avoidance has no move left to make
 ///   * DANGER/CAUTION - closest Lidar obstacle
+///   * the action being taken - what the robot is DOING about an obstacle
+///     (stopping, reversing, turning), shown with the obstacle banner
 ///   * NO GPS SIGNAL  - no fix, so NAV mode cannot drive at all
 ///   * UNSUPPORTED FIELD TYPE - from two independent causes: no GPS (the
 ///     field cannot be identified or mapped), or the soil camera's
@@ -113,13 +115,31 @@ class ObstacleWarning extends StatelessWidget {
             final dist = socket.obstacleDist > 0
                 ? ' - ${socket.obstacleDist.toStringAsFixed(2)}m'
                 : '';
+            // The action is appended to what the Lidar SEES, so one banner
+            // answers both "what is there" and "what is it doing about it".
+            final action = socket.avoidAction;
             banners.add(_banner(
               color: danger ? const Color(0xFFE53935) : const Color(0xFFFFB300),
               icon: danger ? Icons.dangerous : Icons.warning_amber_rounded,
               title: danger ? 'DANGER' : 'CAUTION',
-              detail: '${_zoneLabel(socket.obstacleZone)}$dist',
+              detail: '${_zoneLabel(socket.obstacleZone)}$dist'
+                  '${action == null ? '' : '  -  $action'}',
             ));
           }
+        }
+
+        // An action can outlive the obstacle reading that caused it -- the
+        // robot reverses away, the zone reads CLEAR, but it is still backing
+        // up. Show it on its own rather than letting it vanish mid-maneuver.
+        if (socket.avoidAction != null &&
+            socket.obstacleLevel != 'DANGER' &&
+            socket.obstacleLevel != 'CAUTION') {
+          banners.add(_banner(
+            color: const Color(0xFFFFB300),
+            icon: Icons.sync,
+            title: socket.avoidAction!,
+            detail: 'avoiding an obstacle',
+          ));
         }
 
         // 2. NO GPS SIGNAL -- independent of any obstacle state. Blue-grey on
