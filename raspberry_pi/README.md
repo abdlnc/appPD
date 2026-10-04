@@ -122,7 +122,12 @@ in sync.
   on the network. Independent of the ROS2/GPIO/camera stack.
 - `draw_slam_path.py` — Does the `.pgm` → `.png` conversion for the gallery AND
   draws the robot's traversed path on top, annotated with its GPS coordinates
-  when a fix was recorded. Also upscales (~800px) so the path and text are
+  when a fix was recorded. It also measures the **nearest mapped obstacle** to
+  where the robot finished (or to the SLAM origin when no path was recorded)
+  and marks it on the image with the distance in metres. That measurement is
+  only possible because of the `.yaml`: its `resolution` turns cell spacing
+  into metres and its `origin` places the pixels in the map frame, so the
+  number is a real distance rather than a pixel count. Also upscales (~800px) so the path and text are
   legible — the raw maps are only ~70px across. Drops track points older than
   the running `slam_toolbox` process: restarting SLAM starts a brand-new map
   frame, so older points are in a different coordinate system and would be

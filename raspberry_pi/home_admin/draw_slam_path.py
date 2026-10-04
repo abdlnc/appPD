@@ -45,6 +45,10 @@ LINE_BGR    = (60, 200, 90)     # traversed path
 START_BGR   = (80, 220, 80)
 END_BGR     = (60, 60, 235)
 BAR_H       = 34       # info bar height at the bottom, in upscaled px
+NEAR_BGR    = (40, 160, 245)    # nearest-obstacle marker + line (orange)
+# A map_saver PGM is 0 = occupied, 205 = unknown, 254 = free. Anything this
+# dark is an obstacle the Lidar actually saw; unknown space is not.
+OCC_THRESH  = 65
 
 
 def slam_start_epoch():
@@ -106,6 +110,29 @@ def load_track(since_epoch):
     return pts
 
 
+def nearest_obstacle(img, res, origin, ref_xy):
+    """Closest occupied cell to ref_xy, in MAP-FRAME METRES.
+
+    Returns (distance_m, (cell_x, cell_y)) or None when the map holds no
+    occupied cells at all.
+
+    The yaml is what makes this measurable rather than a pixel count:
+    `resolution` converts cell spacing to metres and `origin` places the
+    bottom-left pixel in the map frame, so a distance here is the same
+    distance the robot would drive.
+    """
+    h, w = img.shape[:2]
+    rows, cols = np.nonzero(img < OCC_THRESH)
+    if len(rows) == 0:
+        return None
+    # cell centre in world metres; row 0 is the TOP of the image, hence the flip
+    xs = origin[0] + (cols + 0.5) * res
+    ys = origin[1] + (h - 1 - rows + 0.5) * res
+    d = np.hypot(xs - ref_xy[0], ys - ref_xy[1])
+    i = int(np.argmin(d))
+    return float(d[i]), (float(xs[i]), float(ys[i]))
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: draw_slam_path.py <base-path-without-extension>",
@@ -142,6 +169,34 @@ def main():
         cv2.circle(canvas, px[0][:2], max(2, scale), START_BGR, -1, cv2.LINE_AA)
         cv2.circle(canvas, px[-1][:2], max(2, scale), END_BGR, -1, cv2.LINE_AA)
 
+    # ---- nearest obstacle to where the robot finished ----
+    # Measured from the END of the traversed path, which is where the robot
+    # actually is when the map is saved. With no path recorded, fall back to
+    # the SLAM origin (0,0) -- that is where mapping started, so it is still
+    # the robot's own position rather than an arbitrary point.
+    near = None
+    if res and origin:
+        ref = (pts[-1][0], pts[-1][1]) if pts else (0.0, 0.0)
+        near = nearest_obstacle(img, res, origin, ref)
+        if near:
+            dist_m, (ox, oy) = near
+            oc = int(((ox - origin[0]) / res) * scale)
+            orr = int((h - 1 - (oy - origin[1]) / res) * scale)
+            rc = int(((ref[0] - origin[0]) / res) * scale)
+            rr = int((h - 1 - (ref[1] - origin[1]) / res) * scale)
+            cv2.line(canvas, (rc, rr), (oc, orr), NEAR_BGR,
+                     max(1, scale // 4), cv2.LINE_AA)
+            cv2.circle(canvas, (oc, orr), max(3, scale), NEAR_BGR, 2,
+                       cv2.LINE_AA)
+            label = f"{dist_m:.2f} m"
+            # keep the label inside the image rather than off the right edge
+            tx = min(oc + max(5, scale), canvas.shape[1] - 70)
+            ty = max(14, orr - max(5, scale))
+            for colour, thick in ((0, 0, 0), 3), (NEAR_BGR, 1):
+                cv2.putText(canvas, label, (tx, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, thick,
+                            cv2.LINE_AA)
+
     # ---- info bar: GPS for the path, when any fix was recorded ----
     fixes = [(la, lo) for _, _, la, lo in pts if la and lo]
     if not px:
@@ -151,6 +206,12 @@ def main():
                 f" | end {fixes[-1][0]},{fixes[-1][1]}")
     else:
         info = f"path {len(px)} pts | GPS: no fix recorded"
+
+    if near:
+        info += (f" | nearest obstacle {near[0]:.2f} m"
+                 f" from {'path end' if pts else 'start'}")
+    elif res and origin:
+        info += " | no obstacles mapped"
 
     bar = np.zeros((BAR_H, canvas.shape[1], 3), dtype=np.uint8)
     cv2.putText(bar, info, (8, BAR_H - 11), cv2.FONT_HERSHEY_SIMPLEX,
@@ -162,6 +223,9 @@ def main():
         return 1
     print(f"  path points drawn: {len(px)}"
           f"{' (with GPS)' if fixes else ' (no GPS fix)'}")
+    if near:
+        print(f"  nearest obstacle:  {near[0]:.2f} m at map ({near[1][0]:.2f},"
+              f" {near[1][1]:.2f})")
     return 0
 
 
