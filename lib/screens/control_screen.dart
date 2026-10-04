@@ -3,6 +3,8 @@ import 'package:flutter_joystick/flutter_joystick.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'dart:async';
+
 import '../services/dev_settings.dart';
 import '../services/run_log_store.dart';
 import 'logs_screen.dart';
@@ -26,6 +28,7 @@ class _ControlScreenState extends State<ControlScreen> {
 
   // --- Hidden developer settings (see DevSettings) ---
   bool _showJoystick = false; // hidden unless enabled in developer settings
+  Timer? _tick; // 1Hz, only while a run is being recorded
   int _devTaps = 0;
   DateTime? _lastDevTap;
   static const int _devTapsNeeded = 7;
@@ -63,6 +66,33 @@ class _ControlScreenState extends State<ControlScreen> {
       }
     }
     if (mounted) setState(() {});
+  }
+
+  void _syncTicker(RunLogStore store) {
+    if (store.isRecording && _tick == null) {
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else if (!store.isRecording && _tick != null) {
+      _tick!.cancel();
+      _tick = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  /// "00:42" / "1:04:12" -- a clock, not a sentence, so it stays readable
+  /// while it ticks in a narrow chip.
+  static String _elapsedLabel(Duration d) {
+    final s = d.inSeconds;
+    final h = s ~/ 3600, m = (s % 3600) ~/ 60, sec = s % 60;
+    final mm = m.toString().padLeft(2, '0');
+    final ss = sec.toString().padLeft(2, '0');
+    return h > 0 ? '$h:$mm:$ss' : '$mm:$ss';
   }
 
   /// 7 quick taps on the mode pill open the developer settings. Taps more
@@ -287,6 +317,7 @@ class _ControlScreenState extends State<ControlScreen> {
   Widget build(BuildContext context) {
     final socket = Provider.of<RobotSocket>(context);
     final runs = context.watch<RunLogStore>();
+    _syncTicker(runs);
     final Color accent = isAutoMode ? AppColors.amber : AppColors.lime;
     final bool hasCamera = socket.cameraImage != null;
     final bool online = socket.isConnected;
@@ -402,6 +433,42 @@ class _ControlScreenState extends State<ControlScreen> {
                       ),
                     ),
                   ),
+                  // Live run timer, shown only while something is recording.
+                  if (runs.isRecording) ...[
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 9),
+                      decoration: BoxDecoration(
+                        color: AppColors.surface.withValues(alpha: 0.85),
+                        borderRadius: BorderRadius.circular(40),
+                        border: Border.all(
+                            color: runs.activeMode == 'AUTO'
+                                ? AppColors.amber
+                                : AppColors.dev),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.fiber_manual_record,
+                              size: 11,
+                              color: runs.activeMode == 'AUTO'
+                                  ? AppColors.amber
+                                  : AppColors.dev),
+                          const SizedBox(width: 6),
+                          Text(
+                            _elapsedLabel(runs.elapsed ?? Duration.zero),
+                            style: GoogleFonts.rajdhani(
+                              color: AppColors.textHi,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                   const Spacer(),
                   // Right action cluster -- consistent circular buttons
                   // Status, not a button (no onTap). Deliberately NOT green:

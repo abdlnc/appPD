@@ -120,7 +120,6 @@ class LogsScreen extends StatelessWidget {
   /// still being timed. Its duration is deliberately not live here -- the
   /// control screen carries the ticking clock.
   Widget _activeCard(RunLogStore store) {
-    final auto = store.activeMode == 'AUTO';
     final start = store.activeStart!;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
@@ -128,17 +127,16 @@ class LogsScreen extends StatelessWidget {
       decoration: BoxDecoration(
         color: AppColors.surface,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-            color: auto ? AppColors.amber : AppColors.dev, width: 1.5),
+        border: Border.all(color: AppColors.lime, width: 1.5),
       ),
       child: Row(
         children: [
-          Icon(auto ? Icons.smart_toy : Icons.sports_esports,
-              color: auto ? AppColors.amber : AppColors.dev, size: 18),
+          const Icon(Icons.fiber_manual_record,
+              color: AppColors.lime, size: 16),
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              "${store.activeMode} run in progress - started ${_clock(start)}",
+              "Run in progress - started ${_clock(start)}",
               style: GoogleFonts.rajdhani(
                   color: AppColors.textHi, fontWeight: FontWeight.w700),
             ),
@@ -149,8 +147,6 @@ class LogsScreen extends StatelessWidget {
   }
 
   Widget _runCard(RunLog run) {
-    final auto = run.mode == 'AUTO';
-    final accent = auto ? AppColors.amber : AppColors.dev;
     final disp = run.displacementM;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
@@ -165,22 +161,6 @@ class LogsScreen extends StatelessWidget {
         children: [
           Row(
             children: [
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                decoration: BoxDecoration(
-                  color: accent.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: accent.withValues(alpha: 0.5)),
-                ),
-                child: Text(run.mode,
-                    style: GoogleFonts.rajdhani(
-                        color: accent,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1)),
-              ),
-              const SizedBox(width: 8),
               Text(run.durationLabel,
                   style: GoogleFonts.rajdhani(
                       color: AppColors.textHi,
