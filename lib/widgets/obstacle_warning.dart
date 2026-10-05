@@ -10,10 +10,11 @@ import '../services/robot_socket.dart';
 ///   * the action being taken - what the robot is DOING about an obstacle
 ///     (stopping, reversing, turning), shown with the obstacle banner
 ///   * UNSUPPORTED FIELD TYPE - the soil camera's classifier reporting
-///     ground this system does not support
+///     ground this system does not support, or no GPS fix to confirm the
+///     ground with
 ///
-/// GPS state is deliberately NOT a banner: see the chip beside the AUTO
-/// button on the control screen.
+/// The fix state on its own is deliberately NOT a banner: see the chip
+/// beside the AUTO button on the control screen.
 /// All hidden while disconnected.
 class ObstacleWarning extends StatelessWidget {
   const ObstacleWarning({super.key});
@@ -143,22 +144,32 @@ class ObstacleWarning extends StatelessWidget {
           ));
         }
 
-        // No GPS no longer raises a banner. It is a standing condition
-        // rather than an event -- it can persist for an entire session --
-        // and a permanent banner over the camera feed buried the warnings
-        // that actually need reacting to. The GPS chip beside the AUTO
-        // button carries it instead, including the satellite count.
-        if (socket.unsupportedField) {
-          // The soil camera's classifier says the ground under the robot is
-          // not a field type this system handles. Only shown when GPS is
-          // present, since the banner above already covers the other case and
-          // two copies of the same title would just be noise.
-          final pct = (socket.fieldConfidence * 100).round();
+        // UNSUPPORTED FIELD TYPE, for either of two reasons:
+        //   * the soil camera's classifier says the ground under the robot is
+        //     not a field type this system handles, or
+        //   * there is no GPS fix, so the ground cannot be confirmed as a
+        //     supported field at all.
+        //
+        // One banner covers both, with the detail line saying which applies.
+        // The classifier wins when both are true: an actual reading of the
+        // ground is more specific than not being able to place the robot.
+        //
+        // The bare NO GPS banner was dropped separately -- that is a standing
+        // condition the GPS chip beside the AUTO button reports, with the
+        // satellite count. This banner is about the field, not the fix.
+        if (socket.unsupportedField || !socket.hasGps) {
+          final String detail;
+          if (socket.unsupportedField) {
+            final pct = (socket.fieldConfidence * 100).round();
+            detail = 'soil camera: not a supported field ($pct%)';
+          } else {
+            detail = 'no GPS fix - field type cannot be confirmed';
+          }
           banners.add(_banner(
             color: const Color(0xFF546E7A),
             icon: Icons.grass,
             title: 'UNSUPPORTED FIELD TYPE',
-            detail: 'soil camera: not a supported field ($pct%)',
+            detail: detail,
           ));
         }
 
