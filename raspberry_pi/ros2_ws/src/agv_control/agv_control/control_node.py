@@ -82,7 +82,11 @@ ANGLE_OFFSET_DEG = 180.0
 # front trigger below workable: slower approach, less distance needed to
 # stop. REV/TURN left alone -- those happen in tight spots where speed is not
 # an improvement.
-FWD_SPEED  = 0.50
+# Superseded by ENV_PROFILES below for AUTO cruising -- kept because
+# REV_SPEED and TURN_SPEED (the maneuver speeds) still come from here, and
+# because a reader looking for "how fast does it drive" should find the
+# profiles rather than a stale number pretending to be in charge.
+FWD_SPEED  = 0.50          # see ENV_PROFILES; no longer read for cruising
 REV_SPEED  = 0.60
 TURN_SPEED = 0.50
 
@@ -141,6 +145,44 @@ BLOCKED_SIDE  = 0.40
 # the threshold can't make the robot lurch start-stop-start. ~0.5s at 10Hz.
 BLOCKED_RELEASE_SCANS = 5
 
+# ----------- Environment profiles (OUTDOOR / INDOOR) -----------
+# Chosen from the app's developer settings and sent down as /env_mode. Two
+# jobs need genuinely different behaviour from the same robot:
+#
+# OUTDOOR -- open ground. Drive at full output, and treat the whole 120-degree
+#   front arc as the path: anything in it is in the way.
+#
+# INDOOR -- corridors and doorways. Drive at half output, and only the narrow
+#   centre cone counts as the path. This is the important difference: the
+#   front-left and front-right zones span 30-90 degrees either side, so in a
+#   corridor the WALLS BESIDE the robot fall into them and trigger avoidance
+#   even though the way ahead is completely clear. Ignoring them for the
+#   trigger lets the robot drive through gaps it physically fits in. The
+#   corners are still read -- they decide which way to turn once the centre
+#   really is blocked -- and the clearances shrink so a tight turn is allowed.
+#
+# corners_trigger is the whole difference between "stops at every doorway" and
+# "drives down the corridor".
+ENV_PROFILES = {
+    "OUTDOOR": {
+        "fwd": 1.00,            # full duty on open ground
+        "front": 0.70,          # avoidance trigger, metres
+        "turn": 0.28,           # room needed to turn out
+        "rear": 0.28,           # room needed to reverse out
+        "corners_trigger": True,
+        "caution": 1.40,        # app's amber ring
+    },
+    "INDOOR": {
+        "fwd": 0.50,            # unchanged from today
+        "front": 0.45,          # react later: a doorway is close by nature
+        "turn": 0.18,
+        "rear": 0.18,
+        "corners_trigger": False,   # walls beside the robot are not obstacles
+        "caution": 0.90,
+    },
+}
+DEFAULT_ENV = "OUTDOOR"
+
 # ----------- Avoidance maneuver timing -----------
 # Come to a FULL STOP before reversing, and again before driving out of the
 # turn. motor_node enforces its own REVERSE_PAUSE at the hardware level to
@@ -182,9 +224,16 @@ class AGVControl(Node):
         # the app may want either without the other.
         self.action_pub = self.create_publisher(String, '/avoid_action', 10)
         self._last_action = None
+
+        # Active environment profile. The numbers below come from it rather
+        # than from module constants, so a mode change takes effect on the
+        # next scan without restarting anything.
+        self.env = DEFAULT_ENV
+        self.prof = dict(ENV_PROFILES[DEFAULT_ENV])
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.create_subscription(String, '/mode', self.mode_cb, 10)
         self.create_subscription(String, '/ai_detections', self.ai_cb, 10)
+        self.create_subscription(String, '/env_mode', self.env_cb, 10)
         self.create_timer(0.1, self.tick)      # 10 Hz command stream
 
         self.get_logger().info(
@@ -232,6 +281,18 @@ class AGVControl(Node):
             return
         self.pub.publish(self.cmd)
 
+    def env_cb(self, msg: String):
+        name = msg.data.strip().upper()
+        if name not in ENV_PROFILES or name == self.env:
+            return
+        self.env = name
+        self.prof = dict(ENV_PROFILES[name])
+        p = self.prof
+        self.get_logger().info(
+            f"Environment -> {name}: speed {p['fwd']:.2f}, front trigger "
+            f"{p['front']:.2f}m, corners {'count' if p['corners_trigger'] else 'ignored'}"
+            f", turn/rear clearance {p['turn']:.2f}/{p['rear']:.2f}m")
+
     # ----------------------- camera caution -----------------------
     def ai_cb(self, msg: String):
         """ai_detector_node's "<count>|Obstacle:<conf>,Obstacle:<conf>,..."
@@ -277,12 +338,12 @@ class AGVControl(Node):
                 self.get_logger().warn(
                     f"CAMERA sees {self._cam_count} obstacle(s) "
                     f"(conf {self._cam_conf:.2f}) -- slowing "
-                    f"{FWD_SPEED:.2f} -> {CAM_CAUTION_SPEED:.2f}")
+                    f"{self.prof['fwd']:.2f} -> {CAM_CAUTION_SPEED:.2f}")
             else:
                 self.get_logger().info(
                     f"camera clear for {CAM_TTL:.0f}s -- back to "
-                    f"{FWD_SPEED:.2f}")
-        return CAM_CAUTION_SPEED if cautious else FWD_SPEED
+                    f"{self.prof['fwd']:.2f}")
+        return CAM_CAUTION_SPEED if cautious else self.prof['fwd']
 
     # ----------------------- scan processing -----------------------
     def scan_cb(self, msg: LaserScan):
@@ -334,8 +395,12 @@ class AGVControl(Node):
             self.set_cmd(0.0, 0.0)
             return
         z = self.zones
-        if (z['front'] < MIN_DIST_FRONT or z['front_r'] < MIN_DIST_FRONT
-                or z['front_l'] < MIN_DIST_FRONT):
+        front = self.prof['front']
+        # INDOOR ignores the corner zones here on purpose -- see ENV_PROFILES.
+        hit = z['front'] < front
+        if self.prof['corners_trigger']:
+            hit = hit or z['front_r'] < front or z['front_l'] < front
+        if hit:
             self.is_avoiding = True
             threading.Thread(target=self.avoid, args=(dict(z),),
                              daemon=True).start()
@@ -381,9 +446,11 @@ class AGVControl(Node):
     def publish_obstacle(self):
         closest = min(self.zones, key=self.zones.get)
         dist = self.zones[closest]
-        if dist < WARN_DANGER:
+        # DANGER tracks the active profile's trigger, so red still means
+        # "this is where it reacts" in either environment.
+        if dist < self.prof['front']:
             level = "DANGER"
-        elif dist < WARN_CAUTION:
+        elif dist < self.prof['caution']:
             level = "CAUTION"
         else:
             level = "CLEAR"
@@ -425,7 +492,7 @@ class AGVControl(Node):
         # 2. reverse straight if the rear is clear, then stop AGAIN before the
         #    turn -- the robot never goes straight from backwards into a
         #    turning move.
-        if self.mode == "AUTO" and z['back'] > MIN_CLEARANCE_REAR:
+        if self.mode == "AUTO" and z['back'] > self.prof['rear']:
             self.publish_action("REVERSING")
             self.set_cmd(-REV_SPEED, 0.0)
             time.sleep(1.2)
@@ -435,16 +502,19 @@ class AGVControl(Node):
 
         # decide which way to turn AWAY from the obstacle
         # angular.z: +1.0 = LEFT, -1.0 = RIGHT
-        if z['front_r'] < MIN_CLEARANCE_TURN:
+        if z['front_r'] < self.prof['turn']:
             steer = +1.0                         # obstacle front-right -> go left
-        elif z['front_l'] < MIN_CLEARANCE_TURN:
+        elif z['front_l'] < self.prof['turn']:
             steer = -1.0                         # obstacle front-left  -> go right
         else:
             steer = +1.0 if z['right'] < z['left'] else -1.0
 
         if self.mode == "AUTO":
-            self.publish_action(
-                "TURNING LEFT" if steer > 0 else "TURNING RIGHT")
+            # "AVOIDING" rather than naming the turn direction: which way it
+            # swings is a detail of the maneuver, and the operator wants to
+            # know the robot is handling an obstacle, not read a steering
+            # commentary.
+            self.publish_action("AVOIDING")
             self.set_cmd(0.0, steer)             # settle the steering first
             time.sleep(0.4)
             self.set_cmd(TURN_SPEED, steer)      # then drive while turned

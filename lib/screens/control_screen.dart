@@ -28,6 +28,7 @@ class _ControlScreenState extends State<ControlScreen> {
 
   // --- Hidden developer settings (see DevSettings) ---
   bool _showJoystick = false; // hidden unless enabled in developer settings
+  String _env = 'OUTDOOR'; // environment profile held by the robot
   Timer? _tick; // 1Hz, only while a run is being recorded
   int _devTaps = 0;
   DateTime? _lastDevTap;
@@ -39,6 +40,14 @@ class _ControlScreenState extends State<ControlScreen> {
     super.initState();
     DevSettings.loadShowJoystick().then((v) {
       if (mounted) setState(() => _showJoystick = v);
+    });
+    DevSettings.loadEnv().then((v) {
+      if (!mounted) return;
+      setState(() => _env = v);
+      // Push it to the robot: the Pi defaults to OUTDOOR on every restart,
+      // so without this the phone could show INDOOR while the robot drove
+      // at outdoor speed.
+      context.read<RobotSocket>().sendCommand("ENV:$v");
     });
   }
 
@@ -131,6 +140,24 @@ class _ControlScreenState extends State<ControlScreen> {
     }
   }
 
+  Future<void> _setEnv(String value, RobotSocket socket) async {
+    setState(() => _env = value);
+    await DevSettings.saveEnv(value);
+    socket.sendCommand("ENV:$value");
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text(
+          value == 'INDOOR'
+              ? "Indoor: half speed, drives through tight gaps"
+              : "Outdoor: full speed, reacts to the whole front arc",
+          style: GoogleFonts.rajdhani(fontWeight: FontWeight.w600),
+        ),
+      ));
+  }
+
   Future<void> _setShowJoystick(bool value, RobotSocket socket) async {
     setState(() => _showJoystick = value);
     await DevSettings.saveShowJoystick(value);
@@ -183,6 +210,71 @@ class _ControlScreenState extends State<ControlScreen> {
                   style: GoogleFonts.rajdhani(color: AppColors.textLo),
                 ),
                 const SizedBox(height: 8),
+                Text(
+                  "ENVIRONMENT",
+                  style: GoogleFonts.rajdhani(
+                    color: AppColors.textLo,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    for (final e in const ['OUTDOOR', 'INDOOR'])
+                      Expanded(
+                        child: Padding(
+                          padding: EdgeInsets.only(
+                              right: e == 'OUTDOOR' ? 8 : 0),
+                          child: GestureDetector(
+                            onTap: () {
+                              _setEnv(e, socket);
+                              setSheet(() {});
+                            },
+                            child: Container(
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 10),
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: _env == e
+                                    ? AppColors.devDim.withValues(alpha: 0.35)
+                                    : AppColors.surfaceHi,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                    color: _env == e
+                                        ? AppColors.dev
+                                        : AppColors.border),
+                              ),
+                              child: Text(
+                                e,
+                                style: GoogleFonts.rajdhani(
+                                  color: _env == e
+                                      ? AppColors.dev
+                                      : AppColors.textLo,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: 1,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _env == 'INDOOR'
+                      ? "Half speed. Ignores the front-corner zones, so the "
+                          "robot drives through corridors and doorways it "
+                          "physically fits instead of stopping at the walls "
+                          "beside it."
+                      : "Full speed. Reacts to anything in the whole front "
+                          "arc -- the safer choice on open ground.",
+                  style: GoogleFonts.rajdhani(
+                      color: AppColors.textLo, fontSize: 12),
+                ),
+                const SizedBox(height: 10),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   // Dev hue, so even the switch reads as "not a user setting"
@@ -285,6 +377,45 @@ class _ControlScreenState extends State<ControlScreen> {
           ),
         ),
       );
+  }
+
+  /// GPS state, in one line, beside the AUTO button.
+  ///
+  /// Replaces the NO GPS banner that used to sit over the camera feed. No fix
+  /// is a standing condition, not an event -- it can last a whole session --
+  /// so it belongs in a status line, not in a warning stack that the operator
+  /// has to look past to see a real hazard. The satellite count is the useful
+  /// part while it is searching: a number that climbs means the antenna is
+  /// working, and a number stuck at the same value means it is not.
+  Widget _gpsChip(RobotSocket socket) {
+    final fixed = socket.hasGps;
+    final sats = fixed ? socket.gpsSats : socket.gpsSatsView;
+    final colour = fixed ? AppColors.online : AppColors.textLo;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.surface.withValues(alpha: 0.85),
+        borderRadius: BorderRadius.circular(40),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(fixed ? Icons.satellite_alt : Icons.satellite_outlined,
+              size: 14, color: colour),
+          const SizedBox(width: 6),
+          Text(
+            fixed ? "GPS  $sats sats" : "NO GPS  $sats in view",
+            style: GoogleFonts.rajdhani(
+              color: colour,
+              fontWeight: FontWeight.w700,
+              fontSize: 12,
+              letterSpacing: 0.5,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Consistent circular action button for the top bar.
@@ -647,6 +778,8 @@ class _ControlScreenState extends State<ControlScreen> {
                               ),
                             ),
                           ),
+                          const SizedBox(height: 8),
+                          _gpsChip(socket),
                         ],
                       ),
                     ),

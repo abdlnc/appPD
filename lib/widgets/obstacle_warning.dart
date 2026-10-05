@@ -9,10 +9,11 @@ import '../services/robot_socket.dart';
 ///   * DANGER/CAUTION - closest Lidar obstacle
 ///   * the action being taken - what the robot is DOING about an obstacle
 ///     (stopping, reversing, turning), shown with the obstacle banner
-///   * NO GPS SIGNAL  - no fix, so NAV mode cannot drive at all
-///   * UNSUPPORTED FIELD TYPE - from two independent causes: no GPS (the
-///     field cannot be identified or mapped), or the soil camera's
-///     classifier reporting ground this system does not support
+///   * UNSUPPORTED FIELD TYPE - the soil camera's classifier reporting
+///     ground this system does not support
+///
+/// GPS state is deliberately NOT a banner: see the chip beside the AUTO
+/// button on the control screen.
 /// All hidden while disconnected.
 class ObstacleWarning extends StatelessWidget {
   const ObstacleWarning({super.key});
@@ -142,29 +143,12 @@ class ObstacleWarning extends StatelessWidget {
           ));
         }
 
-        // 2. NO GPS SIGNAL -- independent of any obstacle state. Blue-grey on
-        // purpose: this is not a collision hazard, and colouring it red/amber
-        // would blend it in with the ones that are.
-        if (socket.noGpsSignal) {
-          final sats = socket.gpsSatsView > 0
-              ? '${socket.gpsSatsView} sats in view - NAV unavailable'
-              : 'searching - NAV unavailable';
-          banners.add(_banner(
-            color: const Color(0xFF546E7A),
-            icon: Icons.satellite_alt,
-            title: 'NO GPS SIGNAL',
-            detail: sats,
-          ));
-          // Same cause, separate consequence: without a position the field
-          // cannot be identified or mapped, so it is called out on its own
-          // line rather than buried in the GPS banner's detail text.
-          banners.add(_banner(
-            color: const Color(0xFF546E7A),
-            icon: Icons.grass,
-            title: 'UNSUPPORTED FIELD TYPE',
-            detail: 'field mapping needs a GPS fix',
-          ));
-        } else if (socket.unsupportedField) {
+        // No GPS no longer raises a banner. It is a standing condition
+        // rather than an event -- it can persist for an entire session --
+        // and a permanent banner over the camera feed buried the warnings
+        // that actually need reacting to. The GPS chip beside the AUTO
+        // button carries it instead, including the satellite count.
+        if (socket.unsupportedField) {
           // The soil camera's classifier says the ground under the robot is
           // not a field type this system handles. Only shown when GPS is
           // present, since the banner above already covers the other case and

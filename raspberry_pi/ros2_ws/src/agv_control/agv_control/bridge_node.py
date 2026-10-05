@@ -20,6 +20,7 @@ Keeps the EXISTING Flutter app protocol, so NO app changes are needed:
 Translates to ROS2:
     publishes  /cmd_vel (geometry_msgs/Twist)  manual joystick, only while MANUAL
     publishes  /mode    (std_msgs/String)      AUTO / MANUAL / STOP
+    publishes  /env_mode (std_msgs/String)     OUTDOOR / INDOOR (from the app)
     relays     /field_type -> "F:<supported|unsupported>|<conf>" to the app
     relays     /avoid_action -> "A:<STOPPING|REVERSING|TURNING LEFT|...>"
     subscribes /image_raw/compressed (sensor_msgs/CompressedImage)
@@ -96,7 +97,11 @@ RESET_MAP_TIMEOUT = 30.0   # s; the unit itself settles in ~2s, this is just a b
 # change this too. NAV mode is deliberately different (nav_node.py's
 # CRUISE_SPEED = 0.80) -- set 0.80 here instead to match NAV.
 # Steering (angular.z) is NOT scaled: it's an angle, not a speed.
-MANUAL_SPEED = 0.50
+# Manual top speed per environment, matching control_node's ENV_PROFILES so
+# hand-driving and AUTO move at the same pace in either mode.
+MANUAL_SPEED_BY_ENV = {"OUTDOOR": 1.00, "INDOOR": 0.50}
+DEFAULT_ENV = "OUTDOOR"
+MANUAL_SPEED = MANUAL_SPEED_BY_ENV[DEFAULT_ENV]
                             # (map_saver_cli can transiently fail right after
                             # a restart -- the script retries up to 3x itself)
 
@@ -109,6 +114,8 @@ class BridgeNode(Node):
         self.latest_boxes = None         # "<fw>,<fh>|..." from /ai_boxes
         self.latest_field = None         # "supported|0.96" from /field_type
         self.latest_action = None        # "REVERSING" etc from /avoid_action
+        self.env = DEFAULT_ENV           # OUTDOOR / INDOOR, set by the app
+        self.manual_speed = MANUAL_SPEED
         self.latest_gps = None
         self.manual_cmd = Twist()
         self.latest_jpeg = None          # bytes: compressed JPEG from camera_node
@@ -118,6 +125,9 @@ class BridgeNode(Node):
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.mode_pub = self.create_publisher(String, '/mode', 10)
+        # Latched-ish: republished whenever the app sets it, and once at
+        # startup, so control_node hears it even if it started second.
+        self.env_pub = self.create_publisher(String, '/env_mode', 10)
         self.waypoint_pub = self.create_publisher(String, '/waypoint', 10)
         self.create_subscription(CompressedImage, '/image_raw/compressed',
                                  self.img_cb, 10)
@@ -183,10 +193,23 @@ class BridgeNode(Node):
         self.publish_mode()
 
     # ---- manual joystick -> Twist ----
+    def set_env(self, name):
+        """OUTDOOR / INDOOR from the app's developer settings."""
+        name = name.strip().upper()
+        if name not in MANUAL_SPEED_BY_ENV:
+            return
+        self.env = name
+        self.manual_speed = MANUAL_SPEED_BY_ENV[name]
+        m = String()
+        m.data = name
+        self.env_pub.publish(m)
+        self.get_logger().info(
+            f"Environment -> {name} (manual top speed {self.manual_speed:.2f})")
+
     def set_manual(self, x, y):
         # joystick screen coords -> ROS: forward = -y, left = -x
         t = Twist()
-        t.linear.x = max(-1.0, min(1.0, -y)) * MANUAL_SPEED
+        t.linear.x = max(-1.0, min(1.0, -y)) * self.manual_speed
         t.angular.z = max(-1.0, min(1.0, -x))
         self.manual_cmd = t
 
@@ -363,7 +386,10 @@ async def ws_handler(websocket, node: BridgeNode):
     try:
         async for message in websocket:
             msg = message.strip()
-            if msg.upper().startswith("MODE:"):
+            if msg.upper().startswith("ENV:"):
+                # Environment profile from the app's developer settings.
+                node.set_env(msg[4:])
+            elif msg.upper().startswith("MODE:"):
                 node.set_mode(msg.split(":", 1)[1])
             elif msg.upper().startswith("WP:"):
                 node.handle_waypoint(msg.split(":", 1)[1])
