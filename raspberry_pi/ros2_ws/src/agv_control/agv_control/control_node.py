@@ -174,7 +174,14 @@ ENV_PROFILES = {
     },
     "INDOOR": {
         "fwd": 0.50,            # unchanged from today
-        "front": 0.45,          # react later: a doorway is close by nature
+        # 2026-10-06: 0.45 -> 0.60, the robot was reaching walls ahead of it.
+        # 0.45m is less room than it sounds: returns closer than
+        # MIN_VALID_DIST (0.15m) are discarded as chassis/noise, so a wall
+        # the robot has already closed on reads as CLEAR and it drives on.
+        # Triggering earlier keeps it out of that blind spot. Raising this
+        # does NOT narrow the gaps it fits through -- corridors are about
+        # corners_trigger below, not about this distance.
+        "front": 0.60,
         "turn": 0.18,
         "rear": 0.18,
         "corners_trigger": False,   # walls beside the robot are not obstacles
