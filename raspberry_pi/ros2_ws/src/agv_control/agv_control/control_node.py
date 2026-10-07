@@ -231,7 +231,24 @@ TURN_TIME           = 1.0      # s of driving while turned
 # take, which is the behaviour this whole section exists to remove.
 # Re-measure it after any change to wheels, axles or mudguards.
 ROBOT_WIDTH     = 0.60     # m, widest point
-GAP_SIDE_MARGIN = 0.05     # m of slack each side -> needs a 0.70m gap
+ROBOT_LENGTH    = 0.80     # m, front bumper to rear bumper
+GAP_SIDE_MARGIN = 0.05     # m of slack each side
+
+# WHY LENGTH MATTERS TO A GAP. A long body does not sweep its own width
+# unless it goes in straight: entering at an angle, the corners stick out,
+# and the space needed is
+#
+#     ROBOT_WIDTH * cos(angle) + ROBOT_LENGTH * sin(angle)
+#
+# For this 60x80cm machine that is 0.60m straight on, 0.84m at 20 degrees
+# and 0.92m at 30. An earlier version of this check required a flat 0.70m
+# at every angle, which is 14cm short at 20 degrees and 22cm short at 30 --
+# and since gap seeking deliberately picks angled headings, that was the
+# normal case, not an edge case. It would have clipped doorframes.
+#
+# The requirement is therefore computed per candidate heading, not once.
+# The practical effect is that tight gaps have to be approached nearly
+# straight on, which is simply true of a robot this shape.
 
 # How far ahead the corridor must be clear. Shorter and the robot commits
 # too late to steer; longer and distant clutter rules out gaps that will
@@ -646,9 +663,10 @@ class AGVControl(Node):
         Returns (steer, found). steer is in the same -1..+1 units as
         /cmd_vel's angular.z, + = LEFT.
 
-        The test for each candidate heading is a straight corridor
-        ROBOT_WIDTH + 2*GAP_SIDE_MARGIN wide, running along that heading out
-        to GAP_LOOKAHEAD: if no return falls inside it, the robot fits.
+        The test for each candidate heading is a straight corridor wide
+        enough for the body AT THAT ANGLE -- see ROBOT_LENGTH, which is why
+        the width is not a constant -- running along the heading out to
+        GAP_LOOKAHEAD. If no return falls inside it, the robot fits.
 
         That corridor is a STRAIGHT approximation of a path the robot can
         only reach by curving into it, so it slightly overstates what is
@@ -658,8 +676,6 @@ class AGVControl(Node):
         a reactive gap-follower, not a planner -- it does not know where the
         gap leads, only that the robot fits into it now.
         """
-        half = ROBOT_WIDTH / 2.0 + GAP_SIDE_MARGIN
-
         # Collect the nearby returns once, in robot-frame bearings, rather
         # than re-deriving the angle inside the candidate loop.
         pts = []
@@ -691,6 +707,11 @@ class AGVControl(Node):
 
         for cand in cands:
             th = math.radians(cand)
+            # Half-width the body actually needs at THIS heading -- see the
+            # ROBOT_LENGTH note above.
+            half = (ROBOT_WIDTH * math.cos(abs(th))
+                    + ROBOT_LENGTH * math.sin(abs(th))) / 2.0 \
+                + GAP_SIDE_MARGIN
             blocked = False
             for phi, r in pts:
                 rel = phi - th

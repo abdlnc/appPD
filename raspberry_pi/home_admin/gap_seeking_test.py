@@ -94,9 +94,17 @@ def chk(label, cond, extra=""):
     global ok; ok &= bool(cond)
     print(f"{'PASS' if cond else 'FAIL'}  {label:56s} {extra}")
 
-need = cn.ROBOT_WIDTH + 2*cn.GAP_SIDE_MARGIN
-print(f"ROBOT_WIDTH={cn.ROBOT_WIDTH}m  margin={cn.GAP_SIDE_MARGIN}m  "
-      f"-> needs {need:.2f}m of clear space")
+import math as _m
+def need_at(deg):
+    """Total gap the body needs at a given heading -- see ROBOT_LENGTH."""
+    t = _m.radians(abs(deg))
+    return (cn.ROBOT_WIDTH*_m.cos(t) + cn.ROBOT_LENGTH*_m.sin(t)
+            + 2*cn.GAP_SIDE_MARGIN)
+need = need_at(0)
+print(f"ROBOT {cn.ROBOT_WIDTH}m wide x {cn.ROBOT_LENGTH}m long  "
+      f"margin={cn.GAP_SIDE_MARGIN}m")
+print(f"needs {need_at(0):.2f}m straight on, {need_at(20):.2f}m at 20deg, "
+      f"{need_at(30):.2f}m at 30deg")
 print(f"GAP_LOOKAHEAD={cn.GAP_LOOKAHEAD}m  ARC=+/-{cn.GAP_ARC_DEG}deg\n")
 
 print("-- corridors: does it fit, and does it know?")
@@ -108,7 +116,7 @@ for width in (1.20, 0.80, 0.72, 0.68, 0.60, 0.40):
     h = width / 2.0
     walls = [((-1,  h), (3,  h)), ((-1, -h), (3, -h))]
     steer, found, _ = gap(scan_from_walls(walls))
-    fits = width > need
+    fits = width > need_at(0)   # a corridor is entered straight on
     chk(f"{width*100:.0f}cm corridor: {'fits' if fits else 'too narrow'}",
         found == fits, f"found={found} steer={deg_of(steer):+.0f}deg")
 
@@ -184,6 +192,35 @@ r = [0.10]*N        # everything inside MIN_VALID_DIST
 steer, found, _ = gap(r)
 chk("returns inside MIN_VALID_DIST ignored", found and steer == 0.0)
 
+
+print("\n-- body LENGTH: a tight gap must be approached straight on")
+# An offset doorway wide enough head-on but NOT wide enough to enter at
+# the angle the robot would have to turn through: a 60x80cm body needs
+# 0.94m at 20deg, and this gap is 0.75m. The wall is at 0.9m so that even
+# steep headings are inside GAP_LOOKAHEAD -- further out and the robot can
+# legitimately veer PAST the wall instead, which is a different scenario.
+walls = [((0.9, 0.95), (0.9, 4.0)), ((0.9, 0.20), (0.9, -4.0))]   # 75cm, offset
+steer, found, _ = gap(scan_from_walls(walls))
+chk("75cm doorway offset sideways: refuses to squeeze in at an angle",
+    not found, f"found={found} steer={deg_of(steer):+.0f}deg")
+
+# The same width, straight ahead, IS fine -- 0.75m > 0.70m needed at 0deg.
+walls = [((1.2, 0.375), (1.2, 4.0)), ((1.2, -0.375), (1.2, -4.0))]
+steer, found, _ = gap(scan_from_walls(walls))
+chk("75cm doorway dead ahead: still driven straight through",
+    found and abs(deg_of(steer)) < 1e-9, f"steer={deg_of(steer):+.0f}deg")
+
+# A gap wide enough even at an angle should still be used at an angle.
+walls = [((0.9, 1.30), (0.9, 4.0)), ((0.9, 0.15), (0.9, -4.0))]   # 115cm offset
+steer, found, _ = gap(scan_from_walls(walls))
+chk("115cm doorway offset: wide enough to enter on an angle",
+    found and deg_of(steer) > 0, f"steer={deg_of(steer):+.0f}deg")
+
+# Requirement must grow with angle, monotonically, over the useful range.
+reqs = [need_at(d) for d in range(0, 46, 5)]
+chk("required width rises with heading angle",
+    all(b > a for a, b in zip(reqs, reqs[1:])),
+    f"{reqs[0]:.2f}m -> {reqs[-1]:.2f}m")
 
 # ------------------- integration: the real scan_cb -------------------
 # Everything above tests pick_gap in isolation. These drive the actual
