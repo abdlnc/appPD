@@ -205,6 +205,59 @@ REVERSE_TIME        = 1.2      # s of backing away from the obstacle
 SETTLE_TIME         = 0.4      # s to let the steering reach full lock
 TURN_TIME           = 1.0      # s of driving while turned
 
+# ----------- Gap seeking ("drive through what it fits through") -----------
+# The robot used to treat a near return in the front arc as a wall: stop,
+# reverse, turn, try again. That is correct for a wall and wrong for a
+# doorway, a row gap or two obstacles with space between them -- it would
+# shuffle back and forth in front of a gap it could simply have driven
+# through.
+#
+# So before concluding the way is blocked, look for a heading along which a
+# corridor as wide as the ROBOT is clear, and steer into it. Only when no
+# such heading exists does the stop/reverse/turn maneuver run.
+#
+# WHY THIS RUNS DURING CRUISE, not just when the front zone trips: this
+# machine steers with its front wheels and drives both rear wheels at the
+# same duty (see motor_node), so it cannot pivot on the spot the way a
+# differential-drive robot can -- it has a turning radius and must DRIVE to
+# change heading. By the time an obstacle is at the 0.60-0.70m trigger
+# there is no longer room to steer around it. Looking GAP_LOOKAHEAD ahead
+# and easing into the gap early is what makes it possible at all.
+#
+# ROBOT_WIDTH IS A PHYSICAL MEASUREMENT, 60cm at the widest point as
+# measured on this machine. It is the one number here that is not a tuning
+# knob: set it wrong small and the robot will aim at gaps it cannot fit
+# through and wedge itself; set it wrong large and it refuses gaps it could
+# take, which is the behaviour this whole section exists to remove.
+# Re-measure it after any change to wheels, axles or mudguards.
+ROBOT_WIDTH     = 0.60     # m, widest point
+GAP_SIDE_MARGIN = 0.05     # m of slack each side -> needs a 0.70m gap
+
+# How far ahead the corridor must be clear. Shorter and the robot commits
+# too late to steer; longer and distant clutter rules out gaps that will
+# have opened up by the time it arrives.
+GAP_LOOKAHEAD = 1.50       # m
+
+# Headings considered, in degrees either side of straight ahead, and the
+# step between them. The arc is wider than the robot can steer to in one
+# go on purpose: a far-off gap still pulls it in the right direction.
+GAP_ARC_DEG  = 60.0
+GAP_STEP_DEG = 5.0
+
+# Heading error that maps to full steering lock -- same convention as
+# nav_node's STEER_FULL_DEG, so the two modes feel the same to drive.
+GAP_STEER_FULL_DEG = 45.0
+
+# Closer than this in front, threading is abandoned: there is no room left
+# to turn into the gap, so the stop/reverse/turn maneuver is the only
+# honest option.
+GAP_MIN_FRONT = 0.35       # m
+
+# Cruise speed while steering through a gap, instead of prof['fwd']. Going
+# slower buys back the reaction distance that aiming at a 10cm clearance
+# spends, and a gap misjudged at speed is how a robot wedges itself.
+GAP_SPEED = 0.35
+
 # ----------- Turn direction: commitment and hysteresis -----------
 # Each avoidance maneuver used to pick its direction from scratch, with no
 # memory of the one before it. That is what made the robot oscillate in
@@ -258,6 +311,10 @@ class AGVControl(Node):
         self._cam_time = 0.0        # when the last qualifying detection arrived
         self._cam_conf = 0.0        # its best-box confidence
         self._cam_count = 0         # how many boxes that detection had
+
+        # --- gap seeking (see ROBOT_WIDTH) ---
+        self._gap_sign = 0.0        # side of the last gap taken, for hysteresis
+        self._gap_logged = 0.0      # rate-limit for the threading log
 
         # --- turn direction memory (see TURN_COMMIT_TIME) ---
         self._last_turn = 0.0       # steer sign of the last maneuver, 0 = none
@@ -472,7 +529,38 @@ class AGVControl(Node):
         hit = z['front'] < front
         if self.prof['corners_trigger']:
             hit = hit or z['front_r'] < front or z['front_l'] < front
+
+        # --- gap seeking, before anything is called blocked ---
+        # Steer through what the robot physically fits through rather than
+        # stopping for it. Runs during ordinary cruising too, not only when
+        # the front zone trips, because this machine has to start turning
+        # well before an obstacle is at the trigger distance -- see the
+        # ROBOT_WIDTH section.
+        #
+        # Skipped once something is inside GAP_MIN_FRONT: at that range
+        # there is no room left to steer around anything, and pretending
+        # otherwise would drive the robot into it at an angle.
+        if z['front'] > GAP_MIN_FRONT:
+            steer, found = self.pick_gap(ranges, msg.angle_min,
+                                         msg.angle_increment)
+            if found:
+                if steer == 0.0:
+                    # Straight ahead fits: ordinary cruising, full speed.
+                    self.set_cmd(self.cruise_speed(), 0.0)
+                else:
+                    # Thread the gap, slower -- see GAP_SPEED.
+                    now = time.time()
+                    if now - self._gap_logged > 1.0:
+                        self._gap_logged = now
+                        self.get_logger().info(
+                            f"gap at {steer * GAP_STEER_FULL_DEG:+.0f} deg "
+                            f"fits ({ROBOT_WIDTH:.2f}m + margin) -- "
+                            f"steering through instead of stopping")
+                    self.set_cmd(min(self.cruise_speed(), GAP_SPEED), steer)
+                return
+
         if hit:
+            # Nothing the robot fits through: fall back to the maneuver.
             self.is_avoiding = True
             threading.Thread(target=self.avoid, args=(dict(z),),
                              daemon=True).start()
@@ -550,6 +638,75 @@ class AGVControl(Node):
         else:
             m.data = f"{level}|{closest}|{dist:.2f}" + ("|BLOCKED" if blocked else "")
         self.obstacle_pub.publish(m)
+
+    # ----------------------- gap seeking -----------------------
+    def pick_gap(self, ranges, angle_min, angle_increment):
+        """Find a heading the robot physically fits through.
+
+        Returns (steer, found). steer is in the same -1..+1 units as
+        /cmd_vel's angular.z, + = LEFT.
+
+        The test for each candidate heading is a straight corridor
+        ROBOT_WIDTH + 2*GAP_SIDE_MARGIN wide, running along that heading out
+        to GAP_LOOKAHEAD: if no return falls inside it, the robot fits.
+
+        That corridor is a STRAIGHT approximation of a path the robot can
+        only reach by curving into it, so it slightly overstates what is
+        reachable at large deviations. GAP_SIDE_MARGIN absorbs the error at
+        the small angles that matter, and GAP_MIN_FRONT stops it being
+        trusted once an obstacle is too close to steer around at all. It is
+        a reactive gap-follower, not a planner -- it does not know where the
+        gap leads, only that the robot fits into it now.
+        """
+        half = ROBOT_WIDTH / 2.0 + GAP_SIDE_MARGIN
+
+        # Collect the nearby returns once, in robot-frame bearings, rather
+        # than re-deriving the angle inside the candidate loop.
+        pts = []
+        for k, r in enumerate(ranges):
+            if r is None or math.isinf(r) or math.isnan(r):
+                continue
+            if r < MIN_VALID_DIST or r > GAP_LOOKAHEAD:
+                continue
+            deg = (math.degrees(angle_min + k * angle_increment)
+                   + ANGLE_OFFSET_DEG) % 360.0
+            brg = deg if deg <= 180.0 else deg - 360.0
+            # Returns from behind the robot cannot block a forward corridor.
+            if abs(brg) > 90.0:
+                continue
+            pts.append((math.radians(brg), r))
+
+        # Candidate headings, ordered by how far they deviate from straight
+        # ahead, so the robot always prefers the gap that costs it least
+        # course change. Within a tie the side of the LAST gap is tried
+        # first: without that, two symmetric gaps would have the robot
+        # flip-flopping between them scan to scan.
+        first_sign = 1.0 if self._gap_sign >= 0 else -1.0
+        cands = [0.0]
+        d = GAP_STEP_DEG
+        while d <= GAP_ARC_DEG:
+            cands.append(first_sign * d)
+            cands.append(-first_sign * d)
+            d += GAP_STEP_DEG
+
+        for cand in cands:
+            th = math.radians(cand)
+            blocked = False
+            for phi, r in pts:
+                rel = phi - th
+                # Along the candidate heading, and perpendicular to it.
+                if r * math.cos(rel) <= 0.0:
+                    continue                  # beside or behind: no block
+                if abs(r * math.sin(rel)) < half:
+                    blocked = True
+                    break
+            if not blocked:
+                if cand != 0.0:
+                    self._gap_sign = 1.0 if cand > 0 else -1.0
+                steer = max(-1.0, min(1.0, cand / GAP_STEER_FULL_DEG))
+                return steer, True
+
+        return 0.0, False
 
     # ----------------------- turn direction -----------------------
     def pick_turn(self, z):
