@@ -222,6 +222,33 @@ chk("required width rises with heading angle",
     all(b > a for a, b in zip(reqs, reqs[1:])),
     f"{reqs[0]:.2f}m -> {reqs[-1]:.2f}m")
 
+print("\n-- body geometry: no clearance may sit inside the robot")
+# The Lidar is at the body centre, so /scan distances are measured from
+# the MIDDLE of the machine. A clearance shorter than the overhang is a
+# test that can never fail: before this was made explicit, the rear
+# clearance (0.28m) and GAP_MIN_FRONT (0.35m) were both inside the 0.40m
+# overhang, so the robot would reverse into something touching its back
+# bumper and the "too close to steer" guard never fired.
+chk("overhangs match the measured body",
+    abs(cn.OVERHANG_FWD - cn.ROBOT_LENGTH/2) < 1e-9
+    and abs(cn.OVERHANG_SIDE - cn.ROBOT_WIDTH/2) < 1e-9,
+    f"fwd {cn.OVERHANG_FWD:.2f}m side {cn.OVERHANG_SIDE:.2f}m")
+for env in ("OUTDOOR", "INDOOR"):
+    pr = cn.ENV_PROFILES[env]
+    chk(f"{env}: front trigger is outside the bumper", pr['front'] > 0,
+        f"{pr['front']:.2f}m clear = {cn.OVERHANG_FWD+pr['front']:.2f}m on /scan")
+    chk(f"{env}: rear clearance is outside the bumper", pr['rear'] > 0,
+        f"{pr['rear']:.2f}m clear = {cn.OVERHANG_REAR+pr['rear']:.2f}m on /scan")
+chk("threading guard is outside the bumper", cn.GAP_MIN_BUMPER > 0,
+    f"{cn.GAP_MIN_BUMPER:.2f}m = {cn.GAP_MIN_FRONT:.2f}m on /scan")
+# The front trigger must stay where field testing put it.
+chk("OUTDOOR front trigger still fires at 0.70m on /scan",
+    abs(cn.OVERHANG_FWD + cn.ENV_PROFILES['OUTDOOR']['front'] - 0.70) < 1e-9)
+chk("INDOOR front trigger still fires at 0.60m on /scan",
+    abs(cn.OVERHANG_FWD + cn.ENV_PROFILES['INDOOR']['front'] - 0.60) < 1e-9)
+chk("the dead 'turn' key is gone from the profiles",
+    all('turn' not in pr for pr in cn.ENV_PROFILES.values()))
+
 # ------------------- integration: the real scan_cb -------------------
 # Everything above tests pick_gap in isolation. These drive the actual
 # callback, so they also cover the profile speeds and the hand-off to the
@@ -288,8 +315,8 @@ chk("wall at 0.5m across everything: falls back to the maneuver", started)
 # Too close to steer at all -- GAP_MIN_FRONT.
 walls = [((0.25, 3.0), (0.25, -3.0))]
 started, sent = drive(scan_from_walls(walls))
-chk(f"obstacle inside GAP_MIN_FRONT ({cn.GAP_MIN_FRONT}m): maneuver, "
-    f"no threading", started)
+chk(f"obstacle inside GAP_MIN_FRONT ({cn.GAP_MIN_FRONT:.2f}m on /scan): "
+    f"maneuver, no threading", started)
 
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

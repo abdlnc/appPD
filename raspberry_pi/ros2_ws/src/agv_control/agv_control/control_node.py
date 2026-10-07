@@ -165,27 +165,34 @@ BLOCKED_RELEASE_SCANS = 5
 #
 # corners_trigger is the whole difference between "stops at every doorway" and
 # "drives down the corridor".
+# NOTE ON UNITS: 'front' and 'rear' are clearances from the BUMPER, not
+# /scan distances -- OVERHANG_FWD/REAR is added before they are compared.
+# The front values are chosen to leave the trigger exactly where field
+# testing put it (0.70m and 0.60m on /scan); they are only written
+# differently so the number means what it says. 'rear' is a real change:
+# at 0.28m from the Lidar it sat inside the robot and the check could
+# never fail.
+#
+# The old 'turn' key is gone. pick_turn() now compares the two sides
+# against each other rather than against an absolute clearance, so the
+# value had become dead config -- and at 0.28m it was inside the robot's
+# own 0.30m half-width anyway.
 ENV_PROFILES = {
     "OUTDOOR": {
         "fwd": 1.00,            # full duty on open ground
-        "front": 0.70,          # avoidance trigger, metres
-        "turn": 0.28,           # room needed to turn out
-        "rear": 0.28,           # room needed to reverse out
+        "front": 0.30,          # trigger when the BUMPER is this close
+        "rear": 0.30,           # bumper clearance needed to reverse out
         "corners_trigger": True,
-        "caution": 1.40,        # app's amber ring
+        "caution": 1.40,        # app's amber ring (raw /scan distance)
     },
     "INDOOR": {
         "fwd": 0.50,            # unchanged from today
-        # 2026-10-06: 0.45 -> 0.60, the robot was reaching walls ahead of it.
-        # 0.45m is less room than it sounds: returns closer than
-        # MIN_VALID_DIST (0.15m) are discarded as chassis/noise, so a wall
-        # the robot has already closed on reads as CLEAR and it drives on.
-        # Triggering earlier keeps it out of that blind spot. Raising this
-        # does NOT narrow the gaps it fits through -- corridors are about
-        # corners_trigger below, not about this distance.
-        "front": 0.60,
-        "turn": 0.18,
-        "rear": 0.18,
+        # 2026-10-06: raised because the robot was reaching walls ahead of
+        # it. The real reason was the 40cm overhang -- the old 0.45m /scan
+        # trigger left the BUMPER 5cm from the wall. 0.20m of bumper
+        # clearance is 0.60m on /scan, which is where it ended up.
+        "front": 0.20,
+        "rear": 0.20,
         "corners_trigger": False,   # walls beside the robot are not obstacles
         "caution": 0.90,
     },
@@ -234,6 +241,33 @@ ROBOT_WIDTH     = 0.60     # m, widest point
 ROBOT_LENGTH    = 0.80     # m, front bumper to rear bumper
 GAP_SIDE_MARGIN = 0.05     # m of slack each side
 
+# ----------- Where the Lidar sits on the body -----------
+# MEASURED: the Lidar is at the exact centre of the robot. /scan therefore
+# reports distances from the MIDDLE of the machine, with 40cm of robot in
+# front of it, 40cm behind, and 30cm either side.
+#
+# This matters more than it looks, because every threshold in this file is
+# compared against a /scan distance. A "0.70m front trigger" is 0.70m from
+# the Lidar and only 0.30m from the front bumper. Two consequences were
+# live bugs before this was made explicit:
+#
+#   * INDOOR's front trigger of 0.45m put the BUMPER 5cm from the wall
+#     before the robot reacted, which is the "indoor mode hits wall in
+#     front" report. Raising it to 0.60m bought 20cm of real clearance.
+#
+#   * A rear clearance of 0.28m and a GAP_MIN_FRONT of 0.35m are both
+#     SHORTER than the 0.40m overhang, i.e. inside the robot. Those tests
+#     could never fail: the robot would happily reverse into something
+#     already touching its back bumper, and the "too close to steer around"
+#     guard never fired at all.
+#
+# So the clearances below are now written as distances from the BODY, which
+# is what a human means by them, and the overhang is added when they are
+# compared against /scan. Re-measure if the Lidar is ever moved.
+OVERHANG_FWD  = ROBOT_LENGTH / 2.0     # 0.40 m of robot ahead of the Lidar
+OVERHANG_REAR = ROBOT_LENGTH / 2.0     # 0.40 m behind
+OVERHANG_SIDE = ROBOT_WIDTH / 2.0      # 0.30 m either side
+
 # WHY LENGTH MATTERS TO A GAP. A long body does not sweep its own width
 # unless it goes in straight: entering at an angle, the corners stick out,
 # and the space needed is
@@ -265,10 +299,12 @@ GAP_STEP_DEG = 5.0
 # nav_node's STEER_FULL_DEG, so the two modes feel the same to drive.
 GAP_STEER_FULL_DEG = 45.0
 
-# Closer than this in front, threading is abandoned: there is no room left
-# to turn into the gap, so the stop/reverse/turn maneuver is the only
-# honest option.
-GAP_MIN_FRONT = 0.35       # m
+# Closer than this TO THE FRONT BUMPER, threading is abandoned: there is no
+# room left to turn into the gap, so the stop/reverse/turn maneuver is the
+# only honest option. Was 0.35m measured from the Lidar, which is 5cm
+# INSIDE the robot -- the guard could never fire.
+GAP_MIN_BUMPER = 0.15      # m from the front bumper
+GAP_MIN_FRONT = OVERHANG_FWD + GAP_MIN_BUMPER       # = 0.55m on /scan
 
 # Cruise speed while steering through a gap, instead of prof['fwd']. Going
 # slower buys back the reaction distance that aiming at a 10cm clearance
@@ -418,8 +454,11 @@ class AGVControl(Node):
         p = self.prof
         self.get_logger().info(
             f"Environment -> {name}: speed {p['fwd']:.2f}, front trigger "
-            f"{p['front']:.2f}m, corners {'count' if p['corners_trigger'] else 'ignored'}"
-            f", turn/rear clearance {p['turn']:.2f}/{p['rear']:.2f}m")
+            f"{p['front']:.2f}m from the bumper "
+            f"({OVERHANG_FWD + p['front']:.2f}m on /scan), corners "
+            f"{'count' if p['corners_trigger'] else 'ignored'}, rear "
+            f"clearance {p['rear']:.2f}m from the bumper "
+            f"({OVERHANG_REAR + p['rear']:.2f}m on /scan)")
 
     # ----------------------- camera caution -----------------------
     def ai_cb(self, msg: String):
@@ -541,7 +580,8 @@ class AGVControl(Node):
             self.set_cmd(0.0, 0.0)
             return
         z = self.zones
-        front = self.prof['front']
+        # Bumper clearance -> /scan distance; see OVERHANG_FWD.
+        front = OVERHANG_FWD + self.prof['front']
         # INDOOR ignores the corner zones here on purpose -- see ENV_PROFILES.
         hit = z['front'] < front
         if self.prof['corners_trigger']:
@@ -793,7 +833,8 @@ class AGVControl(Node):
         # 2. reverse straight if the rear is clear, then stop AGAIN before the
         #    turn -- the robot never goes straight from backwards into a
         #    turning move.
-        if self.mode == "AUTO" and z['back'] > self.prof['rear']:
+        if (self.mode == "AUTO"
+                and z['back'] > OVERHANG_REAR + self.prof['rear']):
             self.publish_action("REVERSING")
             self.set_cmd(-REV_SPEED, 0.0)
             time.sleep(REVERSE_TIME * grow)
