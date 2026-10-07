@@ -57,6 +57,8 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from sensor_msgs.msg import CompressedImage, LaserScan
 
+from . import scan_filter
+
 import websockets
 
 WS_HOST    = "0.0.0.0"
@@ -164,10 +166,14 @@ class BridgeNode(Node):
         if n == 0:
             self.latest_scan_str = ""
             return
+        # Same sunlight filter the control node uses, so the radar view in
+        # the app shows what the robot is actually acting on rather than a
+        # noisier picture of its own.
+        ranges, _ = scan_filter.clean(list(msg.ranges), list(msg.intensities))
         step = max(1, n // LIDAR_MAX_POINTS)   # downsample to ~LIDAR_MAX_POINTS
         parts = []
         ang = msg.angle_min
-        for i, r in enumerate(msg.ranges):
+        for i, r in enumerate(ranges):
             a = ang
             ang += msg.angle_increment
             if i % step != 0:

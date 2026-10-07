@@ -33,6 +33,13 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from sensor_msgs.msg import LaserScan
+
+# Shipped with the agv_control package; this node runs as a standalone
+# script, so the import is guarded rather than assumed.
+try:
+    from agv_control import scan_filter
+except ImportError:          # pragma: no cover
+    scan_filter = None
 from geometry_msgs.msg import Twist
 
 # ---- navigation tuning ----
@@ -165,11 +172,20 @@ class NavNode(Node):
                 pass
 
     def scan_cb(self, msg):
+        # Same sunlight phantom filter the control node uses, so NAV's own
+        # stop/reroute safety does not react to sun returns that reactive
+        # avoidance has already learned to ignore. Falls through to the raw
+        # scan if the module is unavailable -- NAV safety must not depend
+        # on an import succeeding.
+        ranges = msg.ranges
+        if scan_filter is not None:
+            ranges, _ = scan_filter.clean(list(msg.ranges),
+                                          list(msg.intensities))
         front = []
         left = []
         right = []
         ang = msg.angle_min
-        for r in msg.ranges:
+        for r in ranges:
             a = ang
             ang += msg.angle_increment
             if math.isinf(r) or math.isnan(r) or r < MIN_VALID_DIST:

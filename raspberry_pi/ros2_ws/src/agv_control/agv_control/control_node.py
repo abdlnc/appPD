@@ -50,6 +50,8 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 
+from . import scan_filter
+
 # ----------- Distance thresholds (METERS - LaserScan is in meters) -----------
 # 2026-10-03: all three cut by 30% on request (0.90 -> 0.63, 0.40 -> 0.28),
 # which also suits FWD_SPEED coming back down to 0.80. These are avoid()'s
@@ -220,6 +222,10 @@ class AGVControl(Node):
         self._cam_time = 0.0        # when the last qualifying detection arrived
         self._cam_conf = 0.0        # its best-box confidence
         self._cam_count = 0         # how many boxes that detection had
+
+        # --- sunlight filter (see scan_filter) ---
+        self._scan_blinded = False  # last scan had too few returns to trust
+        self._blind_log = 0.0       # rate-limit for the blinded warning
         self._was_cautious = False  # edge-trigger guard for the log line
 
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -354,9 +360,27 @@ class AGVControl(Node):
 
     # ----------------------- scan processing -----------------------
     def scan_cb(self, msg: LaserScan):
+        # Strip sunlight phantoms BEFORE anything reads the scan, so the
+        # zones, the boxed-in test and the app all see the same cleaned
+        # view. Rejected rays come back as inf, i.e. indistinguishable
+        # from a ray that never returned -- see scan_filter.
+        ranges, st = scan_filter.clean(list(msg.ranges), list(msg.intensities))
+        self._scan_blinded = scan_filter.blinded(st)
+        if self._scan_blinded:
+            # Not "clear" -- cannot see. Logged rather than acted on,
+            # because there is no safe automatic response: stopping on a
+            # blinded scan would strand the robot in the sun, and driving
+            # on is what it already does. The operator needs to know.
+            now = time.time()
+            if now - self._blind_log > 2.0:
+                self._blind_log = now
+                self.get_logger().warn(
+                    f"LIDAR possibly sun-blinded: only "
+                    f"{st['valid_frac']*100:.1f}% of rays returned anything "
+                    f"-- obstacles may be invisible")
         buckets = {k: [] for k in self.zones}
         ang = msg.angle_min
-        for r in msg.ranges:
+        for r in ranges:
             a = ang
             ang += msg.angle_increment
             if math.isinf(r) or math.isnan(r) or r < MIN_VALID_DIST:
