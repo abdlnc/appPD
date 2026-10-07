@@ -201,6 +201,42 @@ DEFAULT_ENV = "OUTDOOR"
 # just nearly hit.
 STOP_BEFORE_REVERSE = 0.8      # s; was 0.5
 STOP_AFTER_REVERSE  = 0.4      # s; was 0.2, before the turn begins
+REVERSE_TIME        = 1.2      # s of backing away from the obstacle
+SETTLE_TIME         = 0.4      # s to let the steering reach full lock
+TURN_TIME           = 1.0      # s of driving while turned
+
+# ----------- Turn direction: commitment and hysteresis -----------
+# Each avoidance maneuver used to pick its direction from scratch, with no
+# memory of the one before it. That is what made the robot oscillate in
+# front of an obstacle: it would reverse and swing left, and the next
+# trigger -- now looking at DIFFERENT side distances, because the robot had
+# just moved -- would swing right, undoing the first escape. Repeat until
+# something intervenes. Reported from the field as "it should be turning
+# right but decides to turn left again".
+#
+# Two fixes, and they are both needed:
+#
+# TURN_COMMIT_TIME -- once a direction is chosen, a new maneuver starting
+#   within this long of the last one ending REUSES it instead of deciding
+#   again. The robot is still dealing with the same obstacle, so it keeps
+#   working the same way around it. Drive clear for longer than this and
+#   the next obstacle gets a fresh decision.
+#
+# TURN_SIDE_MARGIN -- one side must be clearer than the other by at least
+#   this much to win. Without it, two readings a centimetre apart (noise,
+#   not geometry) flip the choice between attempts, which is the same
+#   oscillation arriving by a different route.
+TURN_COMMIT_TIME = 5.0         # s
+TURN_SIDE_MARGIN = 0.15        # m
+
+# After this many committed repeats against the same obstacle, the same
+# maneuver plainly is not working, so make it bigger rather than keep
+# repeating it identically: back off further and turn for longer, in the
+# SAME direction (flipping would be the oscillation again). If that still
+# does not clear it, path_blocked() eventually reports NO PATH and a human
+# is called -- which is the designed escape hatch, not a failure here.
+TURN_ESCALATE_AFTER = 2
+TURN_ESCALATE_MAX   = 2.5      # cap on the reverse/turn time multiplier
 
 
 class AGVControl(Node):
@@ -222,6 +258,11 @@ class AGVControl(Node):
         self._cam_time = 0.0        # when the last qualifying detection arrived
         self._cam_conf = 0.0        # its best-box confidence
         self._cam_count = 0         # how many boxes that detection had
+
+        # --- turn direction memory (see TURN_COMMIT_TIME) ---
+        self._last_turn = 0.0       # steer sign of the last maneuver, 0 = none
+        self._last_turn_end = 0.0   # when that maneuver finished
+        self._turn_repeats = 0      # consecutive committed repeats
 
         # --- sunlight filter (see scan_filter) ---
         self._scan_blinded = False  # last scan had too few returns to trust
@@ -510,6 +551,44 @@ class AGVControl(Node):
             m.data = f"{level}|{closest}|{dist:.2f}" + ("|BLOCKED" if blocked else "")
         self.obstacle_pub.publish(m)
 
+    # ----------------------- turn direction -----------------------
+    def pick_turn(self, z):
+        """Which way to go around the obstacle. +1.0 = LEFT, -1.0 = RIGHT.
+
+        Also returns how many times this direction has been reused, which
+        avoid() uses to escalate. See TURN_COMMIT_TIME for why this has
+        memory at all."""
+        now = time.time()
+
+        # 1. Already committed: still the same obstacle, so keep working the
+        #    same way around it rather than undoing the last attempt.
+        if (self._last_turn != 0.0
+                and (now - self._last_turn_end) < TURN_COMMIT_TIME):
+            self._turn_repeats += 1
+            return self._last_turn, self._turn_repeats
+
+        # A fresh obstacle: forget the last one.
+        self._turn_repeats = 0
+
+        # 2. Turn away from the side the obstacle is actually ON. The front
+        #    corner zones are where something in the robot's path shows up;
+        #    the old code only consulted them when a corner was already
+        #    within the turn clearance (0.18-0.28m), which measured 0 times
+        #    in 60 scans -- i.e. effectively never.
+        fl, fr = z['front_l'], z['front_r']
+        if abs(fl - fr) > TURN_SIDE_MARGIN:
+            return (-1.0 if fl < fr else +1.0), 0
+
+        # 3. Corners agree (both clear, or equally blocked): use what is
+        #    beside the robot, which is what the old code always did.
+        if abs(z['left'] - z['right']) > TURN_SIDE_MARGIN:
+            return (+1.0 if z['right'] < z['left'] else -1.0), 0
+
+        # 4. Genuinely symmetric -- open ground, or a wall square ahead.
+        #    Reuse the last direction if there is one so repeated attempts
+        #    stay consistent, otherwise pick left and stick to it.
+        return (self._last_turn if self._last_turn != 0.0 else +1.0), 0
+
     # ----------------------- avoidance maneuver (thread) -----------------------
     def avoid(self, z):
         log = self.get_logger()
@@ -520,25 +599,32 @@ class AGVControl(Node):
         self.set_cmd(0.0, 0.0)
         time.sleep(STOP_BEFORE_REVERSE)
 
+        # Direction is chosen BEFORE reversing, so the choice is made from
+        # the scan that saw the obstacle rather than from wherever the robot
+        # ends up after backing away.
+        steer, repeats = self.pick_turn(z)
+
+        # Repeating the same escape and getting nowhere: make it bigger.
+        grow = 1.0
+        if repeats >= TURN_ESCALATE_AFTER:
+            grow = min(TURN_ESCALATE_MAX,
+                       1.0 + 0.5 * (repeats - TURN_ESCALATE_AFTER + 1))
+            log.warn(f"still blocked after {repeats} attempts the same way "
+                     f"-- backing off and turning {grow:.1f}x longer")
+
         # 2. reverse straight if the rear is clear, then stop AGAIN before the
         #    turn -- the robot never goes straight from backwards into a
         #    turning move.
         if self.mode == "AUTO" and z['back'] > self.prof['rear']:
             self.publish_action("REVERSING")
             self.set_cmd(-REV_SPEED, 0.0)
-            time.sleep(1.2)
+            time.sleep(REVERSE_TIME * grow)
             self.publish_action("STOPPING")
             self.set_cmd(0.0, 0.0)
             time.sleep(STOP_AFTER_REVERSE)
 
-        # decide which way to turn AWAY from the obstacle
-        # angular.z: +1.0 = LEFT, -1.0 = RIGHT
-        if z['front_r'] < self.prof['turn']:
-            steer = +1.0                         # obstacle front-right -> go left
-        elif z['front_l'] < self.prof['turn']:
-            steer = -1.0                         # obstacle front-left  -> go right
-        else:
-            steer = +1.0 if z['right'] < z['left'] else -1.0
+        log.info(f"going {'LEFT' if steer > 0 else 'RIGHT'} around it"
+                 f"{f' (attempt {repeats + 1})' if repeats else ''}")
 
         if self.mode == "AUTO":
             # "AVOIDING" rather than naming the turn direction: which way it
@@ -547,12 +633,16 @@ class AGVControl(Node):
             # commentary.
             self.publish_action("AVOIDING")
             self.set_cmd(0.0, steer)             # settle the steering first
-            time.sleep(0.4)
+            time.sleep(SETTLE_TIME)
             self.set_cmd(TURN_SPEED, steer)      # then drive while turned
-            time.sleep(1.0)
+            time.sleep(TURN_TIME * grow)
 
         self.set_cmd(0.0, 0.0)                   # stop, re-center
         self.publish_action("")                  # maneuver over
+        # Remember the direction and WHEN it finished: a new maneuver inside
+        # TURN_COMMIT_TIME reuses it instead of contradicting it.
+        self._last_turn = steer
+        self._last_turn_end = time.time()
         self.is_avoiding = False
         log.info("resume")
 
