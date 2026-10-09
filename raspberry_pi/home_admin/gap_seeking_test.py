@@ -81,9 +81,10 @@ def scan_from_walls(segments):
         out[k] = ranges[int(round(deg / STEP)) % N]
     return out
 
-def gap(ranges, last_sign=0.0):
+def gap(ranges, last_sign=0.0, env="OUTDOOR"):
     o = object.__new__(cn.AGVControl)
     o._gap_sign = last_sign
+    o.prof = dict(cn.ENV_PROFILES[env])   # pick_gap reads side_margin from it
     steer, found = cn.AGVControl.pick_gap(o, ranges, 0.0, math.radians(STEP))
     return steer, found, o._gap_sign
 
@@ -95,11 +96,12 @@ def chk(label, cond, extra=""):
     print(f"{'PASS' if cond else 'FAIL'}  {label:56s} {extra}")
 
 import math as _m
-def need_at(deg):
-    """Total gap the body needs at a given heading -- see ROBOT_LENGTH."""
+def need_at(deg, env="OUTDOOR"):
+    """Total gap the body needs at a given heading, for one environment.
+    See ROBOT_LENGTH (angle) and side_margin (corner clearance)."""
     t = _m.radians(abs(deg))
-    return (cn.ROBOT_WIDTH*_m.cos(t) + cn.ROBOT_LENGTH*_m.sin(t)
-            + 2*cn.GAP_SIDE_MARGIN)
+    margin = cn.ENV_PROFILES[env].get('side_margin', cn.GAP_SIDE_MARGIN)
+    return (cn.ROBOT_WIDTH*_m.cos(t) + cn.ROBOT_LENGTH*_m.sin(t) + 2*margin)
 need = need_at(0)
 print(f"ROBOT {cn.ROBOT_WIDTH}m wide x {cn.ROBOT_LENGTH}m long  "
       f"margin={cn.GAP_SIDE_MARGIN}m")
@@ -222,6 +224,44 @@ chk("required width rises with heading angle",
     all(b > a for a, b in zip(reqs, reqs[1:])),
     f"{reqs[0]:.2f}m -> {reqs[-1]:.2f}m")
 
+print("\n-- INDOOR runs wider margins for corner clearance")
+# The robot kept catching walls on its CORNERS indoors. Raising the front
+# trigger does not help there: INDOOR sets corners_trigger False, so the
+# corner ZONES are ignored by design. What covers the corners is the gap
+# geometry's side margin, which INDOOR widens from 5cm to 15cm.
+chk("INDOOR demands more corner clearance than OUTDOOR",
+    cn.ENV_PROFILES['INDOOR']['side_margin']
+    > cn.ENV_PROFILES['OUTDOOR']['side_margin'],
+    f"{cn.ENV_PROFILES['INDOOR']['side_margin']:.2f}m vs "
+    f"{cn.ENV_PROFILES['OUTDOOR']['side_margin']:.2f}m a side")
+chk("so INDOOR needs a wider gap head-on",
+    need_at(0, 'INDOOR') > need_at(0, 'OUTDOOR'),
+    f"{need_at(0,'INDOOR'):.2f}m vs {need_at(0,'OUTDOOR'):.2f}m")
+
+# A 0.80m corridor: OUTDOOR takes it (needs 0.70m), INDOOR refuses it
+# (needs 0.90m). That is the trade being made deliberately -- 10cm a side
+# was what was grazing the walls.
+walls = [((-1, 0.40), (3, 0.40)), ((-1, -0.40), (3, -0.40))]
+r80 = scan_from_walls(walls)
+_, found_out, _ = gap(r80, env="OUTDOOR")
+_, found_in, _ = gap(r80, env="INDOOR")
+chk("80cm corridor: OUTDOOR drives it", found_out)
+chk("80cm corridor: INDOOR refuses it (corner clearance)", not found_in)
+
+# A 1.0m corridor clears the wider margin, so INDOOR still passes.
+walls = [((-1, 0.50), (3, 0.50)), ((-1, -0.50), (3, -0.50))]
+_, found_in, _ = gap(scan_from_walls(walls), env="INDOOR")
+chk("100cm corridor: INDOOR still drives it", found_in)
+
+# The +0.3m that was asked for, on every INDOOR range.
+I = cn.ENV_PROFILES['INDOOR']
+chk("INDOOR front trigger is 0.90m on /scan",
+    abs(cn.OVERHANG_FWD + I['front'] - 0.90) < 1e-9,
+    f"{cn.OVERHANG_FWD + I['front']:.2f}m")
+chk("INDOOR rear clearance is 0.90m on /scan",
+    abs(cn.OVERHANG_REAR + I['rear'] - 0.90) < 1e-9)
+chk("INDOOR caution ring is 1.20m", abs(I['caution'] - 1.20) < 1e-9)
+
 print("\n-- body geometry: no clearance may sit inside the robot")
 # The Lidar is at the body centre, so /scan distances are measured from
 # the MIDDLE of the machine. A clearance shorter than the overhang is a
@@ -244,8 +284,10 @@ chk("threading guard is outside the bumper", cn.GAP_MIN_BUMPER > 0,
 # The front trigger must stay where field testing put it.
 chk("OUTDOOR front trigger still fires at 0.70m on /scan",
     abs(cn.OVERHANG_FWD + cn.ENV_PROFILES['OUTDOOR']['front'] - 0.70) < 1e-9)
-chk("INDOOR front trigger still fires at 0.60m on /scan",
-    abs(cn.OVERHANG_FWD + cn.ENV_PROFILES['INDOOR']['front'] - 0.60) < 1e-9)
+# 2026-10-09: deliberately moved out 0.30m, from 0.60m, after the robot
+# kept catching walls on its corners indoors.
+chk("INDOOR front trigger fires at 0.90m on /scan",
+    abs(cn.OVERHANG_FWD + cn.ENV_PROFILES['INDOOR']['front'] - 0.90) < 1e-9)
 chk("the dead 'turn' key is gone from the profiles",
     all('turn' not in pr for pr in cn.ENV_PROFILES.values()))
 

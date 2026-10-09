@@ -184,6 +184,7 @@ ENV_PROFILES = {
         "rear": 0.30,           # bumper clearance needed to reverse out
         "corners_trigger": True,
         "caution": 1.40,        # app's amber ring (raw /scan distance)
+        "side_margin": 0.05,    # gap-check slack each side (see below)
     },
     "INDOOR": {
         "fwd": 0.50,            # unchanged from today
@@ -191,10 +192,31 @@ ENV_PROFILES = {
         # it. The real reason was the 40cm overhang -- the old 0.45m /scan
         # trigger left the BUMPER 5cm from the wall. 0.20m of bumper
         # clearance is 0.60m on /scan, which is where it ended up.
-        "front": 0.20,
-        "rear": 0.20,
+        #
+        # 2026-10-09: +0.3m on all three, on request, after the robot kept
+        # catching walls on its CORNERS indoors. 0.50m of bumper clearance
+        # is 0.90m on /scan.
+        "front": 0.50,
+        "rear": 0.50,
         "corners_trigger": False,   # walls beside the robot are not obstacles
-        "caution": 0.90,
+        "caution": 1.20,
+        # THE ACTUAL CORNER FIX. Raising 'front' moves the narrow centre
+        # cone out; it does nothing for a wall at the front corner, because
+        # corners_trigger above is False and those zones are ignored by
+        # design -- that is what lets the robot down a corridor at all.
+        #
+        # What does cover the corners is the gap geometry, which works off
+        # the full scan rather than the six zones. Widening its margin from
+        # 0.05 to 0.15 means every heading it considers must clear the body
+        # by 15cm a side instead of 5cm, so a wall it would previously have
+        # grazed now rules that heading out.
+        #
+        # THE COST IS REAL AND IS THE POINT: a 60cm robot needs a 0.70m gap
+        # at 5cm margins and a 0.90m gap at 15cm. You cannot have 15cm of
+        # corner clearance AND the tightest gaps -- 6cm a side is all a 72cm
+        # corridor has to give. If it now refuses an opening you know it
+        # fits through, this is the one number to bring back down.
+        "side_margin": 0.15,
     },
 }
 DEFAULT_ENV = "OUTDOOR"
@@ -239,6 +261,9 @@ TURN_TIME           = 1.0      # s of driving while turned
 # Re-measure it after any change to wheels, axles or mudguards.
 ROBOT_WIDTH     = 0.60     # m, widest point
 ROBOT_LENGTH    = 0.80     # m, front bumper to rear bumper
+# Default slack each side in the gap check. Each ENV_PROFILE overrides it
+# with its own 'side_margin' -- OUTDOOR keeps 0.05, INDOOR runs wider for
+# corner clearance. This constant is the fallback if a profile omits it.
 GAP_SIDE_MARGIN = 0.05     # m of slack each side
 
 # ----------- Where the Lidar sits on the body -----------
@@ -458,7 +483,10 @@ class AGVControl(Node):
             f"({OVERHANG_FWD + p['front']:.2f}m on /scan), corners "
             f"{'count' if p['corners_trigger'] else 'ignored'}, rear "
             f"clearance {p['rear']:.2f}m from the bumper "
-            f"({OVERHANG_REAR + p['rear']:.2f}m on /scan)")
+            f"({OVERHANG_REAR + p['rear']:.2f}m on /scan), gap margin "
+            f"{p.get('side_margin', GAP_SIDE_MARGIN):.2f}m a side "
+            f"(needs a {ROBOT_WIDTH + 2*p.get('side_margin', GAP_SIDE_MARGIN):.2f}m "
+            f"gap head-on)")
 
     # ----------------------- camera caution -----------------------
     def ai_cb(self, msg: String):
@@ -710,7 +738,7 @@ class AGVControl(Node):
 
         That corridor is a STRAIGHT approximation of a path the robot can
         only reach by curving into it, so it slightly overstates what is
-        reachable at large deviations. GAP_SIDE_MARGIN absorbs the error at
+        reachable at large deviations. The profile's side_margin absorbs it at
         the small angles that matter, and GAP_MIN_FRONT stops it being
         trusted once an obstacle is too close to steer around at all. It is
         a reactive gap-follower, not a planner -- it does not know where the
@@ -751,7 +779,7 @@ class AGVControl(Node):
             # ROBOT_LENGTH note above.
             half = (ROBOT_WIDTH * math.cos(abs(th))
                     + ROBOT_LENGTH * math.sin(abs(th))) / 2.0 \
-                + GAP_SIDE_MARGIN
+                + self.prof.get('side_margin', GAP_SIDE_MARGIN)
             blocked = False
             for phi, r in pts:
                 rel = phi - th
