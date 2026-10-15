@@ -42,8 +42,48 @@ sys.modules['agv_control.control_node'] = cn
 spec.loader.exec_module(cn)
 
 CLOCK = [1000.0]
-cn.time = types.SimpleNamespace(time=lambda: CLOCK[0],
-                                sleep=lambda s: CLOCK.__setitem__(0, CLOCK[0]+s))
+# A simulated live lidar: while LIDAR['on'], every fake sleep also marks a
+# fresh scan as arrived, the way the real one does at 10Hz. Tests can swap
+# what the robot sees mid-manoeuvre through LIDAR['next'], or kill the
+# lidar by switching it off.
+LIDAR = {'robot': None, 'on': True, 'next': None, 'after': 0.0}
+EVENTS = []          # (time, fn(robot)) fired once the fake clock passes time
+def _sleep(dt):
+    CLOCK[0] += dt
+    o = LIDAR['robot']
+    for ev in [e for e in EVENTS if CLOCK[0] >= e[0]]:
+        EVENTS.remove(ev)
+        ev[1](o)
+    if o is None or not LIDAR['on']:
+        return
+    if LIDAR['next'] is not None and CLOCK[0] >= LIDAR['after']:
+        o._scan_ranges = LIDAR['next']
+        LIDAR['next'] = None
+    o._scan_time = CLOCK[0]
+cn.time = types.SimpleNamespace(time=lambda: CLOCK[0], sleep=_sleep)
+
+STEP = 0.5          # degrees per ray, as on the C1
+N = 720
+def scan_with(points):
+    """(bearing_deg, range_m) pairs -> a /scan ranges list. Bearing is in
+    the robot frame, 0 = straight ahead, CCW positive, as control_node sees
+    it after ANGLE_OFFSET_DEG."""
+    r = [math.inf] * N
+    for b, d in points:
+        k = int(round(((b - cn.ANGLE_OFFSET_DEG) % 360.0) / STEP)) % N
+        r[k] = min(r[k], d)
+    return r
+
+def rear_wall(d):
+    """A wall square behind the robot, d metres from the lidar."""
+    pts = []
+    b = 120.0
+    while b <= 240.0:
+        c = -math.cos(math.radians(b))
+        if c > 1e-6:
+            pts.append((b, d / c))
+        b += STEP
+    return scan_with(pts)
 
 ZONES = ('front','front_r','right','back','left','front_l')
 def Z(**k): return {**{z: 9999.0 for z in ZONES}, **k}
@@ -56,15 +96,28 @@ def robot(env="OUTDOOR"):
     o._last_turn = 0.0; o._last_turn_end = 0.0; o._turn_repeats = 0
     o._last_action = None
     o.cmds = []
+    o.published = []        # what _stop_now() sent immediately
+    o.cmd = (0.0, 0.0)
     o.publish_action = lambda t: None
-    o.set_cmd = lambda lx, az: o.cmds.append((round(lx, 2), round(az, 2)))
+    def set_cmd(lx, az):
+        o.cmd = (round(lx, 2), round(az, 2))
+        o.cmds.append(o.cmd)
+    o.set_cmd = set_cmd
+    o.pub = types.SimpleNamespace(publish=lambda m: o.published.append(m))
     o.get_logger = lambda: types.SimpleNamespace(warn=lambda m: None,
                                                  info=lambda m: None)
     return o
 
-def run_avoid(o, z):
+def run_avoid(o, z, scan=None):
+    # The reverse leg now reads the live scan, not z['back']. Unless a test
+    # supplies its own, build one with a wall where z says the rear is.
+    o._scan_ranges = scan if scan is not None else rear_wall(z['back'])
+    o._scan_geom = (0.0, math.radians(STEP))
+    o._scan_time = CLOCK[0]
+    LIDAR['robot'] = o
     cn.AGVControl.avoid(o, z)
     turns = [az for lx, az in o.cmds if az != 0.0]
+    o.last_cmds = list(o.cmds)   # kept: the reverse tests read these
     o.cmds.clear()
     return turns[0] if turns else 0.0
 
@@ -149,7 +202,10 @@ chk("escalation never flips direction", o._last_turn == -1.0, name(o._last_turn)
 print("\n-- blocked rear still skips the reverse")
 o = robot()
 t0 = CLOCK[0]
-run_avoid(o, Z(front=0.4, front_l=0.5, front_r=1.6, back=0.1))
+# A wall 0.10m behind the bumper (0.50m from the centre-mounted lidar).
+# This used to say back=0.1, which is inside the robot itself -- and under
+# MIN_VALID_DIST, so the live scan would never even see it.
+run_avoid(o, Z(front=0.4, front_l=0.5, front_r=1.6, back=0.5))
 blocked_rear = CLOCK[0] - t0
 o2 = robot()
 t0 = CLOCK[0]
@@ -169,6 +225,105 @@ d1 = run_avoid(o, Z(front=0.4, back=2.0))      # open ground, nothing either sid
 CLOCK[0] += cn.TURN_COMMIT_TIME + 1.0
 d2 = run_avoid(o, Z(front=0.4, back=2.0))
 chk("symmetric obstacle: same direction each time", d1 == d2, name(d1))
+
+print("\n-- reversing: the robot must not back into anything")
+blocked = Z(front=0.4, front_l=0.5, front_r=1.6, left=0.6, right=1.8, back=2.0)
+
+def reverse_speeds(o):
+    # Read what the LAST manoeuvre commanded. (An earlier draft read o.cmds,
+    # which run_avoid clears -- so every "did not reverse" check passed no
+    # matter what. Each such check below now has a control case beside it
+    # proving it can fail.)
+    return sorted({lx for lx, az in o.last_cmds if lx < 0})
+
+o = robot()
+run_avoid(o, blocked)
+chk("a normal reverse runs at REV_SPEED",
+    reverse_speeds(o) == [-cn.REV_SPEED], f"{reverse_speeds(o)}")
+
+o = robot()
+for _ in range(cn.TURN_ESCALATE_AFTER + 1):
+    o.cmds.clear()
+    run_avoid(o, blocked)
+chk("the escalated (max) reverse runs slower",
+    reverse_speeds(o) == [-cn.REV_SPEED_ESCALATED],
+    f"{reverse_speeds(o)} vs normal {-cn.REV_SPEED}")
+chk("but not below the motors' stall floor", cn.REV_SPEED_ESCALATED >= 0.40)
+
+# Someone steps behind 0.3s into the reverse, 0.15m from the bumper.
+o = robot()
+t0 = CLOCK[0]
+LIDAR['next'] = rear_wall(cn.OVERHANG_REAR + 0.15)
+LIDAR['after'] = t0 + cn.STOP_BEFORE_REVERSE + 0.3
+run_avoid(o, blocked)
+took = CLOCK[0] - t0
+full = (cn.STOP_BEFORE_REVERSE + cn.REVERSE_TIME + cn.STOP_AFTER_REVERSE
+        + cn.SETTLE_TIME + cn.TURN_TIME)
+chk("someone stepping behind mid-reverse cuts it short",
+    took < full - 0.5, f"{took:.2f}s vs {full:.2f}s uninterrupted")
+chk("and the stop goes out at once, not on the next tick",
+    (0.0, 0.0) in o.published, f"published {o.published}")
+
+# The lidar dies mid-reverse: no fresh scans, so stop.
+o = robot()
+t0 = CLOCK[0]
+EVENTS.append((t0 + cn.STOP_BEFORE_REVERSE + 0.2,
+               lambda r: LIDAR.__setitem__('on', False)))
+run_avoid(o, blocked)
+LIDAR['on'] = True
+took = CLOCK[0] - t0
+chk("a dead lidar mid-reverse stops it",
+    took < full - 0.3, f"{took:.2f}s vs {full:.2f}s")
+
+# Emergency stop mid-reverse: leave the loop at once.
+o = robot()
+t0 = CLOCK[0]
+EVENTS.append((t0 + cn.STOP_BEFORE_REVERSE + 0.2,
+               lambda r: setattr(r, 'mode', 'STOP')))
+run_avoid(o, blocked)
+took = CLOCK[0] - t0
+chk("an emergency stop mid-reverse ends it",
+    took < cn.STOP_BEFORE_REVERSE + 0.2 + cn.STOP_AFTER_REVERSE + 0.2,
+    f"{took:.2f}s")
+
+# Something at a rear CORNER: inside the robot's width, but outside the
+# 60-degree back zone the old check used. 0.05m behind the bumper, at the
+# corner. The old check saw a clear back zone and would have reversed.
+corner = scan_with([(math.degrees(math.atan2(0.30, -0.45)), math.hypot(0.30, 0.45))])
+b = math.degrees(math.atan2(0.30, -0.45))
+chk("(that point really is outside the old back zone)", not (150 <= b <= 210),
+    f"bearing {b:.1f} deg")
+o = robot()
+run_avoid(o, Z(front=0.4, front_l=0.5, front_r=1.6, back=9999.0),
+          scan=scan_with([]))
+chk("(control: same scene, corner empty -> it DOES reverse)",
+    reverse_speeds(o) == [-cn.REV_SPEED], f"{reverse_speeds(o)}")
+o = robot()
+run_avoid(o, Z(front=0.4, front_l=0.5, front_r=1.6, back=9999.0), scan=corner)
+chk("an obstacle at a rear corner blocks the reverse",
+    not reverse_speeds(o), f"reverse cmds {reverse_speeds(o)}")
+
+# No scan has ever arrived: never reverse blind.
+o = robot()
+LIDAR['on'] = False
+run_avoid(o, blocked)
+o._scan_time = 0.0
+o.cmds.clear()
+cn.AGVControl.avoid(o, blocked)
+o.last_cmds = list(o.cmds)
+LIDAR['on'] = True
+chk("with no fresh scan it does not reverse at all", not reverse_speeds(o),
+    f"{reverse_speeds(o)}")
+
+# A person walking IN from the side, not there at the trigger: the
+# corridor watch sees them as soon as they are behind the body.
+o = robot()
+t0 = CLOCK[0]
+LIDAR['next'] = scan_with([(170.0, cn.OVERHANG_REAR + 0.10)])  # one leg
+LIDAR['after'] = t0 + cn.STOP_BEFORE_REVERSE + 0.5
+run_avoid(o, blocked)
+chk("a person stepping in mid-reverse is caught too",
+    CLOCK[0] - t0 < full - 0.3, f"{CLOCK[0]-t0:.2f}s")
 
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

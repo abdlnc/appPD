@@ -231,6 +231,38 @@ DEFAULT_ENV = "OUTDOOR"
 STOP_BEFORE_REVERSE = 0.8      # s; was 0.5
 STOP_AFTER_REVERSE  = 0.4      # s; was 0.2, before the turn begins
 REVERSE_TIME        = 1.2      # s of backing away from the obstacle
+
+# ----------- Reversing safely -----------
+# Reported: on the long, escalated reverse the robot backed into a wall and
+# into a person. Two separate causes, both fixed here.
+#
+# IT WAS BLIND. The rear was checked once, from the scan that triggered the
+# manoeuvre, and then the robot reversed for a fixed TIME -- 1.2s, or 3.0s
+# escalated -- without looking again. The lidar was being read the whole
+# time; the reverse simply did not consult it. So anyone who stepped behind
+# after that snapshot was never seen, and since a fixed time is not a fixed
+# distance, it could travel further than the clearance it had measured.
+#
+# AND THE CHECK MISSED ITS OWN CORNERS. That one check used the 60-degree
+# back ZONE, which at the rear bumper is only +/-0.23m wide -- narrower than
+# the robot's own +/-0.30m. Something at a rear corner, exactly where
+# contact happens, was outside the zone being checked.
+#
+# Now the reverse watches, every REVERSE_POLL, a corridor as wide as the
+# BODY behind the bumper, from the live scan, and stops the moment anything
+# is within REVERSE_STOP_GAP of the bumper, the scan goes stale, or the
+# robot leaves AUTO. The same corridor decides whether to reverse at all.
+REVERSE_STOP_GAP     = 0.20    # m from the rear bumper: stop reversing
+REVERSE_SIDE_MARGIN  = 0.05    # m of slack each side of the body
+REVERSE_POLL         = 0.05    # s between checks while reversing
+REVERSE_SCAN_MAX_AGE = 0.50    # s; an older scan cannot be trusted
+
+# The escalated ("max") reverse runs up to 2.5x longer, so it is also run
+# slower: it covers more ground than a normal reverse, and slower gives the
+# watch above more time to catch something. Not lower than 0.40: motor_node
+# notes plain DC motors may stall under the robot's weight below about that,
+# and a reverse that stalls on grass helps nobody.
+REV_SPEED_ESCALATED  = 0.40    # was REV_SPEED (0.60) for every reverse
 SETTLE_TIME         = 0.4      # s to let the steering reach full lock
 TURN_TIME           = 1.0      # s of driving while turned
 
@@ -399,6 +431,13 @@ class AGVControl(Node):
         self._last_turn_end = 0.0   # when that maneuver finished
         self._turn_repeats = 0      # consecutive committed repeats
 
+        # --- latest cleaned scan, read by the reverse watch (another
+        # thread). Swapped as whole objects, so a reader never sees a
+        # half-written scan. ---
+        self._scan_ranges = []
+        self._scan_geom = (0.0, 0.0)
+        self._scan_time = 0.0       # 0 = no scan yet = never safe to reverse
+
         # --- sunlight filter (see scan_filter) ---
         self._scan_blinded = False  # last scan had too few returns to trust
         self._blind_log = 0.0       # rate-limit for the blinded warning
@@ -547,6 +586,9 @@ class AGVControl(Node):
         # view. Rejected rays come back as inf, i.e. indistinguishable
         # from a ray that never returned -- see scan_filter.
         ranges, st = scan_filter.clean(list(msg.ranges), list(msg.intensities))
+        self._scan_ranges = ranges
+        self._scan_geom = (msg.angle_min, msg.angle_increment)
+        self._scan_time = time.time()
         self._scan_blinded = scan_filter.blinded(st)
         if self._scan_blinded:
             # Not "clear" -- cannot see. Logged rather than acted on,
@@ -724,6 +766,45 @@ class AGVControl(Node):
             m.data = f"{level}|{closest}|{dist:.2f}" + ("|BLOCKED" if blocked else "")
         self.obstacle_pub.publish(m)
 
+    # ----------------------- reversing -----------------------
+    def rear_clearance(self):
+        """Distance from the REAR BUMPER to the nearest thing the robot would
+        back into, reversing straight, from the latest cleaned scan.
+
+        Looks in a corridor as wide as the body (plus REVERSE_SIDE_MARGIN),
+        not the 60-degree back zone -- see "Reversing safely" for why the
+        zone misses the corners. Returns math.inf for a clear path, and None
+        when the scan is too old to trust, which callers must treat as
+        "not safe to reverse".
+        """
+        if time.time() - self._scan_time > REVERSE_SCAN_MAX_AGE:
+            return None
+        ranges = self._scan_ranges
+        amin, ainc = self._scan_geom
+        half = ROBOT_WIDTH / 2.0 + REVERSE_SIDE_MARGIN
+        best = math.inf
+        for k, r in enumerate(ranges):
+            if r is None or math.isinf(r) or math.isnan(r) \
+                    or r < MIN_VALID_DIST:
+                continue
+            a = math.radians((math.degrees(amin + k * ainc)
+                              + ANGLE_OFFSET_DEG) % 360.0)
+            behind = -r * math.cos(a)          # metres behind the lidar
+            if behind <= 0.0:
+                continue                       # ahead of the lidar
+            if abs(r * math.sin(a)) >= half:
+                continue                       # beside the path, not in it
+            best = min(best, behind - OVERHANG_REAR)
+        return best
+
+    def _stop_now(self):
+        """Zero the command AND send it this instant. set_cmd() alone waits
+        for the next 10Hz tick -- up to 100ms of reversing into whatever
+        was just seen."""
+        self.set_cmd(0.0, 0.0)
+        if self.mode == "AUTO":
+            self.pub.publish(self.cmd)
+
     # ----------------------- gap seeking -----------------------
     def pick_gap(self, ranges, angle_min, angle_increment):
         """Find a heading the robot physically fits through.
@@ -861,14 +942,34 @@ class AGVControl(Node):
         # 2. reverse straight if the rear is clear, then stop AGAIN before the
         #    turn -- the robot never goes straight from backwards into a
         #    turning move.
-        if (self.mode == "AUTO"
-                and z['back'] > OVERHANG_REAR + self.prof['rear']):
+        # Whether to reverse at all is decided from the LIVE corridor behind
+        # the body, after the stop above -- not from the trigger snapshot,
+        # which is now 0.8s old and never covered the rear corners.
+        rear = self.rear_clearance()
+        if (self.mode == "AUTO" and rear is not None
+                and rear > self.prof['rear']):
             self.publish_action("REVERSING")
-            self.set_cmd(-REV_SPEED, 0.0)
-            time.sleep(REVERSE_TIME * grow)
+            speed = REV_SPEED_ESCALATED if grow > 1.0 else REV_SPEED
+            self.set_cmd(-speed, 0.0)
+            # Watched, not slept: see "Reversing safely".
+            end = time.time() + REVERSE_TIME * grow
+            while time.time() < end and self.mode == "AUTO":
+                gap = self.rear_clearance()
+                if gap is None:
+                    log.warn("scan stale while reversing -- stopping")
+                    break
+                if gap < REVERSE_STOP_GAP:
+                    log.warn(f"something {gap:.2f}m behind the bumper -- "
+                             f"reverse cut short")
+                    break
+                time.sleep(REVERSE_POLL)
             self.publish_action("STOPPING")
-            self.set_cmd(0.0, 0.0)
+            self._stop_now()
             time.sleep(STOP_AFTER_REVERSE)
+        elif self.mode == "AUTO":
+            log.info("not reversing: "
+                     + ("no fresh scan" if rear is None
+                        else f"only {rear:.2f}m behind the bumper"))
 
         log.info(f"going {'LEFT' if steer > 0 else 'RIGHT'} around it"
                  f"{f' (attempt {repeats + 1})' if repeats else ''}")
