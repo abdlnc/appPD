@@ -66,11 +66,11 @@ void main() {
       expect(g.session, isNull);
     });
 
-    test('coordLabel shows 3 decimals, rounded to nearest', () {
+    test('coordLabel shows all 6 recorded decimals', () {
       final g = GeoImage.parse(
           'capture_20260906_134003_lat14.632479_lon121.090634.jpg')!;
-      // 14.632479 -> 14.632 (down), 121.090634 -> 121.091 (up)
-      expect(g.coordLabel, '14.632, 121.091');
+      // Filenames are written with 6 places, so every recorded digit shows.
+      expect(g.coordLabel, '14.632479, 121.090634');
     });
 
     test('the stored position keeps full precision', () {
@@ -82,11 +82,75 @@ void main() {
       expect(g.lon, closeTo(121.090634, 1e-9));
     });
 
-    test('formatCoord rounds half away from zero, and handles negatives', () {
-      expect(formatCoord(14.6325), '14.633');
-      expect(formatCoord(14.6324), '14.632');
-      expect(formatCoord(-33.86885), '-33.869');
-      expect(formatCoord(0), '0.000');
+    test('formatCoord shows 6 places, rounding the 7th', () {
+      // The live GPS feed carries 7 places; the 7th is rounded, not cut.
+      expect(formatCoord(121.0906342), '121.090634');
+      expect(formatCoord(121.0906348), '121.090635');
+      expect(formatCoord(-33.8688497), '-33.868850');
+      // Padded to a fixed width, so a column of them lines up.
+      expect(formatCoord(14.5), '14.500000');
+      expect(formatCoord(0), '0.000000');
+    });
+  });
+
+  group('soil classification tag', () {
+    test('a soil verdict parses', () {
+      final g = GeoImage.parse('soil_20261015_101500_lat14.632479_lon121.090634'
+          '_s20261015-1000_cls-soil.jpg')!;
+      expect(g.soilClass, GeoImage.kSoil);
+      expect(g.session, '20261015-1000');
+      expect(g.lat, closeTo(14.632479, 1e-9));   // tag does not disturb GPS
+    });
+
+    test('a not-soil verdict parses', () {
+      final g = GeoImage.parse(
+          'soil_20261015_101500_nogps_s20261015-1000_cls-notsoil.jpg')!;
+      expect(g.soilClass, GeoImage.kNotSoil);
+      expect(g.hasFix, isFalse);
+    });
+
+    test('an older untagged soil photo is unclassified, not soil', () {
+      final g = GeoImage.parse('soil_20260921_140407_nogps.jpg')!;
+      expect(g.soilClass, isNull);
+    });
+
+    test('the backfill tag works without a session too', () {
+      final g = GeoImage.parse('soil_20260921_140407_nogps_cls-notsoil.jpg')!;
+      expect(g.soilClass, GeoImage.kNotSoil);
+      expect(g.session, isNull);
+    });
+
+    test('an unknown verdict is not silently accepted', () {
+      // Anything but soil/notsoil is a naming scheme this app does not
+      // know; treat the whole name as unrecognised rather than guess.
+      expect(GeoImage.parse('soil_20261015_101500_nogps_cls-rock.jpg'), isNull);
+    });
+
+    test('front-camera captures never carry a soil verdict', () {
+      final g = GeoImage.parse(
+          'capture_20260906_134003_lat14.632479_lon121.090634_detected.jpg')!;
+      expect(g.soilClass, isNull);
+      expect(g.annotated, isTrue);   // group shift did not break _detected
+    });
+  });
+
+  group('earliest soil photos, saved before GPS was in the name', () {
+    test('parse with their date instead of failing', () {
+      final g = GeoImage.parse('soil_20260903_171509.jpg')!;
+      expect(g.kind, 'soil');
+      expect(g.time, DateTime(2026, 9, 3, 17, 15, 9));
+    });
+
+    test('and are treated as having no fix', () {
+      final g = GeoImage.parse('soil_20260903_171509.jpg')!;
+      expect(g.hasFix, isFalse);
+      expect(g.lat, isNull);
+    });
+
+    test('and can carry a backfilled verdict', () {
+      final g = GeoImage.parse('soil_20260903_171509_cls-notsoil.jpg')!;
+      expect(g.soilClass, GeoImage.kNotSoil);
+      expect(g.hasFix, isFalse);
     });
   });
 

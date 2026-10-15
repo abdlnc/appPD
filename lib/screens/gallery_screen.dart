@@ -127,6 +127,19 @@ class _GalleryGridState extends State<_GalleryGrid>
   /// Session key currently being shown, or null for all of them.
   String? _sessionFilter;
 
+  /// SOIL tab only: which classifier verdict is shown -- [GeoImage.kSoil],
+  /// [GeoImage.kNotSoil], [_kUnclassified] -- or null for all of them. It is
+  /// applied BEFORE the photos are grouped into sessions, so the session
+  /// chips below it count only the photos that verdict leaves.
+  String? _soilFilter;
+
+  /// Photos saved before the verdict went into filenames, or while the
+  /// classifier was unavailable. Shown as their own group rather than folded
+  /// into "soil": an unknown is not a yes.
+  static const _kUnclassified = 'unclassified';
+
+  String _soilOf(GalleryImage g) => g.geo?.soilClass ?? _kUnclassified;
+
   @override
   bool get wantKeepAlive => true;
 
@@ -175,8 +188,8 @@ class _GalleryGridState extends State<_GalleryGrid>
         if (snap.hasError) {
           return _errorState(snap.error.toString());
         }
-        final images = snap.data ?? [];
-        if (images.isEmpty) {
+        final all = snap.data ?? [];
+        if (all.isEmpty) {
           return RefreshIndicator(
             onRefresh: _refresh,
             child: ListView(
@@ -192,14 +205,26 @@ class _GalleryGridState extends State<_GalleryGrid>
             ),
           );
         }
+        final soilTab = widget.kind == 'soil';
+        final images = soilTab && _soilFilter != null
+            ? all.where((g) => _soilOf(g) == _soilFilter).toList()
+            : all;
         final sections = _sections(images);
-        final shown = _sessionFilter == null
+        // A session picked under one verdict may not exist under another;
+        // fall back to showing every session rather than an empty screen.
+        final pickedSession = sections.any((s) => s.key == _sessionFilter)
+            ? _sessionFilter
+            : null;
+        final shown = pickedSession == null
             ? sections
-            : sections.where((s) => s.key == _sessionFilter).toList();
+            : sections.where((s) => s.key == pickedSession).toList();
         return RefreshIndicator(
           onRefresh: _refresh,
           child: CustomScrollView(
             slivers: [
+              if (soilTab) SliverToBoxAdapter(child: _soilFilterRow(all)),
+              if (soilTab && images.isEmpty)
+                SliverToBoxAdapter(child: _noMatch()),
               // Only worth a filter when there is more than one session.
               if (sections.length > 1)
                 SliverToBoxAdapter(child: _filterRow(sections)),
@@ -374,6 +399,88 @@ class _GalleryGridState extends State<_GalleryGrid>
     );
   }
 
+  /// SOIL tab: filter by the soil classifier's verdict.
+  Widget _soilFilterRow(List<GalleryImage> all) {
+    int n(String k) => all.where((g) => _soilOf(g) == k).length;
+    final unclassified = n(_kUnclassified);
+    return SizedBox(
+      height: 52,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
+        children: [
+          _soilChip("ALL", null, all.length),
+          _soilChip("SOIL", GeoImage.kSoil, n(GeoImage.kSoil)),
+          _soilChip("NOT SOIL", GeoImage.kNotSoil, n(GeoImage.kNotSoil),
+              warn: true),
+          if (unclassified > 0)
+            _soilChip("UNCLASSIFIED", _kUnclassified, unclassified),
+        ],
+      ),
+    );
+  }
+
+  Widget _soilChip(String label, String? key, int count, {bool warn = false}) {
+    final on = _soilFilter == key;
+    final accent = warn ? AppColors.amber : AppColors.lime;
+    final onAccent = warn ? AppColors.onAmber : AppColors.onLime;
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: GestureDetector(
+        // A session chosen under one verdict may hold nothing under another,
+        // so changing verdict starts again from all sessions.
+        onTap: () => setState(() {
+          _soilFilter = key;
+          _sessionFilter = null;
+        }),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+          decoration: BoxDecoration(
+            color: on ? accent : AppColors.surface,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: on ? accent : AppColors.border),
+          ),
+          child: Row(
+            children: [
+              if (key != null) ...[
+                Icon(
+                    key == GeoImage.kNotSoil
+                        ? Icons.do_not_disturb_alt
+                        : key == GeoImage.kSoil
+                            ? Icons.grass
+                            : Icons.help_outline,
+                    size: 13,
+                    color: on ? onAccent : AppColors.textLo),
+                const SizedBox(width: 4),
+              ],
+              Text("$label  $count",
+                  style: GoogleFonts.rajdhani(
+                    color: on ? onAccent : AppColors.textHi,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                  )),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _noMatch() {
+    final what = _soilFilter == GeoImage.kNotSoil
+        ? "not soil"
+        : _soilFilter == GeoImage.kSoil
+            ? "soil"
+            : "unclassified";
+    return SizedBox(
+      height: 200,
+      child: Center(
+        child: Text("No photos classified $what",
+            style: GoogleFonts.rajdhani(color: AppColors.textLo)),
+      ),
+    );
+  }
+
   Widget _chip(String label, String? key, int count, {bool inferred = false}) {
     final on = _sessionFilter == key;
     return Padding(
@@ -498,6 +605,30 @@ class _GalleryGridState extends State<_GalleryGrid>
                           left: 4,
                           bottom: 4,
                           child: _GeoBadge(geo: items[i].geo!),
+                        ),
+                      // Only NOT SOIL is marked on the tile. Soil is the
+                      // normal case, and a badge on every photo saying so
+                      // adds nothing -- the absence of the mark is the
+                      // answer, as with the field-type stamp on the image.
+                      if (items[i].geo?.soilClass == GeoImage.kNotSoil)
+                        Positioned(
+                          right: 4,
+                          top: 4,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 5, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: AppColors.amber,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text("NOT SOIL",
+                                style: GoogleFonts.rajdhani(
+                                  color: AppColors.onAmber,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: 0.4,
+                                )),
+                          ),
                         ),
                     ],
                   ),

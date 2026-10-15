@@ -1,6 +1,22 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:robot_controller/services/run_log_store.dart';
+import 'package:robot_controller/services/robot_socket.dart';
+
+/// Records what would have been sent to the robot, with a connection that
+/// the test switches on and off by hand.
+class FakeSocket extends RobotSocket {
+  bool connected = false;
+  final sent = <String>[];
+  @override
+  bool get isConnected => connected;
+  @override
+  void sendCommand(String command) => sent.add(command);
+  void setConnected(bool v) {
+    connected = v;
+    notifyListeners();
+  }
+}
 
 /// ~1.11 m per 0.00001 degrees of latitude, which makes the steps below easy
 /// to reason about against minStepM (1.0 m) and maxJumpM (40 m).
@@ -99,6 +115,155 @@ void main() {
     expect(revived.activeMode, 'AUTO');
     final run = await revived.stop(lat: latPlusMetres(12), lon: lon0);
     expect(run!.distanceM!, closeTo(12, 1));
+  });
+
+  group('deleting one run', () {
+    Future<RunLogStore> withThree() async {
+      final s = RunLogStore();
+      await s.load();
+      for (final m in ['AUTO', 'MANUAL', 'AUTO']) {
+        await s.start(m, lat: lat0, lon: lon0);
+        await s.stop(lat: lat0, lon: lon0);
+      }
+      return s;  // newest first: AUTO, MANUAL, AUTO
+    }
+
+    test('removes exactly that run and reports where it was', () async {
+      final s = await withThree();
+      final middle = s.runs[1];
+      final at = await s.remove(middle);
+      expect(at, 1);
+      expect(s.runs.length, 2);
+      expect(s.runs.any((r) => identical(r, middle)), isFalse);
+    });
+
+    test('the deletion is saved, not just hidden', () async {
+      final s = await withThree();
+      await s.remove(s.runs[0]);
+      final reloaded = RunLogStore();
+      await reloaded.load();
+      expect(reloaded.runs.length, 2);
+    });
+
+    test('of two identical-looking runs, only the chosen one goes', () async {
+      // Same mode, same position, both started this second -- equal in
+      // every field. Deleting by value could take the wrong one.
+      final s = await withThree();
+      final keep = s.runs[0], drop = s.runs[2];
+      await s.remove(drop);
+      expect(s.runs.any((r) => identical(r, keep)), isTrue);
+      expect(s.runs.any((r) => identical(r, drop)), isFalse);
+    });
+
+    test('undo puts it back in the same place', () async {
+      final s = await withThree();
+      final middle = s.runs[1];
+      final at = await s.remove(middle);
+      await s.restore(middle, at);
+      expect(s.runs.length, 3);
+      expect(identical(s.runs[1], middle), isTrue);
+    });
+
+    test('undo pressed twice does not duplicate the run', () async {
+      final s = await withThree();
+      final r = s.runs[0];
+      final at = await s.remove(r);
+      await s.restore(r, at);
+      await s.restore(r, at);
+      expect(s.runs.length, 3);
+    });
+
+    test('undo survives the history changing in between', () async {
+      final s = await withThree();
+      final last = s.runs[2];
+      final at = await s.remove(last);         // was at index 2
+      await s.remove(s.runs[0]);               // history shrinks to 1
+      await s.restore(last, at);               // 2 is now out of range
+      expect(s.runs.length, 2);
+      expect(identical(s.runs.last, last), isTrue);
+    });
+
+    test('removing a run that is not there changes nothing', () async {
+      final s = await withThree();
+      final r = s.runs[0];
+      await s.remove(r);
+      expect(await s.remove(r), -1);
+      expect(s.runs.length, 2);
+    });
+  });
+
+  group('image capture follows the run', () {
+    Future<(RunLogStore, FakeSocket)> bound({bool online = true}) async {
+      final s = RunLogStore();
+      await s.load();
+      final sock = FakeSocket()..connected = online;
+      s.bind(sock);
+      sock.sent.clear();   // ignore the state sent on binding
+      return (s, sock);
+    }
+
+    test('starting a run turns capture on', () async {
+      final (s, sock) = await bound();
+      await s.start('AUTO', lat: lat0, lon: lon0);
+      expect(sock.sent, ['CAPTURE:ON']);
+    });
+
+    test('a manual recording turns it on too', () async {
+      final (s, sock) = await bound();
+      await s.start('MANUAL');
+      expect(sock.sent, ['CAPTURE:ON']);
+    });
+
+    test('ending the run turns it off', () async {
+      final (s, sock) = await bound();
+      await s.start('AUTO');
+      await s.stop();
+      expect(sock.sent, ['CAPTURE:ON', 'CAPTURE:OFF']);
+    });
+
+    test('a second start while recording sends nothing new', () async {
+      final (s, sock) = await bound();
+      await s.start('MANUAL');
+      await s.start('AUTO');   // ignored: a run is already going
+      expect(sock.sent, ['CAPTURE:ON']);
+    });
+
+    test('nothing is sent while offline', () async {
+      final (s, sock) = await bound(online: false);
+      await s.start('AUTO');
+      expect(sock.sent, isEmpty);
+    });
+
+    test('reconnecting mid-run turns capture back on', () async {
+      // The Pi forces capture off when the phone drops, and loses it
+      // entirely if it restarts. The run is still going, so re-assert it.
+      final (s, sock) = await bound();
+      await s.start('AUTO');
+      sock.setConnected(false);
+      sock.sent.clear();
+      sock.setConnected(true);
+      expect(sock.sent, ['CAPTURE:ON']);
+    });
+
+    test('reconnecting with no run going keeps capture off', () async {
+      final (_, sock) = await bound(online: false);
+      sock.setConnected(true);
+      expect(sock.sent, ['CAPTURE:OFF']);
+    });
+
+    test('a run restored after the app was killed resumes capture', () async {
+      final first = RunLogStore();
+      await first.load();
+      await first.start('MANUAL');
+      // app killed and reopened: a fresh store reads the persisted run
+      final revived = RunLogStore();
+      final sock = FakeSocket()..connected = true;
+      revived.bind(sock);
+      sock.sent.clear();
+      await revived.load();
+      expect(revived.isRecording, isTrue);
+      expect(sock.sent, ['CAPTURE:ON']);
+    });
   });
 
   test('finished runs are kept newest first', () async {

@@ -343,10 +343,15 @@ class _ControlScreenState extends State<ControlScreen> {
     setState(() => isAutoMode = false);
     socket.sendCommand("MODE:STOP");
     _logEvent("EMERGENCY STOP");
-    // The robot has stopped driving, so an AUTO run has ended whatever the
-    // mode button says.
-    if (context.read<RunLogStore>().activeMode == 'AUTO') {
-      _record(false, 'AUTO', socket);
+    // EMERGENCY STOP ends whatever run is being recorded -- AUTO or a manual
+    // recording -- and with it, image capture. Until 2026-10-15 only an AUTO
+    // run was ended here and a manual recording carried on through it; now
+    // that a run is also what keeps the cameras saving, letting one survive
+    // an emergency stop would leave them saving too. (The Pi forces capture
+    // off on STOP regardless; this keeps the run log agreeing with it.)
+    final active = context.read<RunLogStore>().activeMode;
+    if (active != null) {
+      _record(false, active, socket);
     }
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()

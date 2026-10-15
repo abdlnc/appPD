@@ -147,6 +147,7 @@ def run_node():
     import cv2
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy
     from std_msgs.msg import String
     from sensor_msgs.msg import CompressedImage
     from datetime import datetime
@@ -173,6 +174,18 @@ def run_node():
             self.gps_lon = None
             self.create_subscription(String, '/gps', self.gps_cb, 10)
 
+            # Image SAVING is gated on a recorded run -- see bridge_node.py's
+            # CAPTURE note. Inference is not: it still runs on every frame,
+            # because AUTO's camera slow-down and the app's live boxes depend
+            # on /ai_detections whether or not anything is being kept. OFF
+            # until the bridge says otherwise; latched, so the current state
+            # arrives on startup.
+            self.capture_on = False
+            self.create_subscription(
+                String, '/capture_enabled', self.capture_cb,
+                QoSProfile(depth=1,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
             # depth 1: if we are mid-inference the newest frame is the only one
             # worth having; older ones are already out of date.
             self.create_subscription(CompressedImage, AI_TOPIC,
@@ -180,7 +193,14 @@ def run_node():
             self.get_logger().info(
                 f"AI detector ready. Watching {AI_TOPIC} (camera decides what "
                 f"an obstacle is); saves to {CAPTURE_DIR} + {DETECT_DIR} "
-                f"ONLY on detection.")
+                f"ONLY on detection, and only while a run is recorded.")
+
+        def capture_cb(self, msg):
+            on = msg.data.strip().upper() == "ON"
+            if on != self.capture_on:
+                self.get_logger().info(
+                    f"Detection capture {'ON -- saving' if on else 'OFF -- detecting, not saving'}")
+            self.capture_on = on
 
         # ---- GPS tagging ----
         def gps_cb(self, msg: String):
@@ -247,6 +267,12 @@ def run_node():
                 if count == 0:
                     # Camera sees nothing -> save nothing.
                     self.get_logger().debug(f"[{dt:.1f}s] no obstacle in view")
+                    return
+
+                # Detected something -- the detections above are already
+                # published, so everything below is only about KEEPING a
+                # photo. Nothing is kept outside a recorded run.
+                if not self.capture_on:
                     return
 
                 # Detected something, but is it worth a photo?

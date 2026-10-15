@@ -7,10 +7,16 @@ the robot. Separate from camera_node.py (which owns the front-facing obstacle
 / pest camera at /dev/video0); this one is purely a periodic snapshot logger,
 no live video relay, no AI.
 
-Job: every CAPTURE_INTERVAL seconds, save a full-res JPEG of whatever the
-downward camera currently sees into CAPTURE_DIR. Those images are served to
-the app by the SAME gallery_server.py as the front camera's captures/
-detections, just under a third "soil" kind (see gallery_server.py's DIRS).
+Job: every CAPTURE_INTERVAL seconds, classify what the downward camera sees
+and -- ONLY while a run is being recorded -- save it as a full-res JPEG into
+CAPTURE_DIR. Those images are served to the app by the SAME gallery_server.py
+as the front camera's captures/detections, under a third "soil" kind (see
+gallery_server.py's DIRS).
+
+When the robot is saving is decided by the bridge and published on
+/capture_enabled -- see bridge_node.py's CAPTURE note. This node only obeys:
+nothing is saved until it hears ON, and a run's first photo is taken the
+moment ON arrives rather than up to a minute later.
 
 A background thread reads frames continuously (same reasoning as
 camera_node.py: keeps the buffer fresh so the saved frame isn't a stale one,
@@ -32,6 +38,7 @@ from datetime import datetime
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import String
 
 import cv2
@@ -74,11 +81,47 @@ SESSION_ID        = datetime.now().strftime("%Y%m%d-%H%M")
 # -- because unpinned it pulls numpy 2, which breaks ROS2, OpenCV and Torch.
 FIELD_MODEL_PATH = os.path.expanduser("~/agv_models/agv_field_classifier.tflite")
 FIELD_INPUT_SIZE = 224
-# Pixel scaling used at training time. 0-1 (Keras rescale=1./255) is the
-# assumption; the three plausible scalings agreed to within 0.03 on real soil
-# images, so this is safe but worth correcting if the training code differs.
-FIELD_SCALE_0_1 = True
+# Feed RAW 0-255 pixels. The model normalises them itself.
+#
+# This was wrong from the day the classifier was deployed until 2026-10-15,
+# and it meant the classifier never worked at all. The file is a Keras
+# MobileNetV3Small, which carries its own preprocessing layer: its first two
+# operations, read straight out of the graph, are
+#
+#     MUL  input * 0.007843   (= 1/127.5)
+#     ADD  -1.0               layer "MobileNetV3Small/rescaling"
+#
+# so it expects 0-255 and maps that to -1..1 internally. This node divided
+# by 255 first, so every image reached the network squeezed into
+# -1.000..-0.992 -- effectively the same input every time -- and it answered
+# "supported" to everything: flat grey, white, black, sky blue and a
+# checkerboard all came back supported at 0.90-0.97, and so did all 4,435
+# photos in the archive. That is why the app's UNSUPPORTED FIELD TYPE
+# warning never once fired.
+#
+# The original justification for 0-1 was that "the three plausible scalings
+# agreed on real soil images". A saturated model agrees with itself on
+# everything, so that check could not have caught this. The test that does
+# is to feed things that are plainly NOT field ground and see whether the
+# verdict moves. With 0-255 it does: of the same 4,438 photos, 319 (7.2%)
+# come back unsupported, they cluster in the indoor bench-testing sessions,
+# and the most confident of them are a desk, a room and a wall.
+FIELD_SCALE_0_1 = False
 FIELD_LABELS = ("supported", "unsupported")   # index order of the output
+
+# The verdict is written into each soil photo's FILENAME so the app can
+# filter by it -- the gallery server has no metadata channel, the name is
+# the only one there is. Shown in the app as "Soil" / "Not soil": the
+# classifier is asked whether the robot is over a supported field, and a
+# supported field is soil. A photo saved while the classifier is unavailable
+# gets no tag at all and shows as unclassified -- never guessed.
+#
+#   soil_20261015_101500_lat14.632479_lon121.090634_s20261015-1000_cls-soil.jpg
+SOIL_CLASS_TAG = {"supported": "soil", "unsupported": "notsoil"}
+
+# /capture_enabled is latched by bridge_node; subscribe the same way so the
+# current state arrives on startup instead of only at the next change.
+CAPTURE_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 # ----------------- stamp burned onto each image -----------------
 # Soil photos get the capture time (and GPS, when there is a fix) drawn onto
@@ -104,6 +147,14 @@ class SoilCameraNode(Node):
         self.running = True
         self.last_capture = 0.0
 
+        # Saving is OFF until the bridge says a run has started. When it turns
+        # ON, the next tick shoots immediately rather than waiting out the
+        # interval -- pressing START should produce a photo of where it began.
+        self.capture_on = False
+        self._shoot_now = False
+        self.create_subscription(String, '/capture_enabled', self.capture_cb,
+                                 CAPTURE_QOS)
+
         # latest GPS fix, or (None, None) when there is no fix RIGHT NOW.
         # Cleared on loss rather than held, so an image is never tagged with a
         # stale position (same rule as camera_node.py).
@@ -121,10 +172,20 @@ class SoilCameraNode(Node):
         self.reader = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader.start()
 
-        self.create_timer(1.0, self.tick)      # check every second; save on interval
+        self.create_timer(1.0, self.tick)      # check every second; act on interval
         self.get_logger().info(
             f"Soil camera node ready (index {self.camera_index}). "
-            f"Saving snapshots to {CAPTURE_DIR} every {int(CAPTURE_INTERVAL)}s")
+            f"Classifying every {int(CAPTURE_INTERVAL)}s; saving to "
+            f"{CAPTURE_DIR} only while a run is recorded")
+
+    def capture_cb(self, msg: String):
+        on = msg.data.strip().upper() == "ON"
+        if on and not self.capture_on:
+            self._shoot_now = True             # first photo of the run, now
+        if on != self.capture_on:
+            self.get_logger().info(
+                f"Soil capture {'ON -- saving' if on else 'OFF -- not saving'}")
+        self.capture_on = on
 
     def gps_cb(self, msg: String):
         """/gps is "lat,lon,heading,speed,fix,sats", or ",,,0.0,0,<sats>" while
@@ -262,13 +323,15 @@ class SoilCameraNode(Node):
 
     def tick(self):
         now = time.time()
-        if now - self.last_capture < CAPTURE_INTERVAL:
+        due = self._shoot_now or (now - self.last_capture >= CAPTURE_INTERVAL)
+        if not due:
             return
         with self.lock:
             frame = None if self.latest_frame is None else self.latest_frame.copy()
         if frame is None:
             return
         self.last_capture = now
+        self._shoot_now = False
         when = datetime.now()
 
         # Classify BEFORE stamping, so the verdict can be burned into the
@@ -283,10 +346,17 @@ class SoilCameraNode(Node):
                 self.get_logger().warn(
                     f"FIELD TYPE UNSUPPORTED ({conf:.2f}) -- see the app's "
                     f"warning banner")
+        # Classified either way -- the field-type warning in the app depends
+        # on it -- but only SAVED during a recorded run. See capture_cb.
+        if not self.capture_on:
+            return
+
+        tag = SOIL_CLASS_TAG.get(label)
         fname = os.path.join(
             CAPTURE_DIR,
             when.strftime("soil_%Y%m%d_%H%M%S") + self._gps_suffix()
-            + "_s" + SESSION_ID + ".jpg")
+            + "_s" + SESSION_ID
+            + (f"_cls-{tag}" if tag else "") + ".jpg")
         try:
             cv2.imwrite(fname, self._stamp(frame, when))
             self.get_logger().info(f"Saved soil snapshot: {fname}")

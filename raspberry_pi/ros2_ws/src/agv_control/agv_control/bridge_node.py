@@ -5,6 +5,7 @@ AGV Bridge Node  (ROS2 <-> Flutter app over WebSocket)
 Keeps the EXISTING Flutter app protocol, so NO app changes are needed:
     app  -> robot:  "x,y"                 joystick: x=steer(-1..1), y=speed(-1..1)
                     "MODE:AUTO" / "MODE:MANUAL" / "MODE:STOP"
+                    "CAPTURE:ON" / "CAPTURE:OFF"  image saving, see CAPTURE below
                     "SAVEMAP"              save the live SLAM map (see below)
                     "RESETMAP"             wipe the live SLAM map (see below)
     robot -> app:   "C:<base64 jpeg>"     camera frame
@@ -21,6 +22,7 @@ Translates to ROS2:
     publishes  /cmd_vel (geometry_msgs/Twist)  manual joystick, only while MANUAL
     publishes  /mode    (std_msgs/String)      AUTO / MANUAL / STOP
     publishes  /env_mode (std_msgs/String)     OUTDOOR / INDOOR (from the app)
+    publishes  /capture_enabled (std_msgs/String, latched)  ON / OFF
     relays     /field_type -> "F:<supported|unsupported>|<conf>" to the app
     relays     /avoid_action -> "A:<STOPPING|REVERSING|TURNING LEFT|...>"
     subscribes /image_raw/compressed (sensor_msgs/CompressedImage)
@@ -53,6 +55,7 @@ from datetime import datetime
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from sensor_msgs.msg import CompressedImage, LaserScan
@@ -102,6 +105,35 @@ RESET_MAP_TIMEOUT = 30.0   # s; the unit itself settles in ~2s, this is just a b
 # Manual top speed per environment, matching control_node's ENV_PROFILES so
 # hand-driving and AUTO move at the same pace in either mode.
 MANUAL_SPEED_BY_ENV = {"OUTDOOR": 1.00, "INDOOR": 0.50}
+
+# ----------- CAPTURE: when the cameras are allowed to save images -----------
+# Images are saved only while a run is being recorded -- from START AUTO, or
+# from the record button beside the developer joystick -- and never at any
+# other time. Before this, the soil camera saved a photo every minute from
+# the moment the robot powered on, and the front camera saved every
+# detection, so a robot left sitting in the shed filled the gallery with
+# pictures of the shed.
+#
+# The app is the source of truth for when a run starts and ends (it owns
+# the run log) and says so with CAPTURE:ON / CAPTURE:OFF. Two things here
+# are deliberately independent of what the app says:
+#
+#   * Entering STOP turns capture OFF, whatever the reason -- the app's
+#     emergency stop, the phone disconnecting, a waypoint being cleared.
+#     A stopped robot has nothing to record, and a dropped connection must
+#     not leave the cameras saving with nobody watching.
+#   * Entering AUTO turns capture ON, so pressing START AUTO captures even if
+#     the CAPTURE:ON that follows it is lost, or comes from an older app
+#     build that does not send it.
+#
+# Capture only governs SAVING. Both models keep running regardless: the
+# front detector still feeds AUTO's camera slow-down and the live boxes,
+# and the soil classifier still feeds the field-type warning.
+#
+# Published latched (transient-local), so a camera node that starts after
+# the bridge -- or restarts on its own -- receives the current state at once
+# instead of guessing. Every node defaults to OFF until told otherwise.
+CAPTURE_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 DEFAULT_ENV = "OUTDOOR"
 MANUAL_SPEED = MANUAL_SPEED_BY_ENV[DEFAULT_ENV]
                             # (map_saver_cli can transiently fail right after
@@ -130,6 +162,12 @@ class BridgeNode(Node):
         # Latched-ish: republished whenever the app sets it, and once at
         # startup, so control_node hears it even if it started second.
         self.env_pub = self.create_publisher(String, '/env_mode', 10)
+
+        # see CAPTURE above -- OFF until a run starts
+        self.capture_pub = self.create_publisher(String, '/capture_enabled',
+                                                 CAPTURE_QOS)
+        self.capture_on = False
+        self._publish_capture()
         self.waypoint_pub = self.create_publisher(String, '/waypoint', 10)
         self.create_subscription(CompressedImage, '/image_raw/compressed',
                                  self.img_cb, 10)
@@ -197,6 +235,28 @@ class BridgeNode(Node):
             self.mode = m
             self.get_logger().info(f"Mode -> {m} (from app)")
         self.publish_mode()
+        # see CAPTURE: STOP always ends capture, AUTO always starts it
+        if m == "STOP":
+            self.set_capture(False, "robot stopped")
+        elif m == "AUTO":
+            self.set_capture(True, "AUTO started")
+
+    # ---- image capture on/off (see CAPTURE) ----
+    def _publish_capture(self):
+        msg = String()
+        msg.data = "ON" if self.capture_on else "OFF"
+        self.capture_pub.publish(msg)
+
+    def set_capture(self, on, why):
+        on = bool(on)
+        if on != self.capture_on:
+            self.capture_on = on
+            self.get_logger().info(
+                f"Image capture {'ON' if on else 'OFF'} ({why})")
+        # Republished even when unchanged: cheap, and it means a camera node
+        # that somehow missed the latched copy is corrected at the next run
+        # boundary rather than never.
+        self._publish_capture()
 
     # ---- manual joystick -> Twist ----
     def set_env(self, name):
@@ -397,6 +457,10 @@ async def ws_handler(websocket, node: BridgeNode):
                 node.set_env(msg[4:])
             elif msg.upper().startswith("MODE:"):
                 node.set_mode(msg.split(":", 1)[1])
+            elif msg.upper().startswith("CAPTURE:"):
+                arg = msg.split(":", 1)[1].strip().upper()
+                if arg in ("ON", "OFF"):
+                    node.set_capture(arg == "ON", "from app")
             elif msg.upper().startswith("WP:"):
                 node.handle_waypoint(msg.split(":", 1)[1])
             elif msg.upper() == "SAVEMAP":

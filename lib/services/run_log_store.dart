@@ -15,6 +15,15 @@ import 'robot_socket.dart';
 /// last an hour, and Android is free to kill a backgrounded app at any point in
 /// it; without this, the whole run would vanish. On the next launch the run is
 /// picked back up where it left off.
+///
+/// It also decides when the robot SAVES IMAGES: exactly while a run is being
+/// recorded. Starting a run sends `CAPTURE:ON`, ending one sends
+/// `CAPTURE:OFF`, and the state is re-sent whenever the connection comes
+/// back, so a Pi that restarted mid-run picks capture up again. Owning it
+/// here, rather than in each button, makes "capturing" and "recording a run"
+/// the same thing by construction -- they cannot drift apart because a
+/// button forgot to send one of them. (The Pi additionally forces capture
+/// off whenever the robot enters STOP; see bridge_node.py's CAPTURE note.)
 class RunLogStore extends ChangeNotifier {
   static const _kRuns = 'runlog.runs';
   static const _kActiveMode = 'runlog.active.mode';
@@ -51,6 +60,7 @@ class RunLogStore extends ChangeNotifier {
   double? _lastLat, _lastLon;
 
   RobotSocket? _socket;
+  bool _wasConnected = false;
 
   String? get activeMode => _activeMode;
   DateTime? get activeStart => _activeStart;
@@ -67,12 +77,28 @@ class RunLogStore extends ChangeNotifier {
     if (identical(_socket, socket)) return;
     _socket?.removeListener(_onSocket);
     _socket = socket;
+    _wasConnected = socket.isConnected;
     _socket!.addListener(_onSocket);
+    _syncCapture();
+  }
+
+  /// Tell the robot whether to save images, to match whether a run is being
+  /// recorded. Safe to call any time; does nothing while offline, and the
+  /// reconnect in [_onSocket] catches up.
+  void _syncCapture() {
+    final s = _socket;
+    if (s == null || !s.isConnected) return;
+    s.sendCommand(isRecording ? 'CAPTURE:ON' : 'CAPTURE:OFF');
   }
 
   void _onSocket() {
     final s = _socket;
-    if (s == null || _activeMode == null) return;
+    if (s == null) return;
+    // Connection just came (back): the Pi may have restarted and lost the
+    // capture state, or forced it off when the phone dropped. Re-assert it.
+    if (s.isConnected && !_wasConnected) _syncCapture();
+    _wasConnected = s.isConnected;
+    if (_activeMode == null) return;
     if (!s.hasGps || s.robotLat == null || s.robotLon == null) return;
     noteFix(s.robotLat!, s.robotLon!);
   }
@@ -133,6 +159,7 @@ class RunLogStore extends ChangeNotifier {
       _activeStart = null;
     }
     notifyListeners();
+    _syncCapture();
   }
 
   /// Begin recording. Ignored when a run is already in progress, so a double
@@ -153,6 +180,7 @@ class RunLogStore extends ChangeNotifier {
     if (lon != null) await p.setDouble(_kActiveLon, lon);
     if (_activeDist != null) await p.setDouble(_kActiveDist, _activeDist!);
     notifyListeners();
+    _syncCapture();
   }
 
   /// Finish the current run and file it. Returns the entry, or null if
@@ -178,6 +206,9 @@ class RunLogStore extends ChangeNotifier {
     _activeDist = null;
     _lastLat = null;
     _lastLon = null;
+    // Before the awaits below: the cameras should stop the moment the run
+    // does, not after the history has been written to storage.
+    _syncCapture();
     final p = await SharedPreferences.getInstance();
     await p.setString(_kRuns, RunLog.encodeList(_runs));
     await p.remove(_kActiveMode);
@@ -187,6 +218,36 @@ class RunLogStore extends ChangeNotifier {
     await p.remove(_kActiveDist);
     notifyListeners();
     return run;
+  }
+
+  /// Delete one finished run. Returns where it was, so [restore] can put it
+  /// back in the same place -- the logs screen offers UNDO rather than asking
+  /// "are you sure?" first, since one run is cheap to bring back and a
+  /// confirmation on every single delete is just friction. Returns -1 if the
+  /// run is not in the history.
+  Future<int> remove(RunLog run) async {
+    // Identity, not equality: two runs can share every field (a pair of
+    // zero-length test runs started in the same second), and deleting the
+    // wrong twin would be a quiet bug.
+    final i = _runs.indexWhere((r) => identical(r, run));
+    if (i < 0) return -1;
+    _runs = [..._runs]..removeAt(i);
+    notifyListeners();
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_kRuns, RunLog.encodeList(_runs));
+    return i;
+  }
+
+  /// Put back a run that [remove] took out, at the index it returned. The
+  /// index is clamped: the history may have changed in between, e.g. a run
+  /// finished and went on top.
+  Future<void> restore(RunLog run, int index) async {
+    if (_runs.any((r) => identical(r, run))) return;
+    final at = index.clamp(0, _runs.length);
+    _runs = [..._runs]..insert(at, run);
+    notifyListeners();
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_kRuns, RunLog.encodeList(_runs));
   }
 
   Future<void> clear() async {

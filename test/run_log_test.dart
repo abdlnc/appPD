@@ -62,7 +62,7 @@ void main() {
           elon: 121.0907);
       expect(r.hasStartFix, isTrue);
       expect(r.hasEndFix, isTrue);
-      expect(r.startCoordLabel, '14.632, 121.091');
+      expect(r.startCoordLabel, '14.632479, 121.090634');
     });
 
     test('no fix at either end still logs the run', () {
@@ -78,7 +78,7 @@ void main() {
       final r = run(seconds: 60, elat: 14.6330, elon: 121.0907);
       expect(r.hasStartFix, isFalse);
       expect(r.hasEndFix, isTrue);
-      expect(r.endCoordLabel, '14.633, 121.091');
+      expect(r.endCoordLabel, '14.633000, 121.090700');
     });
 
     test('displacement needs BOTH ends', () {

@@ -110,7 +110,7 @@ class LogsScreen extends StatelessWidget {
               itemBuilder: (context, i) {
                 if (store.isRecording && i == 0) return _activeCard(store);
                 final run = runs[store.isRecording ? i - 1 : i];
-                return _runCard(run);
+                return _runCard(context, store, run);
               },
             ),
     );
@@ -146,7 +146,34 @@ class LogsScreen extends StatelessWidget {
     );
   }
 
-  Widget _runCard(RunLog run) {
+  /// Delete one run straight away and offer UNDO, rather than asking first.
+  /// One run is cheap to put back, and a dialog on every delete is friction
+  /// for the common case of clearing out a few test runs. "Clear all" in the
+  /// app bar keeps its confirmation: that one cannot be undone.
+  Future<void> _delete(
+      BuildContext context, RunLogStore store, RunLog run) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final at = await store.remove(run);
+    if (at < 0) return;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 5),
+        content: Text(
+          "Run deleted - ${run.durationLabel}, "
+          "${_day(run.start)} ${_clock(run.start)}",
+          style: GoogleFonts.rajdhani(fontWeight: FontWeight.w600),
+        ),
+        action: SnackBarAction(
+          label: "UNDO",
+          textColor: AppColors.lime,
+          onPressed: () => store.restore(run, at),
+        ),
+      ));
+  }
+
+  Widget _runCard(BuildContext context, RunLogStore store, RunLog run) {
     final disp = run.displacementM;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
@@ -170,6 +197,19 @@ class LogsScreen extends StatelessWidget {
               Text("${_day(run.start)}  ${_clock(run.start)}-${_clock(run.end)}",
                   style: GoogleFonts.rajdhani(
                       color: AppColors.textLo, fontSize: 12)),
+              const SizedBox(width: 4),
+              SizedBox(
+                width: 32,
+                height: 32,
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  iconSize: 18,
+                  tooltip: "Delete this run",
+                  icon: const Icon(Icons.delete_outline,
+                      color: AppColors.textLo),
+                  onPressed: () => _delete(context, store, run),
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 8),

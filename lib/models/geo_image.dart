@@ -12,6 +12,12 @@ import 'dart:math' as math;
 ///   capture_20260920_173737_nogps.jpg
 ///   soil_20260920_174146_nogps.jpg
 ///   capture_20260927_190210_nogps_s20260927-1858.jpg      (session-tagged)
+///   soil_20261015_101500_nogps_s20261015-1000_cls-soil.jpg (classified)
+///   soil_20260903_171509.jpg                     (earliest: no GPS segment)
+///
+/// `_cls-soil` / `_cls-notsoil` is the soil classifier's verdict on a soil
+/// photo -- see [soilClass]. Soil photos saved before classification went
+/// into the name have no tag and read as unclassified.
 ///
 /// The `_s<YYYYmmdd-HHMM>` tag is the SESSION: one run of the robot, stamped
 /// when the capturing node started. Photos saved before that tag existed have
@@ -50,6 +56,15 @@ class GeoImage {
   /// photos saved before sessions were recorded.
   final String? session;
 
+  /// The soil classifier's verdict on a soil photo: [kSoil], [kNotSoil], or
+  /// null when the photo was never classified (saved before classification
+  /// went into filenames, or while the classifier was unavailable). Always
+  /// null on front-camera captures.
+  final String? soilClass;
+
+  static const String kSoil = 'soil';
+  static const String kNotSoil = 'notsoil';
+
   const GeoImage({
     required this.name,
     required this.kind,
@@ -58,6 +73,7 @@ class GeoImage {
     required this.lon,
     required this.annotated,
     this.session,
+    this.soilClass,
   });
 
   bool get hasFix => lat != null && lon != null;
@@ -67,7 +83,7 @@ class GeoImage {
   /// sitting exactly on top of each other.
   String get eventKey => '$kind|${time.millisecondsSinceEpoch}|$lat|$lon';
 
-  /// e.g. "14.632, 121.091" -- see [formatCoord].
+  /// e.g. "14.632479, 121.090634" -- see [formatCoord].
   String get coordLabel =>
       hasFix ? '${formatCoord(lat!)}, ${formatCoord(lon!)}' : 'no GPS fix';
 
@@ -79,10 +95,15 @@ class GeoImage {
     caseSensitive: false,
   );
 
+  // The GPS segment is optional: the very earliest soil photos were saved
+  // before position was put in the name at all (`soil_20260903_171509.jpg`),
+  // and until this was relaxed those 365 photos failed to parse and showed
+  // with no date. A missing segment means the same as `_nogps`.
   static final RegExp _re = RegExp(
-    r'^(capture|soil)_(\d{8})_(\d{6})_'
-    r'(?:nogps|lat(-?\d+(?:\.\d+)?)_lon(-?\d+(?:\.\d+)?))'
+    r'^(capture|soil)_(\d{8})_(\d{6})'
+    r'(?:_(?:nogps|lat(-?\d+(?:\.\d+)?)_lon(-?\d+(?:\.\d+)?)))?'
     r'(?:_s(\d{8}-\d{4}))?'
+    r'(?:_cls-(soil|notsoil))?'
     r'(_detected)?\.(?:jpg|jpeg|png)$',
     caseSensitive: false,
   );
@@ -126,7 +147,8 @@ class GeoImage {
       lat: lat,
       lon: lon,
       session: m.group(6),
-      annotated: m.group(7) != null,
+      soilClass: m.group(7)?.toLowerCase(),
+      annotated: m.group(8) != null,
     );
   }
 }
@@ -155,13 +177,19 @@ DateTime _stamp(String d, String t) => DateTime(
 
 /// Decimal places used when a coordinate is SHOWN.
 ///
-/// Display only. What is stored keeps its full precision: filenames carry 6
-/// decimals, and a waypoint is sent to the robot with 7, because navigation
-/// works on the number itself rather than on what the screen says.
-const int kCoordDecimals = 3;
+/// Six places is ~0.11m of latitude, and it is every digit the robot records:
+/// filenames are written with 6, so a seventh on screen would only ever be a
+/// zero. It is also already finer than the GPS can tell -- a consumer
+/// receiver is good to a few metres -- so the last digit or two are noise;
+/// they are shown because they are what was recorded, not because they are
+/// that accurate. (This was 3 places, ~110m, until 2026-10-15.)
+///
+/// Display only. Distance and navigation work on the full-precision number,
+/// never on this string; a waypoint is sent to the robot with 7 places.
+const int kCoordDecimals = 6;
 
-/// A coordinate as it appears on screen, rounded to the nearest
-/// [kCoordDecimals] places (121.090634 shows as 121.091).
+/// A coordinate as it appears on screen, rounded to [kCoordDecimals] places
+/// (121.0906342 shows as 121.090634).
 String formatCoord(double value) => value.toStringAsFixed(kCoordDecimals);
 
 /// A group of photos taken close enough together to share one map pin.
