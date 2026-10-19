@@ -108,7 +108,11 @@ class ObstacleWarning extends StatelessWidget {
             color: const Color(0xFFC62828), // deeper red than DANGER
             icon: Icons.block,
             title: 'NO PATH',
-            detail: 'boxed in - no way forward, back or around',
+            // FENCE: the field's stop line ahead and an obstacle behind --
+            // the robot will not cross the line and cannot back up.
+            detail: socket.pathBlockedReason == 'FENCE'
+                ? 'field boundary ahead, obstacle behind'
+                : 'boxed in - no way forward, back or around',
           ));
         } else {
           final level = socket.obstacleLevel;

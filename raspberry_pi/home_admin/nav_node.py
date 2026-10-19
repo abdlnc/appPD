@@ -26,6 +26,7 @@ NO colcon build needed. Run:
     python3 ~/nav_node.py
 """
 
+import json
 import math
 import time
 
@@ -40,6 +41,25 @@ try:
     from agv_control import scan_filter
 except ImportError:          # pragma: no cover
     scan_filter = None
+
+from rclpy.qos import QoSProfile, DurabilityPolicy
+try:
+    from agv_control import field_geometry as fg
+except ImportError:          # pragma: no cover
+    fg = None
+
+# ---- the field boundary, in NAV ----
+# motor_node blocks forward motion at the stop line in every autonomous mode,
+# NAV included -- that is the enforcement and it does not depend on anything
+# here. What NAV adds:
+#   * a destination OUTSIDE the boundary is refused when it arrives, rather
+#     than driven toward until the fence stops the robot short of it.
+#   * at the stop line it holds still and says so. It does not try to recover
+#     the way AUTO/COVER do: a NAV destination is inside the field by the rule
+#     above, so reaching the line means the straight route to it leaves the
+#     field (a concave corner) -- a person should pick another waypoint.
+#   * NOFIX is already handled: NAV holds without a fix, boundary or not.
+FENCE_STALE_S = 1.0
 from geometry_msgs.msg import Twist
 
 # ---- navigation tuning ----
@@ -111,6 +131,14 @@ class NavNode(Node):
         self.create_subscription(String, '/gps', self.gps_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.create_subscription(String, '/mode', self.mode_cb, 10)
+        self.fence_state = "OFF"
+        self.fence_time = 0.0
+        self.fence_poly = None          # (frame, polygon) when active
+        self._fence_said = False
+        self.create_subscription(String, '/fence_state', self.fence_cb, 10)
+        self.create_subscription(
+            String, '/fence', self.fence_def_cb,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(String, '/ai_detections', self.ai_cb, 10)
 
         self.mode = "STOP"
@@ -134,6 +162,22 @@ class NavNode(Node):
     def mode_cb(self, msg):
         self.mode = msg.data.strip().upper()
 
+    def fence_cb(self, msg):
+        self.fence_state = msg.data.split("|")[0].strip().upper()
+        self.fence_time = time.time()
+
+    def fence_def_cb(self, msg):
+        self.fence_poly = None
+        if fg is None:
+            return
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        if d.get("active") and d.get("points"):
+            fr = fg.LocalFrame(*d["points"][0])
+            self.fence_poly = (fr, [fr.to_xy(a, b) for a, b in d["points"]])
+
     def wp_cb(self, msg):
         d = msg.data.strip()
         if d.upper() == "CLEAR":
@@ -142,7 +186,16 @@ class NavNode(Node):
             return
         try:
             lat, lon = d.split(',')
-            self.target = (float(lat), float(lon))
+            lat, lon = float(lat), float(lon)
+            if self.fence_poly is not None:
+                fr, poly = self.fence_poly
+                if not fg.point_in_polygon(fr.to_xy(lat, lon), poly):
+                    self.target = None
+                    self.get_logger().warn(
+                        f"Waypoint {lat:.6f}, {lon:.6f} REFUSED: it is outside "
+                        f"the field boundary")
+                    return
+            self.target = (lat, lon)
             self._arrived_logged = False
             self.get_logger().info(f"New waypoint: {self.target}")
         except (ValueError, IndexError):
@@ -263,6 +316,20 @@ class NavNode(Node):
         if self._no_fix_logged:
             self._no_fix_logged = False
             self.get_logger().info("GPS fix back -- NAV resuming")
+
+        # at the field boundary: hold, and say so once (see "the field
+        # boundary, in NAV")
+        fence = (self.fence_state if time.time() - self.fence_time
+                 <= FENCE_STALE_S else "STALE")
+        if fence in ("LINE", "OUT"):
+            self.send(0.0, 0.0)
+            if not self._fence_said:
+                self._fence_said = True
+                self.get_logger().warn(
+                    "NAV holding: the route to the waypoint reaches the field "
+                    "boundary -- pick another waypoint")
+            return
+        self._fence_said = False
 
         tlat, tlon = self.target
         dist = distance_m(self.lat, self.lon, tlat, tlon)

@@ -36,6 +36,12 @@ class GalleryImage {
   DateTime get captureTime => geo?.time ?? time;
 }
 
+/// Not-soil photos are left out of the SOIL tab altogether. They are still
+/// on the robot -- nothing is deleted -- and setting this to false brings
+/// them back, with their own NOT SOIL filter chip. The tab is for looking at
+/// soil; a desk or a wall from bench testing only gets in the way.
+const bool kHideNotSoil = true;
+
 /// Saved-images viewer: raw camera captures + AI-annotated detections +
 /// downward soil-camera snapshots + saved SLAM maps, served by
 /// gallery_server.py (read-only HTTP file server on the Pi).
@@ -206,9 +212,16 @@ class _GalleryGridState extends State<_GalleryGrid>
           );
         }
         final soilTab = widget.kind == 'soil';
-        final images = soilTab && _soilFilter != null
-            ? all.where((g) => _soilOf(g) == _soilFilter).toList()
+        // see kHideNotSoil: the hidden ones are counted, not just dropped
+        final hiddenNotSoil = soilTab && kHideNotSoil
+            ? all.where((g) => _soilOf(g) == GeoImage.kNotSoil).length
+            : 0;
+        final visible = hiddenNotSoil > 0
+            ? all.where((g) => _soilOf(g) != GeoImage.kNotSoil).toList()
             : all;
+        final images = soilTab && _soilFilter != null
+            ? visible.where((g) => _soilOf(g) == _soilFilter).toList()
+            : visible;
         final sections = _sections(images);
         // A session picked under one verdict may not exist under another;
         // fall back to showing every session rather than an empty screen.
@@ -222,7 +235,9 @@ class _GalleryGridState extends State<_GalleryGrid>
           onRefresh: _refresh,
           child: CustomScrollView(
             slivers: [
-              if (soilTab) SliverToBoxAdapter(child: _soilFilterRow(all)),
+              if (soilTab) SliverToBoxAdapter(child: _soilFilterRow(visible)),
+              if (hiddenNotSoil > 0)
+                SliverToBoxAdapter(child: _hiddenNote(hiddenNotSoil)),
               if (soilTab && images.isEmpty)
                 SliverToBoxAdapter(child: _noMatch()),
               // Only worth a filter when there is more than one session.
@@ -411,8 +426,9 @@ class _GalleryGridState extends State<_GalleryGrid>
         children: [
           _soilChip("ALL", null, all.length),
           _soilChip("SOIL", GeoImage.kSoil, n(GeoImage.kSoil)),
-          _soilChip("NOT SOIL", GeoImage.kNotSoil, n(GeoImage.kNotSoil),
-              warn: true),
+          if (!kHideNotSoil)
+            _soilChip("NOT SOIL", GeoImage.kNotSoil, n(GeoImage.kNotSoil),
+                warn: true),
           if (unclassified > 0)
             _soilChip("UNCLASSIFIED", _kUnclassified, unclassified),
         ],
@@ -462,6 +478,24 @@ class _GalleryGridState extends State<_GalleryGrid>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// One line saying how many not-soil photos the SOIL tab is leaving out,
+  /// so a falling count reads as a filter rather than as photos going missing.
+  Widget _hiddenNote(int n) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 0, 14, 4),
+      child: Row(
+        children: [
+          const Icon(Icons.visibility_off_outlined,
+              size: 14, color: AppColors.textLo),
+          const SizedBox(width: 6),
+          Text("$n not-soil photo${n == 1 ? '' : 's'} hidden",
+              style: GoogleFonts.rajdhani(
+                  color: AppColors.textLo, fontSize: 12)),
+        ],
       ),
     );
   }
@@ -610,6 +644,22 @@ class _GalleryGridState extends State<_GalleryGrid>
                       // normal case, and a badge on every photo saying so
                       // adds nothing -- the absence of the mark is the
                       // answer, as with the field-type stamp on the image.
+                      // Duplicate / outside-the-boundary marks, top-left.
+                      if (items[i].geo?.isDuplicate == true ||
+                          items[i].geo?.isOutside == true)
+                        Positioned(
+                          left: 4,
+                          top: 4,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (items[i].geo?.isDuplicate == true)
+                                _tileTag("DUP", AppColors.textLo),
+                              if (items[i].geo?.isOutside == true)
+                                _tileTag("OUTSIDE", const Color(0xFFE5533D)),
+                            ],
+                          ),
+                        ),
                       if (items[i].geo?.soilClass == GeoImage.kNotSoil)
                         Positioned(
                           right: 4,
@@ -633,6 +683,21 @@ class _GalleryGridState extends State<_GalleryGrid>
                     ],
                   ),
                 ),
+    );
+  }
+
+  Widget _tileTag(String text, Color color) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 2),
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color),
+      ),
+      child: Text(text,
+          style: GoogleFonts.rajdhani(
+              color: color, fontSize: 10, fontWeight: FontWeight.w800)),
     );
   }
 

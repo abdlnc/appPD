@@ -6,6 +6,10 @@ Keeps the EXISTING Flutter app protocol, so NO app changes are needed:
     app  -> robot:  "x,y"                 joystick: x=steer(-1..1), y=speed(-1..1)
                     "MODE:AUTO" / "MODE:MANUAL" / "MODE:STOP"
                     "CAPTURE:ON" / "CAPTURE:OFF"  image saving, see CAPTURE below
+                    "MODE:COVER"           systematic coverage of the field
+                    "FENCE:SET <inset>|lat,lon;lat,lon;..."  set the boundary
+                    "FENCE:CLEAR" / "FENCE:UNDO" / "FENCE:ADD lat,lon"
+                    "COVER:RESET"          forget coverage progress, start over
                     "SAVEMAP"              save the live SLAM map (see below)
                     "RESETMAP"             wipe the live SLAM map (see below)
     robot -> app:   "C:<base64 jpeg>"     camera frame
@@ -17,6 +21,12 @@ Keeps the EXISTING Flutter app protocol, so NO app changes are needed:
                     "MAPERR:<reason>"     SAVEMAP failed (e.g. SLAM isn't running)
                     "MAPRESET:ok"         RESETMAP succeeded, map is now blank
                     "MAPRESETERR:<reason>" RESETMAP failed
+                    "Z:<json>"             the field boundary (sent on connect
+                                          and on every change)
+                    "P:<json>"             the planned coverage lanes
+                    "V:<json>"             coverage progress
+                    All three are NEW prefixes: an older app build ignores
+                    them, so it keeps working unchanged.
 
 Translates to ROS2:
     publishes  /cmd_vel (geometry_msgs/Twist)  manual joystick, only while MANUAL
@@ -46,6 +56,7 @@ Requires:  pip install websockets
 
 import asyncio
 import base64
+import json
 import signal
 import math
 import os
@@ -134,6 +145,25 @@ MANUAL_SPEED_BY_ENV = {"OUTDOOR": 1.00, "INDOOR": 0.50}
 # the bridge -- or restarts on its own -- receives the current state at once
 # instead of guessing. Every node defaults to OFF until told otherwise.
 CAPTURE_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+
+# ----------- No-rebuild interim, for the currently installed app -----------
+# Flag files, the same convention as ~/agv_use_sim. They let the boundary and
+# COVER mode be tested with the app ALREADY on the phone, before rebuilding:
+#
+#   touch ~/agv_fence_edit   Every waypoint tapped on the map is saved as a
+#                            boundary CORNER instead of a destination, and the
+#                            robot is forced to STOP rather than drive to it.
+#                            The app's "clear waypoint" removes the last corner.
+#                            rm the file to go back to normal waypoints.
+#
+#   touch ~/agv_coverage     START AUTO runs COVER instead -- but only while an
+#                            ACTIVE boundary exists. Without one it stays plain
+#                            AUTO and says so in the log.
+#
+# Both are checked on every use, not at start-up, so touching or removing
+# one takes effect immediately with no restart.
+FENCE_EDIT_FLAG = os.path.expanduser("~/agv_fence_edit")
+COVERAGE_FLAG = os.path.expanduser("~/agv_coverage")
 DEFAULT_ENV = "OUTDOOR"
 MANUAL_SPEED = MANUAL_SPEED_BY_ENV[DEFAULT_ENV]
                             # (map_saver_cli can transiently fail right after
@@ -168,6 +198,18 @@ class BridgeNode(Node):
                                                  CAPTURE_QOS)
         self.capture_on = False
         self._publish_capture()
+
+        # --- field boundary and COVER mode ---
+        self.fence_cmd_pub = self.create_publisher(String, '/fence_cmd', 10)
+        self.cover_cmd_pub = self.create_publisher(String, '/cover_cmd', 10)
+        self.latest_fence = None         # JSON from fence_node (latched)
+        self.fence_active = False
+        self.latest_plan = None          # JSON from coverage_node (latched)
+        self.latest_cover = None         # JSON progress from coverage_node
+        self.create_subscription(String, '/fence', self.fence_cb, CAPTURE_QOS)
+        self.create_subscription(String, '/cover_plan', self.plan_cb,
+                                 CAPTURE_QOS)
+        self.create_subscription(String, '/cover_status', self.cover_cb, 10)
         self.waypoint_pub = self.create_publisher(String, '/waypoint', 10)
         self.create_subscription(CompressedImage, '/image_raw/compressed',
                                  self.img_cb, 10)
@@ -195,6 +237,29 @@ class BridgeNode(Node):
 
     def field_cb(self, msg: String):
         self.latest_field = msg.data
+
+    def fence_cb(self, msg: String):
+        self.latest_fence = msg.data
+        try:
+            self.fence_active = bool(json.loads(msg.data).get("active"))
+        except ValueError:
+            self.fence_active = False
+
+    def plan_cb(self, msg: String):
+        self.latest_plan = msg.data
+
+    def cover_cb(self, msg: String):
+        self.latest_cover = msg.data
+
+    def send_fence_cmd(self, text):
+        m = String()
+        m.data = text
+        self.fence_cmd_pub.publish(m)
+
+    def send_cover_cmd(self, text):
+        m = String()
+        m.data = text
+        self.cover_cmd_pub.publish(m)
 
     def gps_cb(self, msg: String):
         self.latest_gps = msg.data
@@ -229,8 +294,18 @@ class BridgeNode(Node):
 
     def set_mode(self, m):
         m = m.strip().upper()
-        if m not in ("AUTO", "MANUAL", "STOP", "NAV"):
+        if m not in ("AUTO", "MANUAL", "STOP", "NAV", "COVER"):
             return
+        if m == "AUTO" and os.path.exists(COVERAGE_FLAG):
+            # see "No-rebuild interim"
+            if self.fence_active:
+                self.get_logger().warn(
+                    "*** ~/agv_coverage present: START AUTO -> COVER mode ***")
+                m = "COVER"
+            else:
+                self.get_logger().warn(
+                    "~/agv_coverage present but NO ACTIVE BOUNDARY -- running "
+                    "plain AUTO. Set a boundary first to use COVER.")
         if m != self.mode:
             self.mode = m
             self.get_logger().info(f"Mode -> {m} (from app)")
@@ -238,8 +313,10 @@ class BridgeNode(Node):
         # see CAPTURE: STOP always ends capture, AUTO always starts it
         if m == "STOP":
             self.set_capture(False, "robot stopped")
-        elif m == "AUTO":
-            self.set_capture(True, "AUTO started")
+        elif m in ("AUTO", "COVER"):
+            # COVER is a run like AUTO: objective 1.3's one-a-minute soil
+            # photo applies to it too.
+            self.set_capture(True, f"{m} started")
 
     # ---- image capture on/off (see CAPTURE) ----
     def _publish_capture(self):
@@ -281,6 +358,21 @@ class BridgeNode(Node):
 
     def handle_waypoint(self, payload):
         payload = payload.strip()
+        if os.path.exists(FENCE_EDIT_FLAG):
+            # see "No-rebuild interim": the tap is a CORNER, not a destination
+            if payload.upper() == "CLEAR":
+                self.send_fence_cmd("UNDO")
+                self.get_logger().warn(
+                    "*** FENCE EDIT (~/agv_fence_edit): waypoint clear -> "
+                    "last boundary corner REMOVED ***")
+            else:
+                self.send_fence_cmd("ADD " + payload)
+                self.get_logger().warn(
+                    "*** FENCE EDIT (~/agv_fence_edit): waypoint " + payload +
+                    " SAVED AS A BOUNDARY CORNER, robot held in STOP. "
+                    "rm ~/agv_fence_edit for normal waypoints. ***")
+            self.set_mode("STOP")
+            return
         wp = String()
         if payload.upper() == "CLEAR":
             wp.data = "CLEAR"
@@ -431,6 +523,21 @@ async def ws_handler(websocket, node: BridgeNode):
         except websockets.exceptions.ConnectionClosed:
             pass
 
+    async def send_on_change(prefix, getter, delay):
+        # Boundary, plan and coverage progress: each sent once on connect
+        # (the app needs the saved boundary straight away) and again only
+        # when it changes.
+        last = None
+        try:
+            while True:
+                v = getter()
+                if v is not None and v != last:
+                    await websocket.send(prefix + v)
+                    last = v
+                await asyncio.sleep(delay)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
     async def send_lidar():
         delay = 1.0 / LIDAR_STREAM_HZ
         try:
@@ -449,6 +556,12 @@ async def ws_handler(websocket, node: BridgeNode):
     boxes_task = asyncio.create_task(send_boxes())
     field_task = asyncio.create_task(send_field())
     action_task = asyncio.create_task(send_action())
+    fence_task = asyncio.create_task(
+        send_on_change("Z:", lambda: node.latest_fence, 0.5))
+    plan_task = asyncio.create_task(
+        send_on_change("P:", lambda: node.latest_plan, 1.0))
+    cover_task = asyncio.create_task(
+        send_on_change("V:", lambda: node.latest_cover, 1.0))
     try:
         async for message in websocket:
             msg = message.strip()
@@ -463,6 +576,15 @@ async def ws_handler(websocket, node: BridgeNode):
                     node.set_capture(arg == "ON", "from app")
             elif msg.upper().startswith("WP:"):
                 node.handle_waypoint(msg.split(":", 1)[1])
+            elif msg.upper().startswith("FENCE:"):
+                # "FENCE:SET 3|lat,lon;..." -> fence_node "SET 3|lat,lon;..."
+                node.send_fence_cmd(msg.split(":", 1)[1].strip())
+            elif msg.upper().startswith("COVER:"):
+                arg = msg.split(":", 1)[1].strip().upper()
+                if arg == "START":
+                    node.set_mode("COVER")
+                elif arg == "RESET":
+                    node.send_cover_cmd("RESET")
             elif msg.upper() == "SAVEMAP":
                 if node.saving_map:
                     await websocket.send("MAPERR:already saving, wait a moment")
@@ -518,6 +640,9 @@ async def ws_handler(websocket, node: BridgeNode):
         boxes_task.cancel()
         field_task.cancel()
         action_task.cancel()
+        fence_task.cancel()
+        plan_task.cancel()
+        cover_task.cancel()
         # app gone -> STOP for safety
         node.set_mode("STOP")
         node.manual_cmd = Twist()

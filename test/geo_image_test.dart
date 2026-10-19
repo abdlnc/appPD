@@ -120,10 +120,12 @@ void main() {
       expect(g.session, isNull);
     });
 
-    test('an unknown verdict is not silently accepted', () {
-      // Anything but soil/notsoil is a naming scheme this app does not
-      // know; treat the whole name as unrecognised rather than guess.
-      expect(GeoImage.parse('soil_20261015_101500_nogps_cls-rock.jpg'), isNull);
+    test('an unknown verdict reads as unclassified, not as soil', () {
+      // Tags are tolerated (see GeoImage), so the photo still parses -- but
+      // only the two known verdicts count. Guessing "soil" would be wrong.
+      final g = GeoImage.parse('soil_20261015_101500_nogps_cls-rock.jpg')!;
+      expect(g.soilClass, isNull);
+      expect(g.tags, ['cls-rock']);
     });
 
     test('front-camera captures never carry a soil verdict', () {
@@ -243,10 +245,58 @@ void sessionTests() {
       expect(g.session, isNull);
     });
 
-    test('a malformed session tag is not accepted as one', () {
-      // Wrong shape -> the whole name fails to match, rather than being read
-      // as an untagged photo with junk in it.
-      expect(GeoImage.parse('capture_20260927_190210_nogps_s2026.jpg'), isNull);
+    test('a malformed session tag is not accepted AS a session', () {
+      // Since tags are tolerated, the name still parses -- its date is good --
+      // but the junk must never be read as a session and group the photo
+      // with the wrong run.
+      final g = GeoImage.parse('capture_20260927_190210_nogps_s2026.jpg')!;
+      expect(g.session, isNull);
+      expect(g.time, DateTime(2026, 9, 27, 19, 2, 10));
+    });
+  });
+
+  group('photo tags: duplicate, outside, and ones not invented yet', () {
+    test('a duplicate soil photo', () {
+      final g = GeoImage.parse(
+          'soil_20261019_101500_nogps_s20261019-1000_cls-soil_dup.jpg')!;
+      expect(g.isDuplicate, isTrue);
+      expect(g.isOutside, isFalse);
+      expect(g.soilClass, GeoImage.kSoil);       // other tags still read
+      expect(g.session, '20261019-1000');
+    });
+
+    test('a photo taken outside the boundary', () {
+      final g = GeoImage.parse('soil_20261019_101500_lat14.632479_'
+          'lon121.090634_s20261019-1000_cls-notsoil_dup_outside.jpg')!;
+      expect(g.isOutside, isTrue);
+      expect(g.isDuplicate, isTrue);
+      expect(g.soilClass, GeoImage.kNotSoil);
+      expect(g.lat, closeTo(14.632479, 1e-9));
+    });
+
+    test('outside + the AI annotated twin', () {
+      final g = GeoImage.parse('capture_20261019_101500_nogps_'
+          's20261019-1000_outside_detected.jpg')!;
+      expect(g.isOutside, isTrue);
+      expect(g.annotated, isTrue);               // _detected still recognised
+      expect(g.tags, ['outside']);
+    });
+
+    test('a tag this build has never heard of does not break parsing', () {
+      // The whole reason tags are tolerated: before, every new tag made the
+      // photo fail to parse in every app already installed.
+      final g = GeoImage.parse(
+          'soil_20261019_101500_nogps_s20261019-1000_cls-soil_rainy-v2.jpg')!;
+      expect(g.time, DateTime(2026, 10, 19, 10, 15, 0));
+      expect(g.soilClass, GeoImage.kSoil);
+      expect(g.tags, contains('rainy-v2'));
+    });
+
+    test('plain names carry no tags', () {
+      final g = GeoImage.parse('capture_20260906_134003_nogps.jpg')!;
+      expect(g.tags, isEmpty);
+      expect(g.isDuplicate, isFalse);
+      expect(g.isOutside, isFalse);
     });
   });
 

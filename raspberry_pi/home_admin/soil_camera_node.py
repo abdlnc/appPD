@@ -41,8 +41,15 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import String
 
+import json
+
 import cv2
 import numpy as np
+
+try:
+    from agv_control import field_geometry as fg
+except ImportError:          # the node still works, without dedup/boundary
+    fg = None
 
 # ----------------- camera settings -----------------
 # Preferred index for the soil camera. NOT relied upon: USB cameras
@@ -119,6 +126,30 @@ FIELD_LABELS = ("supported", "unsupported")   # index order of the output
 #   soil_20261015_101500_lat14.632479_lon121.090634_s20261015-1000_cls-soil.jpg
 SOIL_CLASS_TAG = {"supported": "soil", "unsupported": "notsoil"}
 
+# ---- duplicate soil photos ----
+# A soil photo near an earlier one -- the same spot, or a near-identical
+# picture -- is still TAKEN: objective 1.3 requires one a minute, and that
+# is not this node's to drop. It is MARKED, "_dup" in the name, so the app
+# can tell the repeats apart. SOIL_DUP_POLICY = "skip" drops them instead,
+# for when the objective allows it.
+#
+# Same two tests as the front camera (field_geometry.dedup_decision):
+# within SOIL_DUP_RADIUS_M of a recent soil photo, both with a fix; or a
+# dHash within SOIL_DUP_HASH_MAX bits of one. The picture test matters most
+# here: measured on this robot's own archive, consecutive photos of the SAME
+# patch of ground, robot parked, were put 6 to 14 m apart by the GPS -- and
+# were all within 1 bit by dHash. 4 bits flagged no photo of genuinely
+# different ground in the same test. The hash is taken from the clean frame,
+# before the time/GPS text is burned in, which would otherwise make every
+# photo look slightly different.
+SOIL_DUP_POLICY = "tag"          # "tag" or "skip"
+SOIL_DUP_RADIUS_M = 3.0
+SOIL_DUP_HASH_MAX = 4
+SOIL_DUP_RECENT = 30             # how many recent soil photos to compare with
+DUP_TAG = "_dup"
+# Taken outside the field boundary: still saved, marked "_outside".
+OUTSIDE_TAG = "_outside"
+
 # /capture_enabled is latched by bridge_node; subscribe the same way so the
 # current state arrives on startup instead of only at the next change.
 CAPTURE_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -155,6 +186,11 @@ class SoilCameraNode(Node):
         self.create_subscription(String, '/capture_enabled', self.capture_cb,
                                  CAPTURE_QOS)
 
+        # --- duplicates and the field boundary (see SOIL_DUP_*) ---
+        self.recent = []                 # [{lat, lon, conf, hash}]
+        self.fence = None                # (frame, polygon) when active
+        self.create_subscription(String, '/fence', self.fence_cb, CAPTURE_QOS)
+
         # latest GPS fix, or (None, None) when there is no fix RIGHT NOW.
         # Cleared on loss rather than held, so an image is never tagged with a
         # stale position (same rule as camera_node.py).
@@ -177,6 +213,31 @@ class SoilCameraNode(Node):
             f"Soil camera node ready (index {self.camera_index}). "
             f"Classifying every {int(CAPTURE_INTERVAL)}s; saving to "
             f"{CAPTURE_DIR} only while a run is recorded")
+
+    def fence_cb(self, msg: String):
+        self.fence = None
+        if fg is None:
+            return
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        if d.get("active") and d.get("points"):
+            fr = fg.LocalFrame(*d["points"][0])
+            self.fence = (fr, [fr.to_xy(a, b) for a, b in d["points"]])
+
+    def _outside(self):
+        if self.fence is None or self.gps_lat is None:
+            return False
+        fr, poly = self.fence
+        return not fg.point_in_polygon(fr.to_xy(self.gps_lat, self.gps_lon), poly)
+
+    @staticmethod
+    def _dhash(frame):
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        g = g[:int(g.shape[0] * 0.85)]       # same crop as the archive check
+        g = cv2.resize(g, (9, 8), interpolation=cv2.INTER_AREA)
+        return fg.dhash_bits(g.tolist())
 
     def capture_cb(self, msg: String):
         on = msg.data.strip().upper() == "ON"
@@ -352,11 +413,27 @@ class SoilCameraNode(Node):
             return
 
         tag = SOIL_CLASS_TAG.get(label)
+        dup = False
+        if fg is not None:
+            new = {"lat": self.gps_lat, "lon": self.gps_lon, "conf": 0.0,
+                   "hash": self._dhash(frame)}
+            verdict, why = fg.dedup_decision(new, self.recent,
+                                             SOIL_DUP_RADIUS_M,
+                                             SOIL_DUP_HASH_MAX)
+            dup = verdict != fg.SAVE      # conf 0 never REPLACEs: tag only
+            self.recent = (self.recent + [dict(new, conf=1.0)])[-SOIL_DUP_RECENT:]
+            if dup and SOIL_DUP_POLICY == "skip":
+                self.get_logger().info(f"Soil photo SKIPPED as a duplicate: {why}")
+                return
+            if dup:
+                self.get_logger().info(f"Soil photo marked duplicate: {why}")
         fname = os.path.join(
             CAPTURE_DIR,
             when.strftime("soil_%Y%m%d_%H%M%S") + self._gps_suffix()
             + "_s" + SESSION_ID
-            + (f"_cls-{tag}" if tag else "") + ".jpg")
+            + (f"_cls-{tag}" if tag else "")
+            + (DUP_TAG if dup else "")
+            + (OUTSIDE_TAG if self._outside() else "") + ".jpg")
         try:
             cv2.imwrite(fname, self._stamp(frame, when))
             self.get_logger().info(f"Saved soil snapshot: {fname}")

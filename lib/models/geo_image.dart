@@ -19,6 +19,17 @@ import 'dart:math' as math;
 /// photo -- see [soilClass]. Soil photos saved before classification went
 /// into the name have no tag and read as unclassified.
 ///
+/// `_dup` marks a photo of the same spot (or a near-identical picture) as an
+/// earlier one -- see [isDuplicate]. `_outside` marks a photo taken outside
+/// the field boundary -- see [isOutside].
+///
+/// TAGS ARE TOLERATED. Any further `_word` tags after the session are
+/// accepted and kept in [tags], whether this build knows them or not. Before
+/// that, every new tag the robot started writing made the photo fail to
+/// parse in every app already installed -- it showed with no date or session
+/// until the app was rebuilt. A tag this build does not understand is now
+/// simply ignored.
+///
 /// The `_s<YYYYmmdd-HHMM>` tag is the SESSION: one run of the robot, stamped
 /// when the capturing node started. Photos saved before that tag existed have
 /// no session in the name, so [sessionOf] falls back to grouping by time gap.
@@ -65,6 +76,16 @@ class GeoImage {
   static const String kSoil = 'soil';
   static const String kNotSoil = 'notsoil';
 
+  /// Every `_word` tag after the session, as written (`cls-soil`, `dup`,
+  /// `outside`, or anything newer).
+  final List<String> tags;
+
+  /// Same spot, or a near-identical picture, as an earlier photo.
+  bool get isDuplicate => tags.contains('dup');
+
+  /// Taken outside the field boundary.
+  bool get isOutside => tags.contains('outside');
+
   const GeoImage({
     required this.name,
     required this.kind,
@@ -74,6 +95,7 @@ class GeoImage {
     required this.annotated,
     this.session,
     this.soilClass,
+    this.tags = const [],
   });
 
   bool get hasFix => lat != null && lon != null;
@@ -103,7 +125,7 @@ class GeoImage {
     r'^(capture|soil)_(\d{8})_(\d{6})'
     r'(?:_(?:nogps|lat(-?\d+(?:\.\d+)?)_lon(-?\d+(?:\.\d+)?)))?'
     r'(?:_s(\d{8}-\d{4}))?'
-    r'(?:_cls-(soil|notsoil))?'
+    r'((?:_[a-z][a-z0-9-]*)*?)'
     r'(_detected)?\.(?:jpg|jpeg|png)$',
     caseSensitive: false,
   );
@@ -127,6 +149,10 @@ class GeoImage {
     if (m == null) return null;
 
     final time = _stamp(m.group(2)!, m.group(3)!);
+    final tags = [
+      for (final t in (m.group(7) ?? '').toLowerCase().split('_'))
+        if (t.isNotEmpty) t,
+    ];
 
     final latS = m.group(4);
     final lonS = m.group(5);
@@ -147,10 +173,21 @@ class GeoImage {
       lat: lat,
       lon: lon,
       session: m.group(6),
-      soilClass: m.group(7)?.toLowerCase(),
+      soilClass: _soilClassOf(tags),
+      tags: tags,
       annotated: m.group(8) != null,
     );
   }
+}
+
+/// The soil verdict from the tags, or null. Only the two known verdicts
+/// count -- an unrecognised `cls-` value reads as unclassified, not as soil.
+String? _soilClassOf(List<String> tags) {
+  for (final t in tags) {
+    if (t == 'cls-${GeoImage.kSoil}') return GeoImage.kSoil;
+    if (t == 'cls-${GeoImage.kNotSoil}') return GeoImage.kNotSoil;
+  }
+  return null;
 }
 
 /// Distance in metres between two lat/lon pairs (equirectangular

@@ -6,7 +6,8 @@ The ONLY node that touches the GPIO. Everything else just sends commands.
 
 Subscribes:
     /cmd_vel  (geometry_msgs/Twist)   drive + steer commands
-    /mode     (std_msgs/String)       "AUTO" | "MANUAL" | "STOP" | "NAV"
+    /mode     (std_msgs/String)       "AUTO" | "MANUAL" | "STOP" | "NAV" | "COVER"
+    /fence_state (std_msgs/String)    from fence_node -- see FENCE ENFORCEMENT
 
 Twist convention (normalized):
     linear.x   forward speed   -1.0 .. +1.0   (+ = forward, - = reverse)
@@ -25,6 +26,8 @@ Safety:
   * REVERSE GUARD: on a direction flip (forward <-> reverse) the motors are
     held at ZERO for REVERSE_PAUSE seconds first -- a true full stop before
     reversing, so the rear gears are never slammed.
+  * FENCE ENFORCEMENT: the field boundary is enforced HERE, not in the nodes
+    that plan the driving. See the FENCE note below.
 """
 
 import os
@@ -224,6 +227,61 @@ SPEED_SCALE = 1.00
 # motors na xxng ganito katagal bago i-apply ang kabilang direction.
 REVERSE_PAUSE = 0.4                  # s; taasan (0.6) kung gusto ng mas luwag
 
+# ----------------------------- FENCE -----------------------------
+# The field boundary is enforced in this node, because this is the ONLY node
+# that turns /cmd_vel into wheel motion. control_node (AUTO, COVER), nav_node
+# (NAV) and the bridge (MANUAL) all publish /cmd_vel; a fence enforced in any
+# one of them could be driven straight through by another. The same reason
+# control_node's NO PATH hold is enforced where it publishes, taken one step
+# further down, to the point all of them share.
+#
+# fence_node says where the robot is; this node decides what may move:
+#
+#   OFF                no active boundary            -> unrestricted
+#   IN                 clear of the stop line        -> unrestricted
+#   LINE / OUT         at or past the stop line      -> only the direction
+#                      that heads back IN is allowed, as fence_node reports
+#                      it (F or R, from which way the robot faces). Usually
+#                      that is reverse: the robot reached the line driving
+#                      forward. Not always -- it can arrive backwards, or
+#                      curve in sideways at a corner -- and then reversing is
+#                      what takes it OUT. In simulation, a reverse-only rule
+#                      sent the robot 3 km outside the field that way.
+#                      The driving node does the recovering.
+#   NEVER DEEPER       underneath all of that, and trusting no heading: once
+#                      past the stop line, the robot may not get more than
+#                      FENCE_DEPTH_WORSEN_M deeper than the shallowest point
+#                      it has reached since crossing it. If it does, EVERY
+#                      direction is blocked and it holds until a person
+#                      moves it (MANUAL is not fenced) or the line is cleared.
+#                      A wrong heading estimate can then cost a stop, never
+#                      an escape.
+#   NOFIX              boundary active, position not provable -> ALL BLOCKED.
+#                      It cannot show it is inside, so it does not move.
+#   (silence)          boundary file exists but fence_node has gone quiet
+#                      -> ALL BLOCKED. A crashed fence node must not quietly
+#                      become "no fence".
+#
+# Applies in the AUTONOMOUS modes only -- AUTO, NAV, COVER. MANUAL is a human
+# with a joystick, who can see the field edge and may need to drive over it
+# (onto a trailer, out through a gate). STOP stops regardless.
+FENCED_MODES = ("AUTO", "NAV", "COVER")
+FENCE_STALE_S = 1.0                    # fence_node publishes at 5 Hz
+# See NEVER DEEPER: how much deeper than the shallowest point since crossing
+# the line the robot may get. GPS drift alone can move the believed position
+# that far during a slow recovery, so this guard WILL sometimes hold the
+# robot on noise -- and then release it when the error drifts back, which is
+# the right trade: a few seconds lost, never an escape.
+FENCE_DEPTH_WORSEN_M = 1.5
+# The guard's reference point (the shallowest depth since crossing) is only
+# forgotten once the robot is CLEARLY back inside -- this far inside the stop
+# line. Forgetting it on any IN reading let GPS noise near the line (reading
+# IN while the robot was really past it) reset the guard over and over, and
+# in simulation excursions stacked up to 4.4 m outside the boundary. 2 m in
+# plus the 3 m inset is 5 m from the boundary: beyond 2 sigma of the GPS.
+FENCE_BAND_RESET_M = 2.0
+BOUNDARY_FILE = os.path.expanduser("~/agv_boundary.json")
+
 
 class _HwPwm:
     """RP1 hardware PWM channel via sysfs, with the same two methods motor_node
@@ -388,6 +446,17 @@ class MotorNode(Node):
         # --- ROS interfaces ---
         self.create_subscription(Twist, '/cmd_vel', self.cmd_cb, 10)
         self.create_subscription(String, '/mode', self.mode_cb, 10)
+
+        # --- fence (see FENCE) ---
+        self.fence = "OFF"
+        self.fence_time = 0.0
+        self.fence_allow = "R"          # direction that heads back in
+        self.fence_depth = None         # metres past the stop line
+        self.fence_band_min = None      # shallowest since crossing the line
+        self._fence_logged = None
+        self._bf_exists = os.path.exists(BOUNDARY_FILE)
+        self._bf_checked = time.time()
+        self.create_subscription(String, '/fence_state', self.fence_cb, 10)
         self.create_timer(0.1, self.watchdog)   # 10 Hz safety check
         self.create_timer(0.1, self.steering_idle_check)
         self.create_timer(1.0 / STEER_HZ, self.steer_tick)
@@ -518,7 +587,7 @@ class MotorNode(Node):
     # ----------------------- callbacks -----------------------
     def mode_cb(self, msg: String):
         m = msg.data.strip().upper()
-        if m not in ("AUTO", "MANUAL", "STOP", "NAV"):
+        if m not in ("AUTO", "MANUAL", "STOP", "NAV", "COVER"):
             return
         if m != self.mode:
             self.get_logger().info(f"Mode -> {m}")
@@ -527,13 +596,87 @@ class MotorNode(Node):
             self.hard_stop()
             self.center_steering()
 
+    # ----------------------- fence -----------------------
+    def fence_cb(self, msg: String):
+        """See fence_node for the format."""
+        p = msg.data.strip().split("|")
+        self.fence = p[0].upper()
+        self.fence_time = time.time()
+        if self.fence in ("LINE", "OUT"):
+            try:
+                depth = float(p[2])
+            except (IndexError, ValueError):
+                depth = None
+            allow = p[3].strip().upper() if len(p) > 3 else "R"
+            self.fence_allow = allow if allow in ("F", "R") else "R"
+            self.fence_depth = depth
+            if depth is not None:
+                self.fence_band_min = (depth if self.fence_band_min is None
+                                       else min(self.fence_band_min, depth))
+        else:
+            self.fence_depth = None
+            self.fence_allow = "R"
+            # Forget the reference only when CLEARLY back inside, or when
+            # there is no fence at all -- see FENCE_BAND_RESET_M.
+            margin = None
+            if self.fence == "IN":
+                try:
+                    margin = float(p[1])
+                except (IndexError, ValueError):
+                    margin = None
+            if self.fence != "IN" or (margin is not None
+                                      and margin >= FENCE_BAND_RESET_M):
+                self.fence_band_min = None
+
+    def _boundary_file_exists(self):
+        # Re-checked once a second: cheap, and it means a boundary saved or
+        # cleared while running takes effect without a restart.
+        now = time.time()
+        if now - self._bf_checked > 1.0:
+            self._bf_checked = now
+            self._bf_exists = os.path.exists(BOUNDARY_FILE)
+        return self._bf_exists
+
+    def fence_limit(self, linear_x):
+        """The forward/reverse command the fence allows, plus why if it
+        changed anything. See FENCE for the rules."""
+        if self.mode not in FENCED_MODES:
+            return linear_x, None
+        stale = time.time() - self.fence_time > FENCE_STALE_S
+        if stale:
+            if self._boundary_file_exists():
+                return 0.0, "fence node silent with a boundary saved"
+            return linear_x, None
+        if self.fence == "NOFIX":
+            return 0.0, "no GPS fix -- cannot prove it is inside the boundary"
+        if self.fence in ("LINE", "OUT"):
+            if (self.fence_depth is not None and self.fence_band_min is not None
+                    and self.fence_depth
+                    > self.fence_band_min + FENCE_DEPTH_WORSEN_M):
+                return 0.0, (f"{self.fence_depth:.1f} m past the stop line and "
+                             f"getting DEEPER -- holding (see NEVER DEEPER)")
+            if self.fence_allow == "F" and linear_x < 0.0:
+                return 0.0, (f"past the stop line ({self.fence}) facing back "
+                             f"in -- reverse blocked")
+            if self.fence_allow != "F" and linear_x > 0.0:
+                return 0.0, (f"at the field boundary ({self.fence}) -- "
+                             f"forward blocked")
+        return linear_x, None
+
     def cmd_cb(self, msg: Twist):
         self.last_cmd_time = time.time()
         if self.mode == "STOP":
             self.hard_stop()
             return
+        lx, why = self.fence_limit(msg.linear.x)
+        if why != self._fence_logged:
+            self._fence_logged = why
+            if why:
+                self.get_logger().warn(f"FENCE: {why}")
+            else:
+                self.get_logger().info("FENCE: no longer limiting")
         self.steer(msg.angular.z)
-        self.drive(msg.linear.x)
+        self.drive(lx)
         self.stopped = False
 
     def watchdog(self):

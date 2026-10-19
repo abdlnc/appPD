@@ -42,7 +42,17 @@ import datetime
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import String
+
+# Field boundary: with one active, only the trail INSIDE it is recorded -- the
+# map is of the field, and a stretch driven outside (by hand, onto a trailer)
+# is not part of it -- and the saved GeoJSON carries the boundary and its
+# stop line as polygons, so the map shows the field the trail belongs to.
+try:
+    from agv_control import field_geometry as fg
+except ImportError:
+    fg = None
 from geometry_msgs.msg import PoseWithCovarianceStamped
 
 MIN_STEP_M = 1.0           # mag-record ng bagong point pag lumayo nang ganito (m)
@@ -83,6 +93,10 @@ class PathRecorder(Node):
 
         self.path_pub = self.create_publisher(String, '/path', 10)
         self.create_subscription(String, '/gps', self.gps_cb, 10)
+        self.fence = None                # (frame, polygon, json) when active
+        self.create_subscription(
+            String, '/fence', self.fence_cb,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(PoseWithCovarianceStamped, '/pose',
                                  self.pose_cb, 10)
         self.create_timer(SAVE_EVERY_S, self.save_geojson)
@@ -105,6 +119,18 @@ class PathRecorder(Node):
         with open(self.track_path, "a") as f:
             f.write("%.3f,%.4f,%.4f,%s,%s\n" % (time.time(), x, y, lat, lon))
 
+    def fence_cb(self, msg):
+        self.fence = None
+        if fg is None:
+            return
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        if d.get("active") and d.get("points"):
+            fr = fg.LocalFrame(*d["points"][0])
+            self.fence = (fr, [fr.to_xy(a, b) for a, b in d["points"]], d)
+
     def gps_cb(self, msg):
         p = msg.data.split(',')
         if len(p) < 2:
@@ -120,6 +146,13 @@ class PathRecorder(Node):
         self.cur_lat = lat
         self.cur_lon = lon
         heading = p[2].strip() if (len(p) >= 3 and p[2].strip()) else ""
+
+        # with a boundary, only the trail INSIDE it is recorded
+        if self.fence is not None:
+            fr, poly, _ = self.fence
+            if not fg.point_in_polygon(fr.to_xy(lat, lon), poly):
+                self.last = None    # do not join across the outside stretch
+                return
 
         # mag-record lang pag lumayo nang MIN_STEP_M (iwas redundant points)
         if self.last is not None:
@@ -154,6 +187,18 @@ class PathRecorder(Node):
                 "geometry": {"type": "LineString", "coordinates": coords},
             }],
         }
+        if self.fence is not None:
+            d = self.fence[2]
+            for name, pts in (("field boundary", d.get("points", [])),
+                              ("stop line", d.get("stop_line", []))):
+                if len(pts) >= 3:
+                    ring = [[lo, la] for la, lo in pts] + [[pts[0][1], pts[0][0]]]
+                    geo["features"].append({
+                        "type": "Feature",
+                        "properties": {"name": name,
+                                       "inset_m": d.get("inset_m")},
+                        "geometry": {"type": "Polygon", "coordinates": [ring]},
+                    })
         with open(self.geojson_path, "w") as f:
             json.dump(geo, f, indent=2)
 

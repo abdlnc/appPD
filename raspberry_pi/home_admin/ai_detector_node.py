@@ -93,6 +93,35 @@ SAVE_CONF     = 0.50        # min confidence of the BEST box before saving
 # while the robot sits in front of it / drives up to it.
 SAVE_COOLDOWN = 15.0        # s between saved photos
 
+# ---- no duplicate photos of the same spot or the same obstacle ----
+# On top of SAVE_CONF and SAVE_COOLDOWN, which both still apply. Two ways a
+# detection can be "the same one again" (field_geometry.dedup_decision):
+#
+#   POSITION -- within DEDUP_RADIUS_M of ANY earlier saved photo, both with a
+#     GPS fix.
+#   PICTURE -- a dHash within DEDUP_HASH_MAX bits of a photo saved in the last
+#     DEDUP_HASH_WINDOW_S. This is what catches the cases position cannot: no
+#     fix at all, or standing still -- where GPS can wander a photo well past
+#     the radius. Measured on this robot's own soil archive: consecutive
+#     photos of the SAME patch of ground, robot parked, that the GPS put 6 to
+#     14 m apart -- and every one of them was within 1 bit by dHash. Kept to
+#     recent saves so two different obstacles weeks apart that happen to
+#     hash alike are not merged.
+#
+# On a match the MORE CONFIDENT photo wins: a better shot REPLACES the
+# earlier raw + annotated pair (the only place this node deletes anything),
+# a worse one is not saved. Photos from before this existed have no recorded
+# confidence and are treated as unbeatable -- never deleted, since there is
+# no way to know the new one is better.
+DEDUP_RADIUS_M = 3.0
+DEDUP_HASH_MAX = 4
+DEDUP_HASH_WINDOW_S = 600.0
+DEDUP_INDEX = os.path.join(CAPTURE_DIR, ".dedup_index.json")
+
+# A photo taken OUTSIDE the field boundary gets "_outside" in its name, so the
+# app can tell it apart; it is still saved.
+OUTSIDE_TAG = "_outside"
+
 
 def _load_model():
     from ultralytics import YOLO
@@ -151,6 +180,12 @@ def run_node():
     from std_msgs.msg import String
     from sensor_msgs.msg import CompressedImage
     from datetime import datetime
+    import json
+    import re
+    try:
+        from agv_control import field_geometry as fg
+    except ImportError:
+        fg = None
 
     class AIDetector(Node):
         def __init__(self, model):
@@ -186,6 +221,14 @@ def run_node():
                 QoSProfile(depth=1,
                            durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
+            # --- de-duplication and the field boundary (see DEDUP_*) ---
+            self.saved = self._load_index()
+            self.fence = None                    # (frame, polygon) when active
+            self.create_subscription(
+                String, '/fence', self.fence_cb,
+                QoSProfile(depth=1,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
             # depth 1: if we are mid-inference the newest frame is the only one
             # worth having; older ones are already out of date.
             self.create_subscription(CompressedImage, AI_TOPIC,
@@ -194,6 +237,91 @@ def run_node():
                 f"AI detector ready. Watching {AI_TOPIC} (camera decides what "
                 f"an obstacle is); saves to {CAPTURE_DIR} + {DETECT_DIR} "
                 f"ONLY on detection, and only while a run is recorded.")
+
+        # ---- de-duplication ----
+        def _load_index(self):
+            """Earlier saves: the index this node keeps, plus any raw capture
+            on disk it does not know about (saved before de-duplication
+            existed) -- position from its name, confidence unknown."""
+            idx = {}
+            try:
+                with open(DEDUP_INDEX) as f:
+                    for e in json.load(f):
+                        idx[e["name"]] = e
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            try:
+                names = [n for n in os.listdir(CAPTURE_DIR) if n.endswith(".jpg")]
+            except OSError:
+                names = []
+            on_disk = set(n[:-4] for n in names)
+            idx = {k: v for k, v in idx.items() if k in on_disk}   # deleted
+            for n in names:
+                base = n[:-4]
+                if base in idx:
+                    continue
+                m = re.search(r"_lat(-?[\d.]+)_lon(-?[\d.]+)", base)
+                idx[base] = {"name": base,
+                             "lat": float(m.group(1)) if m else None,
+                             "lon": float(m.group(2)) if m else None,
+                             "conf": None, "hash": None,
+                             "t": os.path.getmtime(os.path.join(CAPTURE_DIR, n))}
+            return idx
+
+        def _save_index(self):
+            tmp = DEDUP_INDEX + ".tmp"
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(list(self.saved.values()), f)
+                os.replace(tmp, DEDUP_INDEX)
+            except OSError as e:
+                self.get_logger().warn(f"dedup index not saved: {e}")
+
+        @staticmethod
+        def _dhash(frame):
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            g = cv2.resize(g, (9, 8), interpolation=cv2.INTER_AREA)
+            return fg.dhash_bits(g.tolist())
+
+        def _recent_for_dedup(self):
+            now = time.time()
+            out = []
+            for e in self.saved.values():
+                e2 = dict(e)
+                # unknown confidence = unbeatable (see DEDUP note)
+                e2["conf"] = float("inf") if e.get("conf") is None else e["conf"]
+                if e.get("hash") is None or now - e.get("t", 0) > DEDUP_HASH_WINDOW_S:
+                    e2["hash"] = None
+                out.append(e2)
+            return out
+
+        def _delete_pair(self, base):
+            for path in (os.path.join(CAPTURE_DIR, base + ".jpg"),
+                         os.path.join(DETECT_DIR, base + "_detected.jpg")):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            self.saved.pop(base, None)
+
+        def fence_cb(self, msg):
+            self.fence = None
+            if fg is None:
+                return
+            try:
+                d = json.loads(msg.data)
+            except ValueError:
+                return
+            if d.get("active") and d.get("points"):
+                fr = fg.LocalFrame(*d["points"][0])
+                self.fence = (fr, [fr.to_xy(a, b) for a, b in d["points"]])
+
+        def _outside(self):
+            if self.fence is None or self.gps_lat is None:
+                return False
+            fr, poly = self.fence
+            return not fg.point_in_polygon(fr.to_xy(self.gps_lat, self.gps_lon),
+                                           poly)
 
         def capture_cb(self, msg):
             on = msg.data.strip().upper() == "ON"
@@ -287,14 +415,37 @@ def run_node():
                         f"[{dt:.1f}s] {count} detection(s) within cooldown "
                         f"-- not saved")
                     return
+                # --- the same spot / obstacle as an earlier photo? ---
+                h = self._dhash(frame) if fg is not None else None
+                if fg is not None:
+                    new = {"lat": self.gps_lat, "lon": self.gps_lon,
+                           "conf": best, "hash": h}
+                    verdict, other = fg.dedup_decision(
+                        new, self._recent_for_dedup(), DEDUP_RADIUS_M,
+                        DEDUP_HASH_MAX)
+                    if verdict == fg.SKIP:
+                        self.get_logger().info(
+                            f"[{dt:.1f}s] detection NOT saved: {other}, and "
+                            f"that one was at least as confident")
+                        return
+                    if verdict == fg.REPLACE:
+                        self.get_logger().info(
+                            f"[{dt:.1f}s] better shot ({best:.2f} vs "
+                            f"{other['conf']:.2f}) -- replacing {other['name']}")
+                        self._delete_pair(other["name"])
                 self.last_save = time.time()
 
                 base = ("capture_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-                        + self._gps_suffix() + "_s" + self.session)
+                        + self._gps_suffix() + "_s" + self.session
+                        + (OUTSIDE_TAG if self._outside() else ""))
                 raw = os.path.join(CAPTURE_DIR, base + ".jpg")
                 out = os.path.join(DETECT_DIR, base + "_detected.jpg")
                 cv2.imwrite(raw, frame)     # untouched frame, no overlay
                 r.save(filename=out, conf=False)   # labels, no scores
+                self.saved[base] = {"name": base, "lat": self.gps_lat,
+                                    "lon": self.gps_lon, "conf": best,
+                                    "hash": h, "t": time.time()}
+                self._save_index()
                 self.get_logger().info(
                     f"[{dt:.1f}s] {count} detection(s): {summary}  -> {out}")
             except Exception as e:

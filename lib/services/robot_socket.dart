@@ -4,6 +4,8 @@ import 'dart:math';
 import 'dart:typed_data'; // Added for Uint8List
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:flutter/foundation.dart';
+import 'package:latlong2/latlong.dart';
+import '../models/field_boundary.dart';
 
 /// A GPS location where the robot's Lidar reported a DANGER-level obstacle.
 class ObstaclePin {
@@ -92,6 +94,19 @@ class RobotSocket extends ChangeNotifier {
   /// still parse fine.
   bool _pathBlocked = false;
   bool get pathBlocked => _pathBlocked;
+
+  /// Why the robot is boxed in, when it says: "FENCE" = the field's stop
+  /// line ahead and an obstacle behind. Empty for an ordinary NO PATH.
+  String _pathBlockedReason = "";
+  String get pathBlockedReason => _pathBlockedReason;
+
+  // ---- field boundary and COVER mode (see models/field_boundary.dart) ----
+  FieldBoundary? _boundary;          // "Z:" -- what the robot has stored
+  FieldBoundary? get boundary => _boundary;
+  CoverPlan? _coverPlan;             // "P:" -- the planned lanes
+  CoverPlan? get coverPlan => _coverPlan;
+  CoverStatus? _coverStatus;         // "V:" -- progress
+  CoverStatus? get coverStatus => _coverStatus;
 
   /// True when connected but the GPS has no fix right now. Uses the fix
   /// flag directly rather than hasGps below -- functionally the same now
@@ -306,6 +321,17 @@ class RobotSocket extends ChangeNotifier {
       else if (message.startsWith("G:")) {
         _parseGps(message.substring(2));
       }
+      // 4.5 Field boundary (Z:), COVER plan (P:) and progress (V:)
+      else if (message.startsWith("Z:")) {
+        _boundary = FieldBoundary.parse(message.substring(2));
+        notifyListeners();
+      } else if (message.startsWith("P:")) {
+        _coverPlan = CoverPlan.parse(message.substring(2));
+        notifyListeners();
+      } else if (message.startsWith("V:")) {
+        _coverStatus = CoverStatus.parse(message.substring(2));
+        notifyListeners();
+      }
       // 5. SLAM map save result (MAPSAVED: / MAPERR:)
       else if (message.startsWith("MAPSAVED:")) {
         _isSavingMap = false;
@@ -412,6 +438,7 @@ class RobotSocket extends ChangeNotifier {
       _obstacleZone = "";
       _obstacleDist = 0.0;
       _pathBlocked = false;
+      _pathBlockedReason = "";
     } else {
       _obstacleLevel = level;
       _obstacleZone = parts[1].trim();
@@ -419,6 +446,10 @@ class RobotSocket extends ChangeNotifier {
       // optional 4th field: "BLOCKED" = no escape route at all
       _pathBlocked =
           parts.length >= 4 && parts[3].trim().toUpperCase() == "BLOCKED";
+      // optional 5th field: WHY it is blocked (older robots never send it)
+      _pathBlockedReason = _pathBlocked && parts.length >= 5
+          ? parts[4].trim().toUpperCase()
+          : "";
     }
     if (_obstacleLevel == "DANGER" && hasGps) {
       _maybeAddObstaclePin(previousLevel);
@@ -470,6 +501,21 @@ class RobotSocket extends ChangeNotifier {
     _lidarPoints = newPoints;
     notifyListeners();
   }
+
+  // ---- field boundary and COVER commands ----
+  /// Replace the robot's boundary. It validates it again itself and reports
+  /// the result back on "Z:", so the map shows what was really stored.
+  void sendFence(List<LatLng> corners, double insetM) {
+    final pts = corners
+        .map((p) => "${p.latitude.toStringAsFixed(7)},"
+            "${p.longitude.toStringAsFixed(7)}")
+        .join(';');
+    sendCommand("FENCE:SET ${insetM.toStringAsFixed(1)}|$pts");
+  }
+
+  void clearFence() => sendCommand("FENCE:CLEAR");
+  void startCover() => sendCommand("COVER:START");
+  void resetCover() => sendCommand("COVER:RESET");
 
   void sendCommand(String command) {
     if (_channel != null && _isConnected) {

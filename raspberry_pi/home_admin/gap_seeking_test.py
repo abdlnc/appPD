@@ -308,6 +308,15 @@ def drive(ranges, env="OUTDOOR"):
     o._scan_blinded = False; o._blind_log = 0.0
     o._gap_sign = 0.0; o._gap_logged = 1e9
     o._last_turn = 0.0; o._last_turn_end = 0.0; o._turn_repeats = 0
+    # No boundary, as on a robot without one -- the case that must reproduce
+    # AUTO exactly. Mirrors what __init__ sets.
+    import time as _t
+    o.fence = "OFF"; o.fence_time = _t.time(); o.fence_turn = "?"
+    o.fence_margin = 0.0; o.fence_depth = None; o.fence_band_min = None
+    o.fence_allow = "R"; o.fence_blocked = False; o._nofix_said = False
+    o.route_steer = 0.0; o.route_cap = 0.0; o.route_hold = True
+    o.route_time = 0.0
+    o._scan_ranges = []; o._scan_geom = (0.0, 0.0); o._scan_time = 0.0
     o.zones = {k: 9999.0 for k in
                ('front', 'front_r', 'right', 'back', 'left', 'front_l')}
     o.prof = dict(cn.ENV_PROFILES[env])

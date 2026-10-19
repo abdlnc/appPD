@@ -40,6 +40,11 @@ from ament_index_python.packages import get_package_share_directory
 
 HOME = os.path.expanduser("~")
 USE_SIM = os.path.exists(os.path.join(HOME, "agv_use_sim"))   # flag file = SIM GPS
+# Optional sim realism, only meaningful with agv_use_sim -- see gps_node.py:
+#   touch ~/agv_sim_ackermann   robot steers like the real one (no pivoting)
+#   touch ~/agv_sim_noise       +/-2.5 m drifting GPS error, like the NEO-M8N
+SIM_ACKERMANN = os.path.exists(os.path.join(HOME, "agv_sim_ackermann"))
+SIM_NOISE = os.path.exists(os.path.join(HOME, "agv_sim_noise"))
 
 
 def _node(script, args=None):
@@ -53,6 +58,10 @@ def generate_launch_description():
         "launch", "agv_full.launch.py")
 
     gps_args = ["--sim"] if USE_SIM else []
+    if USE_SIM and SIM_ACKERMANN:
+        gps_args.append("--sim-ackermann")
+    if USE_SIM and SIM_NOISE:
+        gps_args.append("--sim-noise")
 
     actions = [
         IncludeLaunchDescription(PythonLaunchDescriptionSource(agv_full)),
@@ -64,6 +73,11 @@ def generate_launch_description():
         _node("ai_detector_node.py"),   # comment out this line if RAM is tight
         _node("soil_camera_node.py"),   # 2nd camera (/dev/video2) -> ~/agv_soil_images
         _node("gallery_server.py"),     # read-only HTTP viewer, port 8080
+        # Field boundary: owns ~/agv_boundary.json and publishes whether the
+        # robot is inside it. motor_node ENFORCES what this reports.
+        _node("fence_node.py"),
+        # COVER mode route planner: suggests a direction, never drives.
+        _node("coverage_node.py"),
     ]
 
     if USE_SIM:

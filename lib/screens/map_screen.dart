@@ -4,9 +4,11 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../models/field_boundary.dart';
 import '../models/geo_image.dart';
 import '../services/gallery_api.dart';
 import '../services/robot_socket.dart';
+import '../services/run_log_store.dart';
 import '../theme/app_theme.dart';
 
 /// GPS map (2.1 visualization) + interactive waypoint navigation (2.2).
@@ -36,6 +38,14 @@ class _MapScreenState extends State<MapScreen> {
   LatLng? _smoothed; // EMA-smoothed position (tames GPS jitter)
   bool _showTrail = true; // toggle the trail layer on/off
   bool _showObstacles = true; // toggle obstacle pins on/off
+
+  // ---- field boundary editing (see models/field_boundary.dart) ----
+  // While editing, a tap adds a CORNER instead of setting a waypoint. The
+  // draft is only a preview until SAVE: the robot validates it again and
+  // reports back on "Z:", and what the map then draws is what it stored.
+  bool _editingFence = false;
+  final List<LatLng> _draft = [];
+  double _inset = kDefaultInsetM;
   RobotSocket? _socket; // cached for the trail listener
   static const double _trailMinStepM = 3.0; // min meters between trail points
   static const int _trailMaxPoints = 5000; // cap so the list can't grow forever
@@ -314,6 +324,27 @@ class _MapScreenState extends State<MapScreen> {
                 fontWeight: FontWeight.w700, letterSpacing: 1.5)),
         actions: [
           IconButton(
+            icon: Icon(Icons.fence,
+                color: _editingFence
+                    ? const Color(0xFFFFB300)
+                    : (socket.boundary?.active == true
+                        ? AppColors.lime
+                        : null)),
+            tooltip: _editingFence
+                ? "Stop editing the boundary"
+                : "Edit the field boundary",
+            onPressed: () => setState(() {
+              if (!_editingFence) {
+                // start from what the robot has, so editing is editing
+                _draft
+                  ..clear()
+                  ..addAll(socket.boundary?.points ?? const []);
+                _inset = socket.boundary?.insetM ?? kDefaultInsetM;
+              }
+              _editingFence = !_editingFence;
+            }),
+          ),
+          IconButton(
             icon: Icon(_satellite ? Icons.map : Icons.satellite_alt),
             tooltip: _satellite ? "Street view" : "Satellite view",
             onPressed: () => setState(() => _satellite = !_satellite),
@@ -385,6 +416,10 @@ class _MapScreenState extends State<MapScreen> {
               initialCenter: widget.focus ?? robot ?? _fallback,
               initialZoom: 18,
               onTap: (tapPos, point) => setState(() {
+                if (_editingFence) {
+                  _draft.add(point); // a corner, not a destination
+                  return;
+                }
                 _waypoint = point;
                 _arrived = false;
                 _navigating = false;
@@ -400,6 +435,7 @@ class _MapScreenState extends State<MapScreen> {
                 urlTemplate: _satellite ? _satUrl : _streetUrl,
                 userAgentPackageName: 'com.example.robot_controller',
               ),
+              ..._boundaryLayers(socket),
               if (_showTrail && _trail.length >= 2)
                 PolylineLayer(polylines: [
                   Polyline(
@@ -459,7 +495,16 @@ class _MapScreenState extends State<MapScreen> {
             bottom: 0,
             left: 0,
             right: 0,
-            child: _bottomPanel(socket, robot, distLabel),
+            child: _editingFence
+                ? _fencePanel(socket, robot)
+                : Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (socket.boundary?.active == true)
+                        _coverCard(socket, robot),
+                      _bottomPanel(socket, robot, distLabel),
+                    ],
+                  ),
           ),
         ],
       ),
@@ -541,8 +586,7 @@ class _MapScreenState extends State<MapScreen> {
                             "${g.time.hour.toString().padLeft(2, '0')}:"
                             "${g.time.minute.toString().padLeft(2, '0')}:"
                             "${g.time.second.toString().padLeft(2, '0')}"
-                            "${g.kind == 'soil' ? '  soil' : ''}"
-                            "${g.annotated ? '  AI' : ''}",
+                            "${g.kind == 'soil' ? '  soil' : ''}",
                             style: GoogleFonts.rajdhani(
                                 color: AppColors.textLo, fontSize: 12),
                           ),
@@ -609,6 +653,292 @@ class _MapScreenState extends State<MapScreen> {
                   : "Not connected \u2014 set the Pi IP in the Connection screen",
               style: GoogleFonts.rajdhani(
                   color: _satellite ? Colors.white70 : AppColors.textLo)),
+    );
+  }
+
+  // ---------------------------------------------------------------- boundary
+  static const _fenceColor = Color(0xFF8BC34A);
+  static const _stopColor = Color(0xFFFFB300);
+  static const _laneColor = Color(0xFF22D3EE);
+
+  /// The boundary, its stop line and COVER's lanes -- or, while editing,
+  /// the draft and a live preview of where its stop line would fall.
+  List<Widget> _boundaryLayers(RobotSocket socket) {
+    if (_editingFence) {
+      final check = checkBoundary(_draft, _inset);
+      return [
+        if (_draft.length >= 2)
+          PolylineLayer(polylines: [
+            Polyline(
+              points: [..._draft, if (_draft.length >= 3) _draft.first],
+              strokeWidth: 3,
+              color: check.ok ? _fenceColor : const Color(0xFFE53935),
+            ),
+          ]),
+        if (check.ok)
+          PolylineLayer(polylines: [
+            Polyline(
+              points: [...check.stopLine, check.stopLine.first],
+              strokeWidth: 2,
+              color: _stopColor,
+              pattern: StrokePattern.dashed(segments: const [8, 6]),
+            ),
+          ]),
+        MarkerLayer(markers: [
+          for (var i = 0; i < _draft.length; i++)
+            Marker(
+              point: _draft[i],
+              width: 22,
+              height: 22,
+              child: Container(
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: _stopColor,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.black54),
+                ),
+                child: Text("${i + 1}",
+                    style: GoogleFonts.rajdhani(
+                        color: Colors.black,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800)),
+              ),
+            ),
+        ]),
+      ];
+    }
+    final b = socket.boundary;
+    if (b == null || !b.active || b.points.length < 3) return const [];
+    final lanes = socket.coverPlan?.lanes ?? const <List<LatLng>>[];
+    return [
+      PolygonLayer(polygons: [
+        Polygon(
+          points: b.points,
+          color: _fenceColor.withValues(alpha: 0.10),
+          borderColor: _fenceColor,
+          borderStrokeWidth: 3,
+        ),
+      ]),
+      if (b.stopLine.length >= 3)
+        PolylineLayer(polylines: [
+          Polyline(
+            points: [...b.stopLine, b.stopLine.first],
+            strokeWidth: 2,
+            color: _stopColor,
+            pattern: StrokePattern.dashed(segments: const [8, 6]),
+          ),
+        ]),
+      if (lanes.isNotEmpty)
+        PolylineLayer(polylines: [
+          for (final ln in lanes)
+            if (ln.length >= 2)
+              Polyline(
+                points: ln,
+                strokeWidth: 2,
+                color: _laneColor.withValues(alpha: 0.7),
+              ),
+        ]),
+    ];
+  }
+
+  /// Bottom panel while editing the boundary.
+  Widget _fencePanel(RobotSocket socket, LatLng? robot) {
+    final check = checkBoundary(_draft, _inset);
+    final online = socket.isConnected;
+    final String status;
+    final Color statusColor;
+    if (_draft.isEmpty) {
+      status = "Tap the map to add corners, or stand the robot at a corner "
+          "and use ROBOT HERE";
+      statusColor = AppColors.textLo;
+    } else if (check.ok) {
+      status = "${check.corners.length} corners, "
+          "${(check.areaM2 / 10000).toStringAsFixed(2)} ha -- "
+          "stop line ${_inset.toStringAsFixed(1)} m inside";
+      statusColor = _fenceColor;
+    } else {
+      status = check.reason;
+      statusColor = const Color(0xFFFFB300);
+    }
+    Widget btn(String label, IconData icon, VoidCallback? onTap,
+        {Color? color}) {
+      return TextButton.icon(
+        onPressed: onTap,
+        style: TextButton.styleFrom(
+            foregroundColor: color ?? AppColors.textHi,
+            padding: const EdgeInsets.symmetric(horizontal: 8)),
+        icon: Icon(icon, size: 18),
+        label: Text(label,
+            style: GoogleFonts.rajdhani(fontWeight: FontWeight.w700)),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+      decoration: BoxDecoration(
+        color: AppColors.surface.withValues(alpha: 0.96),
+        border: const Border(top: BorderSide(color: _stopColor, width: 2)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.fence, color: _stopColor, size: 18),
+                const SizedBox(width: 6),
+                Text("EDITING BOUNDARY",
+                    style: GoogleFonts.rajdhani(
+                        color: _stopColor,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1.2)),
+                const Spacer(),
+                Text("stop line",
+                    style: GoogleFonts.rajdhani(
+                        color: AppColors.textLo, fontSize: 12)),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.remove, size: 18),
+                  onPressed: _inset > 1.0
+                      ? () => setState(() => _inset -= 0.5)
+                      : null,
+                ),
+                Text("${_inset.toStringAsFixed(1)} m",
+                    style: GoogleFonts.rajdhani(
+                        color: AppColors.textHi, fontWeight: FontWeight.w700)),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.add, size: 18),
+                  onPressed: _inset < 15.0
+                      ? () => setState(() => _inset += 0.5)
+                      : null,
+                ),
+              ],
+            ),
+            Text(status,
+                style: GoogleFonts.rajdhani(color: statusColor, fontSize: 13)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 2,
+              children: [
+                // the same receiver the robot navigates with: more accurate
+                // for the robot than a tap on a map that may be offset
+                btn("ROBOT HERE", Icons.my_location,
+                    robot == null ? null : () => setState(() => _draft.add(robot))),
+                btn("UNDO", Icons.undo,
+                    _draft.isEmpty ? null : () => setState(() => _draft.removeLast())),
+                btn("CLEAR", Icons.delete_outline,
+                    _draft.isEmpty ? null : () => setState(() => _draft.clear())),
+                if (_draft.isEmpty && socket.boundary?.points.isNotEmpty == true)
+                  btn("REMOVE BOUNDARY", Icons.layers_clear, !online
+                      ? null
+                      : () {
+                          socket.clearFence();
+                          setState(() => _editingFence = false);
+                        }, color: const Color(0xFFE53935))
+                else
+                  btn("SAVE", Icons.check, !(check.ok && online)
+                      ? null
+                      : () {
+                          socket.sendFence(check.corners, _inset);
+                          setState(() => _editingFence = false);
+                        }, color: _fenceColor),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// COVER mode: start/stop, and how far through the field it is.
+  Widget _coverCard(RobotSocket socket, LatLng? robot) {
+    final st = socket.coverStatus;
+    final plan = socket.coverPlan;
+    final running = st?.active == true;
+    final runs = context.read<RunLogStore>();
+    String line;
+    if (plan != null && plan.error.isNotEmpty && plan.lanes.isEmpty) {
+      line = "COVER can't plan this field: ${plan.error}";
+    } else if (st == null || plan == null) {
+      line = "COVER: waiting for the plan";
+    } else if (st.done) {
+      line = "COVER complete -- ~${st.coverage.toStringAsFixed(0)}% covered, "
+          "${st.overlap.toStringAsFixed(0)}% driven twice";
+    } else if (running) {
+      line = "${st.phase == 'FILL' ? 'Filling gaps' : 'Lane ${st.lane} of ${st.lanes}'}"
+          "  \u2022  ~${st.coverage.toStringAsFixed(0)}% covered";
+    } else {
+      final mins = plan.summary['minutes'];
+      line = "${plan.lanes.length} lanes"
+          "${mins != null ? ', about $mins min' : ''}"
+          "${st.coverage > 0 ? '  \u2022  ~${st.coverage.toStringAsFixed(0)}% done so far' : ''}";
+    }
+    final canStart = socket.isConnected && plan != null &&
+        plan.lanes.isNotEmpty && !running && st?.done != true;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+      decoration: BoxDecoration(
+        color: AppColors.surface.withValues(alpha: 0.94),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: running ? _laneColor : AppColors.border),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.grid_on, size: 18, color: running ? _laneColor : AppColors.textLo),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(line,
+                style: GoogleFonts.rajdhani(
+                    color: AppColors.textHi,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600)),
+          ),
+          if (!running && (st?.coverage ?? 0) > 0)
+            TextButton(
+              onPressed: socket.isConnected ? socket.resetCover : null,
+              child: Text("RESET",
+                  style: GoogleFonts.rajdhani(
+                      color: AppColors.textLo, fontWeight: FontWeight.w700)),
+            ),
+          if (running)
+            ElevatedButton(
+              onPressed: () {
+                socket.sendCommand("MODE:STOP");
+                if (runs.activeMode == 'COVER') {
+                  runs.stop(
+                      lat: socket.hasGps ? socket.robotLat : null,
+                      lon: socket.hasGps ? socket.robotLon : null);
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFE53935),
+                  foregroundColor: Colors.white),
+              child: Text("STOP",
+                  style: GoogleFonts.rajdhani(fontWeight: FontWeight.w800)),
+            )
+          else
+            ElevatedButton(
+              onPressed: !canStart
+                  ? null
+                  : () {
+                      socket.startCover();
+                      // a COVER run is logged like AUTO; that also turns
+                      // image capture on (RunLogStore -> CAPTURE:ON)
+                      runs.start('COVER',
+                          lat: socket.hasGps ? socket.robotLat : null,
+                          lon: socket.hasGps ? socket.robotLon : null);
+                    },
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: _laneColor, foregroundColor: Colors.black),
+              child: Text("START COVER",
+                  style: GoogleFonts.rajdhani(fontWeight: FontWeight.w800)),
+            ),
+        ],
+      ),
     );
   }
 

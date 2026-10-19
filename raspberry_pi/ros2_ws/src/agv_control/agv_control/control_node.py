@@ -4,7 +4,9 @@ AGV Control Node  (ROS2 / rclpy)  --  AUTONOMOUS DECISION ONLY (no GPIO).
 
 Subscribes:
     /scan           (sensor_msgs/LaserScan)
-    /mode           (std_msgs/String)   only acts while mode == "AUTO"
+    /mode           (std_msgs/String)   acts while mode is "AUTO" or "COVER"
+    /fence_state    (std_msgs/String)   from fence_node -- see FENCE RECOVERY
+    /cover_route    (std_msgs/String)   from coverage_node -- see COVER
     /ai_detections  (std_msgs/String)   camera caution (see CAMERA CAUTION)
 
 Publishes:
@@ -368,6 +370,74 @@ GAP_MIN_FRONT = OVERHANG_FWD + GAP_MIN_BUMPER       # = 0.55m on /scan
 # spends, and a gap misjudged at speed is how a robot wedges itself.
 GAP_SPEED = 0.35
 
+# ----------- COVER mode -----------
+# COVER is driven by THIS node, not by coverage_node. coverage_node only says
+# which way it would like to go (/cover_route); every move still goes through
+# the same obstacle handling as AUTO -- gap seeking, the avoidance manoeuvre,
+# the NO PATH hold, the rear watch. So obstacle avoidance has priority over
+# the route by construction rather than by two nodes agreeing to take turns,
+# and a detour rejoins the lane on its own: as soon as the obstacle is past,
+# the route preference pulls the robot back toward the lane line.
+#
+# AUTO is unchanged. Every COVER difference is behind a mode check, and the
+# route preference AUTO passes to pick_gap is 0 degrees -- which reproduces
+# the original candidate order exactly.
+DRIVE_MODES = ("AUTO", "COVER")
+# A route suggestion older than this is not a route. coverage_node publishes
+# at 5 Hz; going quiet (crashed, or holding for no GPS) means STOP, never
+# "carry on straight".
+COVER_ROUTE_STALE_S = 1.0
+
+# ----------- FENCE RECOVERY (AUTO and COVER) -----------
+# motor_node is what STOPS the robot at the field's stop line -- it blocks
+# forward motion there whatever any node asks for. This is what gets the
+# robot going again afterwards. Without it, AUTO would sit at the line
+# forever asking to go forward.
+#
+#   1. Stop. The way back in is chosen NOW, from fence_node's verdict while
+#      the robot was still driving forward -- after reversing, the heading
+#      from GPS positions is gone (reversing restarts it) and too little
+#      ground has been covered to rebuild it.
+#   2. Reverse until fence_node says the robot is FENCE_BACKOFF_M back
+#      inside the stop line. The robot arrived from inside, so backing up
+#      is the one move guaranteed to head back in. The rear watch applies:
+#      something behind stops the reverse exactly as in avoid().
+#      Why that far: the heading comes from GPS positions a few metres
+#      apart, and reversing restarts it. A short reverse leaves no heading,
+#      so there is no telling which way is in; with no turn, the robot
+#      creeps straight -- straight back at the line -- and repeats forever.
+#      In simulation exactly that happened: 2,638 trips to the line in four
+#      hours, never once crossing it, never getting anywhere. Backing off
+#      past the heading baseline (3 m) rebuilds the heading DURING the
+#      reverse, so the turn can be chosen properly.
+#   3. Turn toward the inside on full lock, until the fence or FENCE_TURN_MAX_S
+#      says stop. For a robot that cannot pivot this may take more than one
+#      round, like a three-point turn -- each forward leg ends at the line,
+#      which triggers the next reverse.
+#
+# BOTH BLOCKED: forward is the stop line and something is behind. Neither
+# move is safe, so the robot holds at zero and reports it the way NO PATH
+# is reported -- /obstacle gets "|BLOCKED|FENCE", which the installed app
+# shows as NO PATH (it reads the 4th field) and a rebuilt app can explain.
+# Must exceed the heading baselines (fence_node 3 m, coverage 5 m) with room
+# to spare, or backing off does not rebuild a heading and the deadlock
+# described above comes straight back -- which it did, in simulation, the
+# moment the coverage baseline was raised past an older 4 m back-off.
+# Checked at start-up: see _check_backoff().
+FENCE_BACKOFF_M = 6.0          # reverse until this far inside the stop line
+FENCE_REVERSE_MAX_S = 45.0     # give up after this (6 m at reverse speed is
+                               # ~25 s at the sim's 0.6 m/s)
+FENCE_TURN_MAX_S = 6.0         # longest single forward turning leg
+FENCE_STALE_S = 1.0
+# Not getting any shallower for this long while trying to get back in means
+# the move is not working (motor_node's NEVER DEEPER guard may be holding
+# it, or the heading is wrong). Stop trying, hold, and report.
+FENCE_NO_PROGRESS_S = 8.0      # long enough that GPS drift is not mistaken
+                               # for being stuck (at reversing speed, 4 s of
+                               # real progress is about the size of the noise)
+FENCE_DEPTH_WORSEN_M = 1.5     # mirrors motor_node's NEVER DEEPER guard
+FENCE_BAND_RESET_M = 2.0       # and its reset rule
+
 # ----------- Turn direction: commitment and hysteresis -----------
 # Each avoidance maneuver used to pick its direction from scratch, with no
 # memory of the one before it. That is what made the robot oscillate in
@@ -462,6 +532,27 @@ class AGVControl(Node):
         self.create_subscription(String, '/mode', self.mode_cb, 10)
         self.create_subscription(String, '/ai_detections', self.ai_cb, 10)
         self.create_subscription(String, '/env_mode', self.env_cb, 10)
+
+        # --- COVER route (see COVER) ---
+        self.route_steer = 0.0
+        self.route_cap = 0.0
+        self.route_hold = True       # until coverage_node says otherwise
+        self.route_time = 0.0
+        self.create_subscription(String, '/cover_route', self.route_cb, 10)
+
+        # --- fence (see FENCE RECOVERY) ---
+        self.fence = "OFF"
+        self.fence_turn = "?"
+        self.fence_margin = 0.0      # metres inside the stop line, when IN
+        self.fence_depth = None      # metres PAST it, when LINE/OUT
+        self.fence_band_min = None   # shallowest since crossing (as motor_node)
+        self.fence_allow = "R"       # direction that heads back in
+        self.fence_time = 0.0
+        self.fence_blocked = False   # stop line ahead AND something behind
+        self._nofix_said = False
+        self.create_subscription(String, '/fence_state', self.fence_cb, 10)
+
+        self._check_backoff()
         self.create_timer(0.1, self.tick)      # 10 Hz command stream
 
         self.get_logger().info(
@@ -473,8 +564,77 @@ class AGVControl(Node):
         if m != self.mode:
             self.get_logger().info(f"Mode -> {m}")
         self.mode = m
-        if m != "AUTO":
+        if m not in DRIVE_MODES:
             self.cmd = Twist()         # zero out (we won't publish anyway)
+
+    def _check_backoff(self):
+        """FENCE_BACKOFF_M must exceed every heading baseline -- see there.
+        Checked here rather than trusted, because the two live in different
+        files and the deadlock it prevents is silent: the robot just never
+        gets anywhere."""
+        try:
+            from . import coverage_planner
+            need = max(3.0, coverage_planner.HEADING_BASELINE_M) + 1.0
+        except ImportError:
+            need = 4.0
+        if FENCE_BACKOFF_M < need:
+            self.get_logger().error(
+                f"FENCE_BACKOFF_M ({FENCE_BACKOFF_M} m) is not above the "
+                f"heading baseline + 1 m ({need} m): boundary recovery can "
+                f"deadlock at the stop line. Raise FENCE_BACKOFF_M.")
+
+    def route_cb(self, msg: String):
+        """/cover_route: "<steer>,<speed cap>" or "HOLD|<why>"."""
+        self.route_time = time.time()
+        t = msg.data.strip()
+        if t.upper().startswith("HOLD"):
+            self.route_hold = True
+            return
+        try:
+            a, b = t.split(",")
+            self.route_steer = max(-1.0, min(1.0, float(a)))
+            self.route_cap = max(0.0, min(1.0, float(b)))
+            self.route_hold = False
+        except ValueError:
+            self.route_hold = True
+
+    def route_ok(self):
+        return (not self.route_hold
+                and time.time() - self.route_time <= COVER_ROUTE_STALE_S)
+
+    def fence_cb(self, msg: String):
+        """IN|<m inside the line>|<turn>, LINE|<turn>|<m>, OUT|<turn>|<m>,
+        NOFIX, OFF. See fence_node."""
+        p = msg.data.strip().split("|")
+        self.fence = p[0].upper()
+        self.fence_margin = 0.0
+        self.fence_turn = "?"
+        try:
+            if self.fence == "IN":
+                self.fence_margin = float(p[1])
+                self.fence_turn = p[2] if len(p) > 2 else "?"
+            elif self.fence in ("LINE", "OUT"):
+                self.fence_turn = p[1]
+                self.fence_depth = float(p[2])
+                self.fence_allow = p[3].upper() if len(p) > 3 else "R"
+        except (IndexError, ValueError):
+            pass
+        if self.fence in ("LINE", "OUT") and self.fence_depth is not None:
+            self.fence_band_min = (self.fence_depth if self.fence_band_min
+                                   is None else min(self.fence_band_min,
+                                                    self.fence_depth))
+        if self.fence not in ("LINE", "OUT"):
+            self.fence_depth = None
+            self.fence_allow = "R"
+            if self.fence != "IN" or self.fence_margin >= FENCE_BAND_RESET_M:
+                self.fence_band_min = None
+        self.fence_time = time.time()
+
+    def fence_now(self):
+        """Current fence verdict, or STALE if fence_node has gone quiet."""
+        if time.time() - self.fence_time > FENCE_STALE_S:
+            return "STALE"
+        return self.fence
 
     def publish_action(self, text):
         """Announce the current avoidance action. Published on CHANGE only,
@@ -496,9 +656,9 @@ class AGVControl(Node):
 
     def tick(self):
         # only this node publishes /cmd_vel while AUTONOMOUS
-        if self.mode != "AUTO":
+        if self.mode not in DRIVE_MODES:
             return
-        if self.blocked_hold:
+        if self.blocked_hold or self.fence_blocked:
             # Boxed in -> hold at zero regardless of whatever avoid() last
             # computed. Enforced HERE, at the single point that publishes
             # /cmd_vel, so an already-running avoid() thread cannot drive
@@ -642,13 +802,41 @@ class AGVControl(Node):
                 f"  (m) [{self.mode}]")
 
         # autonomous decision (only when AUTO and not mid-maneuver)
-        if self.mode != "AUTO" or self.is_avoiding:
+        if self.mode not in DRIVE_MODES or self.is_avoiding:
             return
         if self.blocked_hold:
             # Nowhere to go -- avoid() has no maneuver that helps, so don't
             # start one. tick() is already holding the output at zero.
             self.set_cmd(0.0, 0.0)
             return
+
+        # --- the field boundary (see FENCE RECOVERY) ---
+        fence = self.fence_now()
+        if fence in ("LINE", "OUT"):
+            self.is_avoiding = True
+            threading.Thread(target=self.fence_recover,
+                             args=(self.fence_turn,), daemon=True).start()
+            return
+        if fence == "NOFIX":
+            # motor_node is already refusing to move. Say why, once.
+            if not self._nofix_said:
+                self._nofix_said = True
+                self.publish_action("NO GPS FIX")
+                self.get_logger().warn(
+                    "boundary active but no GPS fix -- holding still")
+            self.set_cmd(0.0, 0.0)
+            return
+        if self._nofix_said:
+            self._nofix_said = False
+            self.publish_action("")
+
+        # --- COVER: no route, no driving ---
+        cover = self.mode == "COVER"
+        if cover and not self.route_ok():
+            self.set_cmd(0.0, 0.0)
+            return
+        prefer = self.route_steer * GAP_STEER_FULL_DEG if cover else 0.0
+
         z = self.zones
         # Bumper clearance -> /scan distance; see OVERHANG_FWD.
         front = OVERHANG_FWD + self.prof['front']
@@ -669,9 +857,15 @@ class AGVControl(Node):
         # otherwise would drive the robot into it at an angle.
         if z['front'] > GAP_MIN_FRONT:
             steer, found = self.pick_gap(ranges, msg.angle_min,
-                                         msg.angle_increment)
+                                         msg.angle_increment, prefer)
             if found:
-                if steer == 0.0:
+                if cover and abs(steer * GAP_STEER_FULL_DEG - prefer) \
+                        <= GAP_STEP_DEG / 2.0:
+                    # COVER, and the way the route wants is clear: follow
+                    # the route exactly, at the speed it asks for.
+                    self.set_cmd(min(self.cruise_speed(), self.route_cap),
+                                 self.route_steer)
+                elif steer == 0.0 and not cover:
                     # Straight ahead fits: ordinary cruising, full speed.
                     self.set_cmd(self.cruise_speed(), 0.0)
                 else:
@@ -691,6 +885,11 @@ class AGVControl(Node):
             self.is_avoiding = True
             threading.Thread(target=self.avoid, args=(dict(z),),
                              daemon=True).start()
+        elif cover:
+            # No gap search ran (something within GAP_MIN_FRONT, but not
+            # tripping the front zone) -- follow the route, carefully.
+            self.set_cmd(min(self.cruise_speed(), self.route_cap, GAP_SPEED),
+                         self.route_steer)
         else:
             # cruise forward, centered -- at reduced speed if the camera
             # currently sees an obstacle (avoid() speeds are left alone:
@@ -735,7 +934,14 @@ class AGVControl(Node):
         dist = self.zones[closest]
         # DANGER tracks the active profile's trigger, so red still means
         # "this is where it reacts" in either environment.
-        if dist < self.prof['front']:
+        #
+        # prof['front'] is a BUMPER clearance; zones are /scan distances from
+        # the centre-mounted lidar, so the overhang must be added -- exactly
+        # as the trigger itself does. From 2026-10-09 (when clearances became
+        # bumper-relative) until 2026-10-19 this compared them directly, so
+        # DANGER needed something within 0.30m of the LIDAR -- inside the
+        # robot's own body -- and effectively never showed.
+        if dist < OVERHANG_FWD + self.prof['front']:
             level = "DANGER"
         elif dist < self.prof['caution']:
             level = "CAUTION"
@@ -760,7 +966,13 @@ class AGVControl(Node):
                 self.get_logger().info("path clear again -- resuming")
 
         m = String()
-        if level == "CLEAR":
+        if self.fence_blocked:
+            # Stop line ahead, obstacle behind. "BLOCKED" in the 4th field is
+            # what the installed app shows as NO PATH; the 5th says why, for
+            # a rebuilt app, and older builds ignore it.
+            lvl = level if level != "CLEAR" else "CAUTION"
+            m.data = f"{lvl}|{closest}|{dist:.2f}|BLOCKED|FENCE"
+        elif level == "CLEAR":
             m.data = "CLEAR"
         else:
             m.data = f"{level}|{closest}|{dist:.2f}" + ("|BLOCKED" if blocked else "")
@@ -802,11 +1014,11 @@ class AGVControl(Node):
         for the next 10Hz tick -- up to 100ms of reversing into whatever
         was just seen."""
         self.set_cmd(0.0, 0.0)
-        if self.mode == "AUTO":
+        if self.mode in DRIVE_MODES:
             self.pub.publish(self.cmd)
 
     # ----------------------- gap seeking -----------------------
-    def pick_gap(self, ranges, angle_min, angle_increment):
+    def pick_gap(self, ranges, angle_min, angle_increment, prefer_deg=0.0):
         """Find a heading the robot physically fits through.
 
         Returns (steer, found). steer is in the same -1..+1 units as
@@ -846,12 +1058,18 @@ class AGVControl(Node):
         # course change. Within a tie the side of the LAST gap is tried
         # first: without that, two symmetric gaps would have the robot
         # flip-flopping between them scan to scan.
+        #
+        # Ordered around prefer_deg: 0 in AUTO (straight ahead -- exactly the
+        # original order), the route's direction in COVER, so the gap chosen
+        # is the one that costs the least deviation FROM THE ROUTE.
         first_sign = 1.0 if self._gap_sign >= 0 else -1.0
-        cands = [0.0]
+        base = round(prefer_deg / GAP_STEP_DEG) * GAP_STEP_DEG
+        cands = [base] if abs(base) <= GAP_ARC_DEG else []
         d = GAP_STEP_DEG
-        while d <= GAP_ARC_DEG:
-            cands.append(first_sign * d)
-            cands.append(-first_sign * d)
+        while d <= 2 * GAP_ARC_DEG:
+            for c in (base + first_sign * d, base - first_sign * d):
+                if abs(c) <= GAP_ARC_DEG:
+                    cands.append(c)
             d += GAP_STEP_DEG
 
         for cand in cands:
@@ -946,14 +1164,14 @@ class AGVControl(Node):
         # the body, after the stop above -- not from the trigger snapshot,
         # which is now 0.8s old and never covered the rear corners.
         rear = self.rear_clearance()
-        if (self.mode == "AUTO" and rear is not None
+        if (self.mode in DRIVE_MODES and rear is not None
                 and rear > self.prof['rear']):
             self.publish_action("REVERSING")
             speed = REV_SPEED_ESCALATED if grow > 1.0 else REV_SPEED
             self.set_cmd(-speed, 0.0)
             # Watched, not slept: see "Reversing safely".
             end = time.time() + REVERSE_TIME * grow
-            while time.time() < end and self.mode == "AUTO":
+            while time.time() < end and self.mode in DRIVE_MODES:
                 gap = self.rear_clearance()
                 if gap is None:
                     log.warn("scan stale while reversing -- stopping")
@@ -966,7 +1184,7 @@ class AGVControl(Node):
             self.publish_action("STOPPING")
             self._stop_now()
             time.sleep(STOP_AFTER_REVERSE)
-        elif self.mode == "AUTO":
+        elif self.mode in DRIVE_MODES:
             log.info("not reversing: "
                      + ("no fresh scan" if rear is None
                         else f"only {rear:.2f}m behind the bumper"))
@@ -974,7 +1192,7 @@ class AGVControl(Node):
         log.info(f"going {'LEFT' if steer > 0 else 'RIGHT'} around it"
                  f"{f' (attempt {repeats + 1})' if repeats else ''}")
 
-        if self.mode == "AUTO":
+        if self.mode in DRIVE_MODES:
             # "AVOIDING" rather than naming the turn direction: which way it
             # swings is a detail of the maneuver, and the operator wants to
             # know the robot is handling an obstacle, not read a steering
@@ -993,6 +1211,148 @@ class AGVControl(Node):
         self._last_turn_end = time.time()
         self.is_avoiding = False
         log.info("resume")
+
+    # ----------------------- fence recovery (thread) -----------------------
+    def _back_inside(self, log):
+        """Move in whichever direction fence_node says heads back in --
+        reverse straight, or forward steering inward -- until the robot is
+        FENCE_BACKOFF_M inside the stop line. Obstacles are respected either
+        way: the rear watch when reversing, the front zone when going
+        forward.
+
+        Returns "ok", "blocked" (an obstacle in the way back in), "stuck"
+        (no progress for FENCE_NO_PROGRESS_S), "fence" (fence went STALE or
+        NOFIX) or "mode" (left AUTO/COVER)."""
+        start = time.time()
+        best_depth, best_time = math.inf, time.time()
+        last_dir = None
+        result = "ok"
+        while True:
+            if self.mode not in DRIVE_MODES:
+                result = "mode"
+                break
+            f = self.fence_now()
+            if f in ("STALE", "NOFIX"):
+                result = "fence"
+                break
+            if f == "OFF" or (f == "IN" and self.fence_margin >= FENCE_BACKOFF_M):
+                break
+            if time.time() - start > FENCE_REVERSE_MAX_S:
+                log.warn("could not get back inside the stop line in time")
+                result = "stuck"
+                break
+            # progress = getting shallower; IN counts as depth < 0
+            depth = (self.fence_depth if f in ("LINE", "OUT")
+                     and self.fence_depth is not None else -self.fence_margin)
+            if depth < best_depth - 0.2:
+                best_depth, best_time = depth, time.time()
+            elif time.time() - best_time > FENCE_NO_PROGRESS_S:
+                result = "stuck"
+                break
+            # Which way is in -- re-read every step: it can change as the
+            # heading estimate rebuilds.
+            forward = f in ("LINE", "OUT") and self.fence_allow == "F"
+            if f == "IN":
+                forward = last_dir == "F"     # keep going the way that worked
+            if forward:
+                z = self.zones
+                if z['front'] < OVERHANG_FWD + self.prof['front']:
+                    result = "blocked"
+                    break
+                steer = {"L": +1.0, "R": -1.0}.get(self.fence_turn, 0.0)
+                if last_dir != "F":
+                    self.publish_action("TURNING IN")
+                self.set_cmd(min(TURN_SPEED, REV_SPEED_ESCALATED), steer)
+                last_dir = "F"
+            else:
+                gap = self.rear_clearance()
+                if gap is None or gap < REVERSE_STOP_GAP:
+                    result = "blocked"
+                    break
+                if last_dir != "R":
+                    self.publish_action("REVERSING")
+                self.set_cmd(-REV_SPEED_ESCALATED, 0.0)
+                last_dir = "R"
+            time.sleep(REVERSE_POLL)
+        self.publish_action("STOPPING")
+        self._stop_now()
+        time.sleep(STOP_AFTER_REVERSE)
+        return result
+
+    def fence_recover(self, turn):
+        """At the stop line: stop, get back inside, turn in. See FENCE
+        RECOVERY. If the way back in is blocked, or not working, hold and
+        report rather than keep pushing."""
+        log = self.get_logger()
+        log.warn(f"FIELD BOUNDARY -- stop line reached, recovering "
+                 f"(back in by {'driving forward' if self.fence_allow == 'F' else 'reversing'})")
+        self.publish_action("BOUNDARY")
+        self._stop_now()
+        time.sleep(STOP_BEFORE_REVERSE)
+
+        result = "ok"
+        if self.mode in DRIVE_MODES and self.fence_now() in ("LINE", "OUT"):
+            result = self._back_inside(log)
+
+        if result in ("blocked", "stuck"):
+            # BOTH BLOCKED: the way out of the band is blocked or not working,
+            # and forward-out is the stop line. Hold at zero, report it the way
+            # NO PATH is reported, until something changes.
+            self.fence_blocked = True
+            self.publish_action("HOLDING")
+            log.warn(f"NO PATH at the field boundary ({result}) -- holding at "
+                     f"zero until the way back in clears")
+            entered = self.fence_now()
+            while self.mode in DRIVE_MODES:
+                f = self.fence_now()
+                if f in ("IN", "OFF"):
+                    break
+                # motor_node's NEVER DEEPER guard is holding it: retrying
+                # cannot help, only a person can. Stay held.
+                if (self.fence_depth is not None and self.fence_band_min
+                        is not None and self.fence_depth
+                        > self.fence_band_min + FENCE_DEPTH_WORSEN_M):
+                    time.sleep(REVERSE_POLL * 4)
+                    continue
+                gap = self.rear_clearance()
+                if (self.fence_allow == "R" and gap is not None
+                        and gap > self.prof['rear']):
+                    break
+                if (self.fence_allow == "F" and self.zones['front']
+                        > OVERHANG_FWD + self.prof['front'] + 0.3):
+                    break
+                time.sleep(REVERSE_POLL * 4)
+            self.fence_blocked = False
+            log.info(f"boundary hold released (was {entered})")
+            self.publish_action("")
+            self.is_avoiding = False
+            return
+
+        # Turn back toward the inside, if a turn is known. Prefer one worked
+        # out now, from the heading the move back in rebuilt, over the one
+        # from before -- it may have been "?". With no heading at all, drive
+        # on: guessing a turn is as likely to aim at the line again, and
+        # reaching it again WITH a heading gives a real answer.
+        if self.fence_turn in ("L", "R"):
+            turn = self.fence_turn
+        if (result == "ok" and turn in ("L", "R")
+                and self.mode in DRIVE_MODES):
+            steer = +1.0 if turn == "L" else -1.0
+            self.publish_action("TURNING IN")
+            self.set_cmd(0.0, steer)          # settle the steering first
+            time.sleep(SETTLE_TIME)
+            self.set_cmd(TURN_SPEED, steer)
+            end = time.time() + FENCE_TURN_MAX_S
+            while (time.time() < end and self.mode in DRIVE_MODES
+                   and self.fence_now() == "IN"):
+                time.sleep(REVERSE_POLL)
+            self._stop_now()
+        elif result != "ok":
+            log.warn(f"boundary recovery stopped early ({result})")
+
+        self.publish_action("")
+        self.is_avoiding = False
+        log.info("boundary recovery done -- resuming")
 
 
 def main(args=None):
