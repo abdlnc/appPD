@@ -19,8 +19,9 @@ picks up anything new. Nothing is deleted and no pixels are touched -- the
 only change is the tag added to each name. Every --apply writes a manifest
 of old -> new names beside the photos, which --undo reverses exactly.
 
-The preprocessing is imported from soil_camera_node rather than copied, so
-this cannot drift from what the live node does. That matters here more than
+The model loading AND classification are imported from soil_camera_node
+rather than copied, so this cannot drift from what the live node does --
+including which model (FIELD_MODEL_PATH) it uses. That matters here more than
 most places: the live node fed the model the wrong pixel scale for weeks and
 it called everything soil. Checked before writing this: the time and GPS
 text burned into the bottom of each photo does not change the verdict --
@@ -38,9 +39,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.expanduser("~"))
 try:
-    from soil_camera_node import (CAPTURE_DIR, FIELD_INPUT_SIZE, FIELD_LABELS,
-                                  FIELD_MODEL_PATH, FIELD_SCALE_0_1,
-                                  SOIL_CLASS_TAG)
+    from soil_camera_node import (CAPTURE_DIR, FIELD_MODEL_PATH,
+                                  SOIL_CLASS_TAG, classify_frame,
+                                  load_field_model)
 except ImportError as e:
     sys.exit(f"cannot import soil_camera_node ({e}) -- run inside the "
              f"ros2_humble environment")
@@ -49,25 +50,12 @@ TAG_PREFIX = "_cls-"
 
 
 def load_model():
-    from ai_edge_litert.interpreter import Interpreter
-    it = Interpreter(model_path=FIELD_MODEL_PATH)
-    it.allocate_tensors()
-    return it
+    return load_field_model()
 
 
-def classify(it, img):
-    """Exactly soil_camera_node.classify_field's preprocessing."""
-    inp = it.get_input_details()[0]
-    out = it.get_output_details()[0]
-    x = cv2.resize(img, (FIELD_INPUT_SIZE, FIELD_INPUT_SIZE))
-    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32)
-    if FIELD_SCALE_0_1:
-        x /= 255.0
-    it.set_tensor(inp['index'], x[None, ...])
-    it.invoke()
-    probs = it.get_tensor(out['index']).ravel()
-    idx = int(np.argmax(probs))
-    return FIELD_LABELS[idx], float(probs[idx])
+def classify(model, img):
+    """Exactly soil_camera_node's classification -- the same function."""
+    return classify_frame(model, img)
 
 
 def tagged_name(name, tag):

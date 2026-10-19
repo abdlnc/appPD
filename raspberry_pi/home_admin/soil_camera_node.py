@@ -86,7 +86,22 @@ SESSION_ID        = datetime.now().strftime("%Y%m%d-%H%M")
 # ("FULLY_CONNECTED version 12"). Install it with numpy pinned --
 #     pip install ai-edge-litert "numpy<2"
 # -- because unpinned it pulls numpy 2, which breaks ROS2, OpenCV and Torch.
-FIELD_MODEL_PATH = os.path.expanduser("~/agv_models/agv_field_classifier.tflite")
+# 2026-10-19: switched to the PyTorch (TorchScript) model on request. The
+# TFLite model is kept beside it -- to go back, point this at
+# agv_field_classifier.tflite; the backend follows the file extension.
+#
+# KNOWN BEHAVIOUR OF THE .pt, measured before switching: it does not separate
+# field ground from indoor scenes. On 40 field-trip photos and 40 bench
+# photos, checked by eye, it gives P(supported) about 0.10 on field ground
+# and 0.07 indoors, so nearly every soil photo is classified UNSUPPORTED --
+# tagged "_cls-notsoil" (hidden from the app's SOIL tab) and showing the
+# UNSUPPORTED FIELD TYPE warning almost all the time. No input format fixes
+# that: every size, scaling and channel order tried scored 50-60% on that
+# set, where the TFLite model scores 76% (98% on field ground). The input
+# used here is the one the model's own graph asks for -- it contains Keras'
+# MobileNetV3 rescaling layer, so raw 0-255 RGB, like the TFLite -- and the
+# conversion (Keras -> ONNX -> onnx2torch) is the likely culprit.
+FIELD_MODEL_PATH = os.path.expanduser("~/agv_models/agv_field_classifier.pt")
 FIELD_INPUT_SIZE = 224
 # Feed RAW 0-255 pixels. The model normalises them itself.
 #
@@ -164,6 +179,47 @@ CAPTURE_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 STAMP_SCALE     = 0.5
 STAMP_THICKNESS = 1
 STAMP_MARGIN    = 8         # px from the bottom-left corner
+
+
+def load_field_model(path=None):
+    """Load the field classifier: TorchScript for .pt, TFLite otherwise.
+    Module-level, not a method, so ~/soil_backfill_classify.py classifies
+    archived photos with EXACTLY the same code as live ones."""
+    path = path or FIELD_MODEL_PATH
+    if path.endswith(".pt"):
+        import torch
+        # One thread: this runs once a minute, and the front camera's YOLO
+        # model needs the cores far more.
+        torch.set_num_threads(1)
+        m = torch.jit.load(path, map_location="cpu").eval()
+        return ("torch", m)
+    from ai_edge_litert.interpreter import Interpreter
+    it = Interpreter(model_path=path)
+    it.allocate_tensors()
+    return ("tflite", it)
+
+
+def classify_frame(model, frame):
+    """(label, confidence) for one BGR frame. Both models take RGB 224x224
+    at raw 0-255 (they rescale internally); the .pt wants it channel-first."""
+    kind, m = model
+    x = cv2.resize(frame, (FIELD_INPUT_SIZE, FIELD_INPUT_SIZE))
+    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32)
+    if FIELD_SCALE_0_1:
+        x /= 255.0
+    if kind == "torch":
+        import torch
+        with torch.no_grad():
+            t = torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1)[None]))
+            probs = m(t).numpy().ravel()
+    else:
+        inp = m.get_input_details()[0]
+        out = m.get_output_details()[0]
+        m.set_tensor(inp['index'], x[None, ...])
+        m.invoke()
+        probs = m.get_tensor(out['index']).ravel()
+    idx = int(np.argmax(probs))
+    return FIELD_LABELS[idx], float(probs[idx])
 
 
 class SoilCameraNode(Node):
@@ -269,12 +325,10 @@ class SoilCameraNode(Node):
 
     def _load_field_model(self):
         try:
-            from ai_edge_litert.interpreter import Interpreter
-            it = Interpreter(model_path=FIELD_MODEL_PATH)
-            it.allocate_tensors()
+            model = load_field_model()
             self.get_logger().info(
                 f"Field classifier loaded: {os.path.basename(FIELD_MODEL_PATH)}")
-            return it
+            return model
         except Exception as e:
             self.get_logger().warn(
                 f"Field classifier unavailable ({type(e).__name__}: {e}) -- "
@@ -286,17 +340,7 @@ class SoilCameraNode(Node):
         if self.field is None:
             return None, 0.0
         try:
-            inp = self.field.get_input_details()[0]
-            out = self.field.get_output_details()[0]
-            x = cv2.resize(frame, (FIELD_INPUT_SIZE, FIELD_INPUT_SIZE))
-            x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32)
-            if FIELD_SCALE_0_1:
-                x /= 255.0
-            self.field.set_tensor(inp['index'], x[None, ...])
-            self.field.invoke()
-            probs = self.field.get_tensor(out['index']).ravel()
-            idx = int(np.argmax(probs))
-            return FIELD_LABELS[idx], float(probs[idx])
+            return classify_frame(self.field, frame)
         except Exception as e:
             self.get_logger().warn(f"Field classification failed: {e}")
             return None, 0.0
