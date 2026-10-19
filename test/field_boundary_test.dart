@@ -171,6 +171,31 @@ void main() {
       expect(v.done, isFalse);
     });
 
+    test('V: driving back to the start', () {
+      final v = CoverStatus.parse('{"phase":"RETURN","lane":5,"lanes":5,'
+          '"coverage":88.0,"overlap":9.0,"active":true,"home_m":23.4,'
+          '"note":""}')!;
+      expect(v.returning, isTrue);
+      expect(v.done, isFalse);
+      expect(v.homeM, 23.4);
+    });
+
+    test('V: finished, with how it ended', () {
+      final v = CoverStatus.parse('{"phase":"DONE","lane":5,"lanes":5,'
+          '"coverage":88.0,"overlap":9.0,"active":true,"home_m":null,'
+          '"note":"coverage complete, back at the start"}')!;
+      expect(v.done, isTrue);
+      expect(v.homeM, isNull);
+      expect(v.note, contains('back at the start'));
+    });
+
+    test('V: an older robot without the new fields still parses', () {
+      final v = CoverStatus.parse('{"phase":"DONE","lane":5,"lanes":5,'
+          '"coverage":88.0,"overlap":9.0,"active":false}')!;
+      expect(v.homeM, isNull);
+      expect(v.note, '');
+    });
+
     test('garbage is ignored, not thrown', () {
       expect(FieldBoundary.parse('not json'), isNull);
       expect(CoverPlan.parse('[1,2]'), isNull);

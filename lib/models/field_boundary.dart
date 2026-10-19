@@ -306,11 +306,17 @@ class CoverPlan {
 
 /// What the robot reports on "V:" -- COVER's progress.
 class CoverStatus {
-  final String phase; // ACQUIRE LANE TURN FILL DONE NOPLAN
+  final String phase; // ACQUIRE LANE TURN FILL RETURN DONE NOPLAN
   final int lane, lanes;
   final double coverage, overlap;
   final bool active;
   final String error;
+
+  /// Metres left to the start point, while driving back (RETURN).
+  final double? homeM;
+
+  /// How the run ended, e.g. "coverage complete, back at the start".
+  final String note;
   const CoverStatus(
       {required this.phase,
       required this.lane,
@@ -318,9 +324,12 @@ class CoverStatus {
       required this.coverage,
       required this.overlap,
       required this.active,
-      required this.error});
+      required this.error,
+      this.homeM,
+      this.note = ''});
 
   bool get done => phase == 'DONE';
+  bool get returning => phase == 'RETURN';
 
   static CoverStatus? parse(String json) {
     try {
@@ -334,6 +343,8 @@ class CoverStatus {
         overlap: (d['overlap'] as num?)?.toDouble() ?? 0,
         active: d['active'] == true,
         error: (d['error'] as String?) ?? '',
+        homeM: (d['home_m'] as num?)?.toDouble(),
+        note: (d['note'] as String?) ?? '',
       );
     } catch (_) {
       return null;

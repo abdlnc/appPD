@@ -46,6 +46,40 @@ perfect GPS on an 80 x 40 m field. A headland lap round that strip was
 tried and removed -- running parallel to the line, it tripped the fence at
 every corner. It is the price of a fence that holds with +/-2.5 m GPS.
 
+RETURN TO START. When the fill-in pass is done the robot drives back to
+where COVER first started (the first GPS fix of the run) and stops there.
+Same pure-pursuit steering, same obstacle avoidance and fence as the rest
+of COVER -- it is just one more target. Three things shape it:
+  * The target is kept RETURN_EDGE_M inside the stop line
+    (field_geometry.point_well_inside). A start at the field's edge, or
+    outside the stop line, is moved in to the nearest such point: the fence
+    will not let it drive onto the line, so aiming there would end in a
+    boundary recovery, not an arrival.
+  * GPS decides "arrived", so it gets back only as close as GPS allows --
+    within HOME_RADIUS_M of where the GPS SAYS the start is, which with the
+    receiver measured on 2026-10-19 could be several metres from the real
+    spot. Passing the start and then moving away also counts as arrived:
+    with a drifting fix it would otherwise circle the point.
+  * The start is often BEHIND it when coverage ends, and pursuit cannot
+    turn round: aimed behind, sin(a) ~ 0 and it drives almost straight
+    away. Full lock does not work either: the heading comes from positions
+    5 m apart and a full-lock circle is only ~9 m round, so mid-turn the
+    heading is meaningless -- in simulation the robot circled for minutes.
+    A timed full-lock U-turn undershot (the heading it was timed from lags)
+    and its straight run afterwards hit the stop line. What works: a start
+    more than RETURN_UTURN_DEG off turns on a RETURN_TURN_RADIUS_M circle,
+    wide enough that the 5 m heading stays usable (it lags ~30 deg there),
+    until the start is ahead enough for pursuit to take over. It turns to
+    whichever side the circle FITS inside the stop line (the start's side
+    if both do), and keeps that side until the turn is done: on an outer
+    lane, a 10 m circle toward the near edge crosses the stop line, and in
+    simulation the boundary recoveries that followed ate the time allowance.
+  * It gives up after RETURN_TIMEOUT -- blocked by an obstacle, or an
+    L-shaped field putting the boundary in the straight-line way -- and
+    stops where it is, saying so. Never a drive with no end.
+A STOP mid-return resumes the return; the start point is saved with the
+rest of the progress, so it is the ORIGINAL start, not where it resumed.
+
 RESUME. to_dict()/load_dict() carry the lane, the phase and the grid, so a
 STOP or E-stop mid-field resumes from the current lane, not from the start.
 """
@@ -115,7 +149,32 @@ CREEP_CAP = 0.40            # building a heading -- nav_node's TURN_SPEED.
 CRUISE_SPEED_MPS = 0.6
 SOIL_INTERVAL_S = 60.0      # objective 1.3: one soil photo a minute
 
+# ---------------------------------------------------------------- return
+RETURN_TO_START = True      # False: stop wherever coverage finishes
+RETURN_CAP = FILL_CAP
+# The start point is moved at least this far inside the stop line -- the
+# same clearance the fill-in pass keeps, for the same reason (FILL_EDGE_M).
+RETURN_EDGE_M = FILL_EDGE_M
+HOME_RADIUS_M = WAYPOINT_RADIUS_M   # this close (by GPS) = back at the start
+# Within HOME_NEAR_M, getting HOME_PASSED_M further away than the closest
+# it has been means it went past: call that arrived rather than loop round
+# for a point GPS drift may have moved.
+HOME_NEAR_M = HOME_RADIUS_M + 1.5
+HOME_PASSED_M = 1.5
+# Time allowed for the drive back: RETURN_SLACK x the straight-line time at
+# cruise speed, and never less than RETURN_MIN_S. Generous on purpose --
+# detours and fence recoveries take time; this only catches a robot that
+# can no longer get there.
+RETURN_SLACK = 4.0
+RETURN_MIN_S = 180.0
+# Start further off the nose than this: turn round first, on a circle of
+# RETURN_TURN_RADIUS_M (see RETURN TO START). Steering for that circle is
+# full lock x (turning radius / this), so it follows the TODO measurement.
+RETURN_UTURN_DEG = 90.0
+RETURN_TURN_RADIUS_M = 5.0
+
 ACQUIRE, LANE, TURN, FILL, DONE = "ACQUIRE", "LANE", "TURN", "FILL", "DONE"
+RETURN = "RETURN"
 
 
 class CoveragePlan:
@@ -222,6 +281,13 @@ class CoverageFollower:
         self.started = False           # chose which end to start from
         self.last = None               # last position, for painting coverage
         self.resume_phase = LANE
+        self.home = None               # first fix of the run: where it started
+        self.home_target = None        # home, moved well inside (RETURN)
+        self.return_until = None       # RETURN gives up after this time
+        self.return_best = math.inf    # closest it has got to home_target
+        self.pos = None                # latest position, for status
+        self.done_why = ""             # how the run ended, for the app
+        self.turn_side = None          # RETURN turn-round: +1 left, -1 right
 
     # --------------------------------------------------------- persistence
     def to_dict(self):
@@ -230,6 +296,8 @@ class CoverageFollower:
                 "lane": self.lane, "wp": self.wp,
                 "fill_done": self.fill_done,
                 "reversed": getattr(self, "is_reversed", False),
+                "home": list(self.home) if self.home is not None else None,
+                "done_why": self.done_why,
                 "grid": self.grid.to_dict()}
 
     def load_dict(self, d):
@@ -240,8 +308,12 @@ class CoverageFollower:
         self.wp = int(d.get("wp", 0))
         self.fill_done = int(d.get("fill_done", 0))
         self.grid.load_dict(d.get("grid", {}))
+        h = d.get("home")
+        self.home = tuple(h) if h else None    # older saves: set at next fix
+        self.done_why = d.get("done_why", "")
         ph = d.get("phase", LANE)
-        self.resume_phase = ph if ph in (LANE, TURN, FILL, DONE) else LANE
+        self.resume_phase = ph if ph in (LANE, TURN, FILL, RETURN, DONE) \
+            else LANE
         self.phase = ACQUIRE if self.resume_phase != DONE else DONE
         self.started = True
 
@@ -250,6 +322,9 @@ class CoverageFollower:
         heading before trusting it, and paint no coverage across the gap."""
         self.track.reset()
         self.last = None
+        self.return_until = None       # a fresh time allowance on resume
+        self.turn_side = None
+        self.return_best = math.inf
         if self.phase not in (DONE, ACQUIRE):
             self.resume_phase = self.phase
             self.phase = ACQUIRE
@@ -261,7 +336,11 @@ class CoverageFollower:
                 "lanes": len(self.plan.lanes),
                 "coverage": round(self.grid.coverage_pct(), 1),
                 "overlap": round(self.grid.overlap_pct(), 1),
-                "fill_done": self.fill_done}
+                "fill_done": self.fill_done,
+                "home_m": (round(math.dist(self.pos, self.home_target), 1)
+                           if self.phase == RETURN and self.pos is not None
+                           and self.home_target is not None else None),
+                "note": self.done_why}
 
     # --------------------------------------------------------- update
     def _paint(self, p, lane_id):
@@ -271,6 +350,70 @@ class CoverageFollower:
                     fg.point_in_polygon(self.last, self.plan.inset_poly)):
                 self.grid.mark_segment(self.last, p, lane_id)
         self.last = p
+
+    def _coverage_finished(self, p):
+        """After the fill-in pass: head back to the start, or stop here."""
+        if RETURN_TO_START and self.home is not None:
+            self.home_target = fg.point_well_inside(
+                self.home, self.plan.inset_poly, RETURN_EDGE_M)
+            if self.home_target is None:
+                return self._finish("coverage complete -- the field is too "
+                                    "small to drive back to the start safely")
+            if math.dist(p, self.home_target) > HOME_RADIUS_M:
+                self.phase = RETURN
+                self.return_until = None
+                self.return_best = math.inf
+                return None
+            return self._finish("coverage complete, back at the start")
+        return self._finish("coverage complete")
+
+    def _return_check(self, t, p):
+        """RETURN: ("HOLD", why) once home or out of time, else None."""
+        if self.home_target is None:              # resumed into RETURN
+            self.home_target = fg.point_well_inside(
+                self.home, self.plan.inset_poly, RETURN_EDGE_M)
+            if self.home_target is None:
+                return self._finish("coverage complete -- the field is too "
+                                    "small to drive back to the start safely")
+        d = math.dist(p, self.home_target)
+        if self.return_until is None:
+            allow = RETURN_SLACK * d / max(CRUISE_SPEED_MPS, 0.1)
+            self.return_until = t + max(RETURN_MIN_S, allow)
+        self.return_best = min(self.return_best, d)
+        if d <= HOME_RADIUS_M:
+            return self._finish("coverage complete, back at the start")
+        if self.return_best <= HOME_NEAR_M and \
+                d >= self.return_best + HOME_PASSED_M:
+            return self._finish(
+                f"coverage complete, back at the start (passed within "
+                f"{self.return_best:.1f} m by GPS)")
+        if t > self.return_until:
+            return self._finish(
+                f"coverage complete, but could not get back to the start "
+                f"-- stopped {d:.0f} m short")
+        return None
+
+    def _turn_side(self, p, h, a):
+        """Which way to turn round for the start: +1 left, -1 right. The
+        start's side if its circle fits inside the stop line, else the side
+        that fits, else the side with more room."""
+        toward = -1 if a > 0 else 1                   # + a = start to the RIGHT
+        room = {}
+        for side in (toward, -toward):
+            b = math.radians(h - 90.0 * side)         # compass: left = h - 90
+            c = (p[0] + RETURN_TURN_RADIUS_M * math.sin(b),
+                 p[1] + RETURN_TURN_RADIUS_M * math.cos(b))
+            d = fg.dist_to_boundary(c, self.plan.inset_poly)
+            room[side] = d if fg.point_in_polygon(c, self.plan.inset_poly) \
+                else -d
+            if room[side] >= RETURN_TURN_RADIUS_M:
+                return side
+        return max(room, key=room.get)
+
+    def _finish(self, why):
+        self.phase = DONE
+        self.done_why = why
+        return ("HOLD", why)
 
     def _go_to(self, p, h, target, cap):
         return ("GO", fg.pursuit_steer(p, h, target, TURN_DIAMETER_M / 2.0),
@@ -283,6 +426,9 @@ class CoverageFollower:
         if p is None:
             self.last = None
             return ("HOLD", "no GPS fix")
+        self.pos = p
+        if self.home is None:
+            self.home = tuple(p)         # where this run started
         self.track.feed(t, p[0], p[1], direction)
         h = self.track.heading()
 
@@ -296,7 +442,16 @@ class CoverageFollower:
             self.started = True
 
         if self.phase == DONE:
-            return ("HOLD", "coverage complete")
+            return ("HOLD", self.done_why or "coverage complete")
+
+        if self.phase == RETURN or (self.phase == ACQUIRE and
+                                    self.resume_phase == RETURN):
+            # Arrived or out of time is decided by position alone -- before
+            # the heading check, so creeping to rebuild a heading cannot
+            # carry it past the start or past its time allowance.
+            done = self._return_check(t, p)
+            if done is not None:
+                return done
 
         if h is None:
             # No heading yet: creep straight to build one (as nav_node does).
@@ -355,10 +510,36 @@ class CoverageFollower:
                           fg.dist_to_boundary(m, self.plan.inset_poly)
                           >= FILL_EDGE_M]
                 if not missed or self.fill_done >= FILL_MAX_POINTS:
-                    self.phase = DONE
-                    return ("HOLD", "coverage complete")
+                    self.fill_target = None
+                    fin = self._coverage_finished(p)
+                    return fin if fin is not None else \
+                        self.update(t, p, direction)
                 self.fill_target = min(missed, key=lambda m: math.dist(p, m))
                 self.fill_since = t
             return self._go_to(p, h, self.fill_target, FILL_CAP)
+
+        if self.phase == RETURN:
+            # Transit, not coverage: nothing painted (it would only add to
+            # the overlap figure). Arrival and time-out were checked above.
+            self.last = None
+            # Aim LOOKAHEAD_M along the straight line home, not at home
+            # itself: pursuit's gain falls with distance, and aimed at a
+            # start 30 m off it drove arcs so wide (in simulation, perfect
+            # GPS) they ran into the stop line again and again. Re-aimed
+            # from wherever it is each fix, so after a detour or a boundary
+            # recovery it takes the shortest way, not back to an old line.
+            hx, hy = self.home_target
+            a = fg.norm180(fg.bearing_xy(hx - p[0], hy - p[1]) - h)
+            if abs(a) > RETURN_UTURN_DEG:
+                if self.turn_side is None:
+                    self.turn_side = self._turn_side(p, h, a)
+                s = min(1.0, TURN_DIAMETER_M / 2.0 / RETURN_TURN_RADIUS_M)
+                return ("GO", s * self.turn_side, RETURN_CAP)
+            self.turn_side = None
+            d = math.dist(p, self.home_target)
+            k = min(1.0, LOOKAHEAD_M / d)
+            aim = (p[0] + (hx - p[0]) * k, p[1] + (hy - p[1]) * k)
+            return ("GO", fg.pursuit_steer(p, h, aim, TURN_DIAMETER_M / 2.0),
+                    RETURN_CAP)
 
         return ("HOLD", f"unknown phase {self.phase}")

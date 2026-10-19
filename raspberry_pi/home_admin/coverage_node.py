@@ -25,6 +25,11 @@ FAIL SAFE. Anything it cannot vouch for is a HOLD: no boundary, a boundary
 the lanes cannot be planned in, no GPS fix, a GPS that has gone quiet. And
 control_node treats a HOLD -- or silence from this node -- as stop.
 
+RETURN TO START. After the last lane and the fill-in pass the planner
+drives back to where the run started, then holds (coverage_planner.py,
+RETURN TO START). The phase goes RETURN, then DONE; /cover_status carries
+"home_m" (metres to go) while returning and "note" (how it ended) after.
+
 RESUME. Progress is saved to ~/agv_coverage_state.json, keyed to the
 boundary it was made in. Leaving COVER (STOP, an emergency stop, the phone
 dropping) saves it; starting COVER again resumes from the same lane. A
@@ -215,7 +220,17 @@ class CoverageNode(Node):
             pos = None
         if pos is not None:
             self.gps_time = time.time()
+        was = self.follower.phase
         self.last_cmd = self.follower.update(time.time(), pos, self.direction)
+        now = self.follower.phase
+        if now != was and (now == cp.DONE or
+                           (now == cp.RETURN and was == cp.FILL)):
+            if now == cp.RETURN:
+                self.get_logger().info(
+                    "COVER: field covered -- driving back to the start")
+            else:
+                self.get_logger().info(f"COVER: {self.follower.done_why}")
+            self._save()
         if time.time() - self._saved_at > SAVE_EVERY_S:
             self._save()
 

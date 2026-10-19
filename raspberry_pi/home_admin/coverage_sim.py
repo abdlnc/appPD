@@ -73,6 +73,8 @@ def run(args, rng):
 
     # start just inside a corner, facing along the long axis
     x, y = 6.0, 6.0
+    start_true = (x, y)
+    return_t0 = None             # when the drive back to the start began
     hdg = 90.0 - math.degrees(plan.angle)       # compass from math angle
     steer = 0.0
     ex = ey = 0.0
@@ -111,6 +113,8 @@ def run(args, rng):
             fence_track.feed(t, gps[0], gps[1], direction)
             if recov is None:
                 cmd = f.update(t, gps, direction)
+                if f.phase == cp.RETURN and return_t0 is None:
+                    return_t0 = t
                 if f.phase == cp.DONE:
                     break
 
@@ -238,6 +242,14 @@ def run(args, rng):
         "retries": retries,
         "deeper_blocks": deeper_blocks,
         "held_at_end": recov is not None and recov.get("ph") == "HOLD",
+        "end_note": f.done_why,
+        "return_min": ((t - return_t0) / 60.0 if return_t0 is not None
+                       else 0.0),
+        # TRUE distances at the end: to where it really started, and to the
+        # point it aimed for (the start moved well inside the stop line)
+        "home_err_m": math.dist((x, y), start_true),
+        "target_err_m": (math.dist((x, y), f.home_target)
+                         if f.home_target is not None else None),
     }
     return plan, (res, path_true, path_gps, f)
 
@@ -309,7 +321,8 @@ def main():
             print(f"  seed {sd:2d}: {'done' if r['done'] else r['phase']:7s} "
                   f"actual {r['actual_cov']:5.1f}%  trips {r['fence_trips']:3d}  "
                   f"xte95 {r['xte_p95']:5.2f} m  past boundary "
-                  f"{r['worst_out_m']:.2f} m")
+                  f"{r['worst_out_m']:.2f} m  ends {r['home_err_m']:5.1f} m "
+                  f"from start")
         n = len(rows)
         fin = sum(r["done"] for r in rows)
         out_max = max(r["worst_out_m"] for r in rows)
@@ -327,6 +340,12 @@ def main():
         print(f"  stop-line trips   total {sum(r['fence_trips'] for r in rows)}, "
               f"held {sum(r['holds'] for r in rows)}x for "
               f"{sum(r['hold_min'] for r in rows):.1f} min in all")
+        tgt = [r["target_err_m"] for r in rows
+               if r["done"] and r["target_err_m"] is not None]
+        if tgt:
+            print(f"  back at the start  {sum('back at the start' in r['end_note'] for r in rows)}/{n};"
+                  f" true distance from the return point median "
+                  f"{sorted(tgt)[len(tgt)//2]:.1f} m, worst {max(tgt):.1f} m")
         print(f"  WORST distance past the BOUNDARY: {out_max:.2f} m"
               f"   {'<- MUST BE 0' if out_max > 0 else '(never crossed)'}")
         return
@@ -357,6 +376,14 @@ def main():
           f"{res['retries']} retried, {res['holds']} hold(s){' (HELD at the end)' if res['held_at_end'] else ''}, "
           f"never-deeper guard fired {res['deeper_blocks']}x")
     print(f"      robot got {res['worst_out_m']:.2f} m past the BOUNDARY at worst")
+    if res["end_note"]:
+        tgt = res["target_err_m"]
+        print(f"      end: {res['end_note']}")
+        print(f"      drive back took {res['return_min']:.1f} min; really "
+              f"{res['home_err_m']:.1f} m from where it started"
+              + (f", {tgt:.1f} m from the return point "
+                 f"({f.home_target[0]:.1f}, {f.home_target[1]:.1f})"
+                 if tgt is not None else ""))
     if args.png:
         draw(plan, pt, pg, args.png)
         print("      drawn ->", args.png)

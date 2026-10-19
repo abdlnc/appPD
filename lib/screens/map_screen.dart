@@ -865,8 +865,16 @@ class _MapScreenState extends State<MapScreen> {
     } else if (st == null || plan == null) {
       line = "COVER: waiting for the plan";
     } else if (st.done) {
+      final where = st.note.contains('back at the start')
+          ? ', back at the start'
+          : st.note.contains('could not get back')
+              ? ' -- could not get back to the start'
+              : '';
       line = "COVER complete -- ~${st.coverage.toStringAsFixed(0)}% covered, "
-          "${st.overlap.toStringAsFixed(0)}% driven twice";
+          "${st.overlap.toStringAsFixed(0)}% driven twice$where";
+    } else if (running && st.returning) {
+      line = "Field done -- returning to start"
+          "${st.homeM != null ? ' (${st.homeM!.toStringAsFixed(0)} m to go)' : ''}";
     } else if (running) {
       line = "${st.phase == 'FILL' ? 'Filling gaps' : 'Lane ${st.lane} of ${st.lanes}'}"
           "  \u2022  ~${st.coverage.toStringAsFixed(0)}% covered";

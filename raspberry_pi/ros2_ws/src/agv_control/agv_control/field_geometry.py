@@ -656,6 +656,22 @@ class CoverageGrid:
             self.driven[(i, j)] = set(ids)
 
 
+def point_well_inside(p, poly, margin):
+    """p itself if it is inside poly at least margin from every edge;
+    otherwise the nearest point that is. None if poly is too small to hold
+    any such point.
+
+    Used to turn "where COVER started" into somewhere it can safely drive
+    back to: the start may have been at the edge, or even outside the stop
+    line, and the robot will not drive onto the line on its own."""
+    inner = inset_polygon(poly, margin)
+    if inner is None:
+        return None
+    if point_in_polygon(p, inner):
+        return tuple(p)
+    return tuple(nearest_edge(p, inner)[2])
+
+
 def nearest_neighbour_route(start, pts):
     """Visit every point, always going to the closest unvisited one next.
     Not optimal, but simple, predictable, and good enough for the handful

@@ -19,6 +19,7 @@ source ~/ros2_ws/install/setup.bash
 
 ```bash
 python3 ~/field_geometry_test.py        # boundary, lanes, coverage, dedup maths
+python3 ~/coverage_planner_test.py      # driving back to the start
 python3 ~/fence_enforcement_test.py     # what motor_node lets through at the fence
 python3 ~/gap_seeking_test.py           # AUTO unchanged with no boundary set
 python3 ~/turn_direction_test.py
@@ -114,6 +115,32 @@ Watch progress:
 ros2 topic echo /cover_status    # {"phase":"LANE","lane":2,"lanes":5,"coverage":31.5,...}
 ros2 topic echo /cover_route     # "<steer>,<cap>" or "HOLD|<why>"
 ```
+
+### 6a. The drive back to the start
+
+When the last lane and the fill-in pass are done, the journal shows
+`COVER: field covered -- driving back to the start`, `/cover_status` goes
+`"phase":"RETURN"` with `"home_m"` counting down, and the app card reads
+**Field done -- returning to start (N m to go)**. It ends with one of:
+
+- `COVER: coverage complete, back at the start`: it got there and holds.
+- `COVER: coverage complete, but could not get back to the start -- stopped N m short`:
+  out of time (blocked, or the boundary in the way). It holds where it is.
+
+"The start" is the first GPS fix after START. If that was within 4 m of
+the stop line, it returns to the nearest point 4 m inside instead. It
+gets as close as the GPS allows: within 2.5 m of where the GPS says the
+start is.
+
+To see it without driving a whole field, simulate it:
+
+```bash
+python3 ~/coverage_planner_test.py     # the return rules, ALL PASS
+python3 ~/coverage_sim.py --noise 0    # ends "back at the start"
+```
+
+To switch it off (stop wherever coverage ends, as before), set
+`RETURN_TO_START = False` in `coverage_planner.py` and run colcon build.
 
 ## 7. Resume after a stop
 
