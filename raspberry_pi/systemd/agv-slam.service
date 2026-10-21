@@ -19,12 +19,10 @@ Description=AGV SLAM mapping (slam_toolbox)
 # order, slam_toolbox just waits for /scan to appear.
 Wants=agv.service
 #
-# EXCEPT the network. Started before WiFi was up (SLAM at 21:48:07, wlan0 at
-# 21:48:12 on 2026-10-19), slam_toolbox ran but no other node could see it --
-# no map frame, no lidar position -- until restarted by hand. Ordering after
-# network-online.target is NOT the cycle above: that target does not depend
-# on this unit. On a RESET MAPPED AREA restart the network is already up, so
-# it costs nothing there.
+# Ordered after network-online.target (NOT the cycle above: that target does
+# not depend on this unit), which the clock sync in start_slam.sh needs.
+# Started before the boot-time clock jump, slam_toolbox runs but no other
+# node can see it -- start_slam.sh waits for the clock (see step 0 there).
 After=network-online.target
 Wants=network-online.target
 

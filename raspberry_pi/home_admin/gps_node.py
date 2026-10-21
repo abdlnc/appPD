@@ -4,6 +4,8 @@ AGV GPS Node  (ROS2 / rclpy)  --  REAL or SIMULATED
 
 Publishes:
     /gps      (std_msgs/String) : "lat,lon,heading,speed_kmh,fix,sats"
+    /position_ref (std_msgs/String, 1 Hz JSON) : the position you set and
+                                  what is tracking it, for the app ("R:")
     /gps_raw  (std_msgs/String) : the same, WITHOUT the parked hold below --
                                   what the receiver says. The boundary fence
                                   reads this one (see below), and gps_drift.py.
@@ -80,6 +82,7 @@ If real mode says "No module named 'serial'":  pip install pyserial
 """
 
 import sys
+import json
 import math
 import random
 import time
@@ -184,6 +187,7 @@ RAW_MEAN_S = 5.0            # GPS error at a tap: the mean of this much raw GPS
 # error adds as much as it removes.
 OFFSET_TRUST_S = 60.0
 FACE_MIN_M = 1.0            # the "facing" tap must be at least this far off
+FACE_TIMEOUT_S = 120.0      # position tapped but no facing tap: dropped
 SLAM_YAW_OFFSET_DEG = LIDAR_ANGLE_OFFSET_DEG   # base_link = laser frame, and
                             # the lidar is mounted backwards: SLAM's yaw is
                             # the robot's REAR. Its front is this much round.
@@ -277,6 +281,7 @@ class PositionRef:
     def __init__(self):
         self.stage = "OFF"           # OFF | FACE (waiting for tap 2) | ON
         self.pos = None              # tapped position (lat, lon)
+        self.face_t = None           # when the position was tapped
         self.pos_slam = None         # SLAM pose when it was tapped
         self.anchor = None           # (x0, y0, rot, lat0, lon0): SLAM -> world
         self.off = None              # (east, north) GPS correction, metres
@@ -351,6 +356,7 @@ class PositionRef:
         self.__init__()
         self.stage = "FACE"
         self.pos = (lat, lon)
+        self.face_t = t
         self.pos_slam = slam
         self.last = (lat, lon, None)
         if raw_mean is not None:
@@ -366,6 +372,12 @@ class PositionRef:
         if self.stage == "OFF":
             return None
         if self.stage == "FACE":
+            if t - self.face_t > FACE_TIMEOUT_S:
+                # left half-done (app closed, walked away): not a position
+                # anyone is still vouching for
+                self.clear("not finished -- no facing tap within "
+                           f"{FACE_TIMEOUT_S:.0f} s")
+                return None
             # held in STOP between the taps: the tapped spot, as tapped
             return self.pos[0], self.pos[1], None, "SET"
 
@@ -534,6 +546,9 @@ class GPSNode(Node):
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.ref = PositionRef()       # see YOU SET WHERE IT IS (top)
         self.create_subscription(String, '/set_position', self.setpos_cb, 10)
+        self.posref_pub = self.create_publisher(String, '/position_ref', 10)
+        self.ref_note = ""          # last thing PositionRef said, for the app
+        self.create_timer(1.0, self.publish_posref)
         self.tf_buf = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buf, self)
         self.raw_hist = []          # (t, lat, lon) trusted raw fixes, RAW_MEAN_S
@@ -615,6 +630,20 @@ class GPSNode(Node):
         ev = self.ref.take_event()
         if ev:
             self.get_logger().warn(ev)
+            self.ref_note = ev
+        self.publish_posref()
+
+    def publish_posref(self):
+        """For the app: is a set position active, and what tracks it."""
+        r = self.ref
+        left = None
+        if r.stage == "ON" and r.using == "GPS" and r.off_t is not None:
+            left = max(0, int(OFFSET_TRUST_S - (time.time() - r.off_t)))
+        d = {"stage": r.stage, "using": r.using, "secs_left": left,
+             "lidar": r.anchor is not None, "note": self.ref_note}
+        m = String()
+        m.data = json.dumps(d, separators=(",", ":"))
+        self.posref_pub.publish(m)
 
     # ---- receiver configuration (UBX) ----
     @staticmethod
@@ -794,6 +823,7 @@ class GPSNode(Node):
         ev = self.ref.take_event()
         if ev:
             self.get_logger().warn(ev)
+            self.ref_note = ev
         if fused is not None:
             # your set position, carried along
             flat, flon, compass, src = fused

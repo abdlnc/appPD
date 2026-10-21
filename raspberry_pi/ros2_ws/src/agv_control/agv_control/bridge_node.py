@@ -10,6 +10,10 @@ Keeps the EXISTING Flutter app protocol, so NO app changes are needed:
                     "FENCE:SET <inset>|lat,lon;lat,lon;..."  set the boundary
                     "FENCE:CLEAR" / "FENCE:UNDO" / "FENCE:ADD lat,lon"
                     "COVER:RESET"          forget coverage progress, start over
+                    "POS:TAP lat,lon"      set where the robot IS: 1st tap its
+                                          position, 2nd a point it faces (see
+                                          gps_node.py, YOU SET WHERE IT IS)
+                    "POS:CLEAR"            drop it -- plain GPS again
                     "SAVEMAP"              save the live SLAM map (see below)
                     "RESETMAP"             wipe the live SLAM map (see below)
     robot -> app:   "C:<base64 jpeg>"     camera frame
@@ -25,7 +29,9 @@ Keeps the EXISTING Flutter app protocol, so NO app changes are needed:
                                           and on every change)
                     "P:<json>"             the planned coverage lanes
                     "V:<json>"             coverage progress
-                    All three are NEW prefixes: an older app build ignores
+                    "R:<json>"             the position you set, and what
+                                          tracks it (gps_node /position_ref)
+                    All four are NEW prefixes: an older app build ignores
                     them, so it keeps working unchanged.
 
 Translates to ROS2:
@@ -216,6 +222,8 @@ class BridgeNode(Node):
         self.fence_active = False
         self.latest_plan = None          # JSON from coverage_node (latched)
         self.latest_cover = None         # JSON progress from coverage_node
+        self.latest_posref = None        # JSON from gps_node (set position)
+        self.create_subscription(String, '/position_ref', self.posref_cb, 10)
         self.create_subscription(String, '/fence', self.fence_cb, CAPTURE_QOS)
         self.create_subscription(String, '/cover_plan', self.plan_cb,
                                  CAPTURE_QOS)
@@ -260,6 +268,18 @@ class BridgeNode(Node):
 
     def cover_cb(self, msg: String):
         self.latest_cover = msg.data
+
+    def posref_cb(self, msg: String):
+        self.latest_posref = msg.data
+
+    def send_position_tap(self, arg):
+        """POS:TAP / POS:CLEAR from the app -> gps_node, robot held in STOP
+        (the same as a tap with ~/agv_set_position)."""
+        m = String()
+        m.data = "CLEAR" if arg.upper() == "CLEAR" else arg
+        self.setpos_pub.publish(m)
+        self.get_logger().info(f"Set position from app: {m.data}")
+        self.set_mode("STOP")
 
     def send_fence_cmd(self, text):
         m = String()
@@ -585,6 +605,8 @@ async def ws_handler(websocket, node: BridgeNode):
         send_on_change("P:", lambda: node.latest_plan, 1.0))
     cover_task = asyncio.create_task(
         send_on_change("V:", lambda: node.latest_cover, 1.0))
+    posref_task = asyncio.create_task(
+        send_on_change("R:", lambda: node.latest_posref, 0.5))
     try:
         async for message in websocket:
             msg = message.strip()
@@ -602,6 +624,10 @@ async def ws_handler(websocket, node: BridgeNode):
             elif msg.upper().startswith("FENCE:"):
                 # "FENCE:SET 3|lat,lon;..." -> fence_node "SET 3|lat,lon;..."
                 node.send_fence_cmd(msg.split(":", 1)[1].strip())
+            elif msg.upper().startswith("POS:"):
+                arg = msg.split(":", 1)[1].strip()
+                if arg.upper() == "CLEAR" or arg.upper().startswith("TAP "):
+                    node.send_position_tap(arg)
             elif msg.upper().startswith("COVER:"):
                 arg = msg.split(":", 1)[1].strip().upper()
                 if arg == "START":
@@ -666,6 +692,7 @@ async def ws_handler(websocket, node: BridgeNode):
         fence_task.cancel()
         plan_task.cancel()
         cover_task.cancel()
+        posref_task.cancel()
         # app gone -> STOP for safety
         node.set_mode("STOP")
         node.manual_cmd = Twist()

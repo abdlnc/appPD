@@ -45,6 +45,12 @@ class _MapScreenState extends State<MapScreen> {
   // reports back on "Z:", and what the map then draws is what it stored.
   bool _editingFence = false;
   final List<LatLng> _draft = [];
+
+  // ---- telling the robot where it is (see models/position_ref.dart) ----
+  // 0 = off, 1 = next tap is where the robot IS, 2 = next tap is a point
+  // it is FACING. The robot does the rest and reports back on "R:".
+  int _settingPos = 0;
+  LatLng? _posTap; // the first tap, drawn until the second
   double _inset = kDefaultInsetM;
   RobotSocket? _socket; // cached for the trail listener
   static const double _trailMinStepM = 3.0; // min meters between trail points
@@ -205,7 +211,8 @@ class _MapScreenState extends State<MapScreen> {
   Widget build(BuildContext context) {
     final socket = context.read<RobotSocket>();
     context.select<RobotSocket, String>((s) =>
-        '${s.isConnected},${s.robotLat},${s.robotLon},${s.robotHeading},${s.gpsFix},${s.gpsSats},${s.gpsSatsView},${s.obstaclePins.length}');
+        '${s.isConnected},${s.robotLat},${s.robotLon},${s.robotHeading},${s.gpsFix},${s.gpsSats},${s.gpsSatsView},${s.obstaclePins.length},'
+        '${s.positionRef?.stage},${s.positionRef?.using},${s.positionRef?.secsLeft},${s.positionRef?.note}');
 
     final LatLng? robot =
         socket.hasGps ? LatLng(socket.robotLat!, socket.robotLon!) : null;
@@ -324,6 +331,28 @@ class _MapScreenState extends State<MapScreen> {
                 fontWeight: FontWeight.w700, letterSpacing: 1.5)),
         actions: [
           IconButton(
+            icon: Icon(Icons.edit_location_alt,
+                color: _settingPos > 0
+                    ? const Color(0xFFFFB300)
+                    : (socket.positionRef?.active == true
+                        ? AppColors.lime
+                        : null)),
+            tooltip: _settingPos > 0
+                ? "Cancel setting the robot's position"
+                : "Set where the robot really is",
+            onPressed: !socket.isConnected
+                ? null
+                : () => setState(() {
+                      if (_settingPos > 0) {
+                        _cancelSetPos(socket);
+                      } else {
+                        _settingPos = 1;
+                        _posTap = null;
+                        _editingFence = false;
+                      }
+                    }),
+          ),
+          IconButton(
             icon: Icon(Icons.fence,
                 color: _editingFence
                     ? const Color(0xFFFFB300)
@@ -334,6 +363,7 @@ class _MapScreenState extends State<MapScreen> {
                 ? "Stop editing the boundary"
                 : "Edit the field boundary",
             onPressed: () => setState(() {
+              if (_settingPos > 0) _cancelSetPos(socket);
               if (!_editingFence) {
                 // start from what the robot has, so editing is editing
                 _draft
@@ -416,6 +446,10 @@ class _MapScreenState extends State<MapScreen> {
               initialCenter: widget.focus ?? robot ?? _fallback,
               initialZoom: 18,
               onTap: (tapPos, point) => setState(() {
+                if (_settingPos > 0) {
+                  _setPosTap(socket, point);
+                  return;
+                }
                 if (_editingFence) {
                   _draft.add(point); // a corner, not a destination
                   return;
@@ -455,6 +489,17 @@ class _MapScreenState extends State<MapScreen> {
                   ),
                 ]),
               MarkerLayer(markers: markers),
+              if (_settingPos == 2 && _posTap != null)
+                MarkerLayer(markers: [
+                  Marker(
+                    point: _posTap!,
+                    width: 40,
+                    height: 40,
+                    alignment: Alignment.topCenter,
+                    child: const Icon(Icons.location_on,
+                        color: Color(0xFFFFB300), size: 40),
+                  ),
+                ]),
             ],
           ),
           Positioned(top: 10, left: 10, right: 10, child: _gpsCard(socket)),
@@ -495,11 +540,15 @@ class _MapScreenState extends State<MapScreen> {
             bottom: 0,
             left: 0,
             right: 0,
-            child: _editingFence
+            child: _settingPos > 0
+                ? _setPosPanel(socket)
+                : _editingFence
                 ? _fencePanel(socket, robot)
                 : Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
+                      if (socket.positionRef?.summary != null)
+                        _posRefCard(socket),
                       if (socket.boundary?.active == true)
                         _coverCard(socket, robot),
                       _bottomPanel(socket, robot, distLabel),
@@ -849,6 +898,143 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------- set position
+  static const double _faceMinM = 1.0; // as gps_node FACE_MIN_M
+
+  void _setPosTap(RobotSocket socket, LatLng point) {
+    if (_settingPos == 1) {
+      socket.sendPositionTap(point);
+      _posTap = point;
+      _settingPos = 2;
+      // The trail so far was drawn from the GPS being corrected; and a jump
+      // to the set position would trip its spike guard for good.
+      _trail.clear();
+      _smoothed = null;
+      return;
+    }
+    final d = const Distance().as(LengthUnit.Meter, _posTap!, point);
+    if (d < _faceMinM) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text("Tap a point a few metres in front of the robot, "
+              "not on it")));
+      return;
+    }
+    socket.sendPositionTap(point);
+    _settingPos = 0;
+    _posTap = null;
+    _follow = true;
+  }
+
+  /// Cancel half-way: after the first tap the robot is already on the
+  /// tapped spot, waiting for the facing tap -- tell it to drop that.
+  void _cancelSetPos(RobotSocket socket) {
+    if (_settingPos == 2) socket.clearSetPosition();
+    _settingPos = 0;
+    _posTap = null;
+  }
+
+  /// Bottom panel while telling the robot where it is.
+  Widget _setPosPanel(RobotSocket socket) {
+    const amber = Color(0xFFFFB300);
+    final step1 = _settingPos == 1;
+    final note = socket.positionRef?.note ?? '';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+      decoration: BoxDecoration(
+        color: AppColors.surface.withValues(alpha: 0.96),
+        border: const Border(top: BorderSide(color: amber, width: 2)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.edit_location_alt, color: amber, size: 18),
+                const SizedBox(width: 6),
+                Text("SET ROBOT POSITION  \u2022  ${step1 ? '1' : '2'} of 2",
+                    style: GoogleFonts.rajdhani(
+                        color: amber,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1.2)),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+                step1
+                    ? "Tap the map where the robot REALLY is. "
+                        "It is held in STOP while you do this."
+                    : "Now tap a point a few metres IN FRONT of it -- the "
+                        "way it is facing.",
+                style: GoogleFonts.rajdhani(
+                    color: AppColors.textHi,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600)),
+            if (!step1 && note.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(note,
+                    style: GoogleFonts.rajdhani(
+                        color: AppColors.textLo, fontSize: 12)),
+              ),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                TextButton.icon(
+                  onPressed: () => setState(() => _cancelSetPos(socket)),
+                  icon: const Icon(Icons.close, size: 18),
+                  label: Text("CANCEL",
+                      style:
+                          GoogleFonts.rajdhani(fontWeight: FontWeight.w700)),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// While a position you set is active: what is tracking it, and a way
+  /// back to plain GPS.
+  Widget _posRefCard(RobotSocket socket) {
+    final st = socket.positionRef!;
+    final lidar = st.using == 'SLAM';
+    final color = lidar ? AppColors.lime : const Color(0xFFFFB300);
+    return Container(
+      margin: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+      padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+      decoration: BoxDecoration(
+        color: AppColors.surface.withValues(alpha: 0.94),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color),
+      ),
+      child: Row(
+        children: [
+          Icon(lidar ? Icons.radar : Icons.edit_location_alt,
+              size: 18, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(st.summary!,
+                style: GoogleFonts.rajdhani(
+                    color: AppColors.textHi,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600)),
+          ),
+          TextButton(
+            onPressed: socket.isConnected
+                ? () => socket.clearSetPosition()
+                : null,
+            child: Text("USE GPS",
+                style: GoogleFonts.rajdhani(fontWeight: FontWeight.w700)),
+          ),
+        ],
       ),
     );
   }

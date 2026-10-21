@@ -188,6 +188,17 @@ chk("CLEAR: back to plain GPS", r.fuse(t + 1, ll(1, 1), ll(1, 1),
                                        bot.pose(), True) is None)
 chk("and says so", "plain GPS" in (r.take_event() or ""))
 
+print("\n-- position tapped, facing tap never comes")
+r6 = g.PositionRef()
+r6.tap(0.0, *ll(0, 0), ll(5, 0), None)
+r6.take_event()
+chk("still waiting at 1 min: the tapped spot",
+    r6.fuse(60.0, ll(5, 0), ll(5, 0), None, False)[3] == "SET")
+out = r6.fuse(g.FACE_TIMEOUT_S + 1, ll(5, 0), ll(5, 0), None, False)
+chk(f"after {g.FACE_TIMEOUT_S:.0f} s: dropped, plain GPS",
+    out is None and r6.stage == "OFF")
+chk("and says so", "not finished" in (r6.take_event() or ""))
+
 print("\n-- a new first tap starts over")
 r5 = g.PositionRef()
 b5 = SlamRobot()

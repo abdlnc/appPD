@@ -182,10 +182,15 @@ the first are named `..._dup.jpg`, and they're still saved. Detections of the
 same thing log `detection NOT saved: ... at least as confident` or
 `better shot ... replacing ...`.
 
-## 9a. Setting where the robot is (no app rebuild)
+## 9a. Setting where the robot is
 
-GPS among the houses can be tens of metres off. To tell the robot where it
-really is:
+**Rebuilt app:** on the GPS map, tap the **pin-with-pencil** button (top
+bar), tap where the robot really is, then tap a point a few metres in front
+of it. A card shows what's tracking it ("tracked by lidar" / "corrected
+GPS (Ns left)"), with **USE GPS** to drop it.
+
+**App already on the phone** (no rebuild): GPS among the houses can be tens
+of metres off. To tell the robot where it really is:
 
 ```bash
 touch ~/agv_set_position

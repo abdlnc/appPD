@@ -6,6 +6,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:flutter/foundation.dart';
 import 'package:latlong2/latlong.dart';
 import '../models/field_boundary.dart';
+import '../models/position_ref.dart';
 
 /// A GPS location where the robot's Lidar reported a DANGER-level obstacle.
 class ObstaclePin {
@@ -107,6 +108,8 @@ class RobotSocket extends ChangeNotifier {
   CoverPlan? get coverPlan => _coverPlan;
   CoverStatus? _coverStatus;         // "V:" -- progress
   CoverStatus? get coverStatus => _coverStatus;
+  PositionRefStatus? _positionRef;   // "R:" -- a position you set
+  PositionRefStatus? get positionRef => _positionRef;
 
   /// True when connected but the GPS has no fix right now. Uses the fix
   /// flag directly rather than hasGps below -- functionally the same now
@@ -331,6 +334,9 @@ class RobotSocket extends ChangeNotifier {
       } else if (message.startsWith("V:")) {
         _coverStatus = CoverStatus.parse(message.substring(2));
         notifyListeners();
+      } else if (message.startsWith("R:")) {
+        _positionRef = PositionRefStatus.parse(message.substring(2));
+        notifyListeners();
       }
       // 5. SLAM map save result (MAPSAVED: / MAPERR:)
       else if (message.startsWith("MAPSAVED:")) {
@@ -514,6 +520,15 @@ class RobotSocket extends ChangeNotifier {
   }
 
   void clearFence() => sendCommand("FENCE:CLEAR");
+
+  /// Tell the robot where it is: the first tap is its real position, the
+  /// second a point it is facing. It reports back on "R:".
+  void sendPositionTap(LatLng p) => sendCommand(
+      "POS:TAP ${p.latitude.toStringAsFixed(7)},"
+      "${p.longitude.toStringAsFixed(7)}");
+
+  /// Drop the position you set -- plain GPS again.
+  void clearSetPosition() => sendCommand("POS:CLEAR");
   void startCover() => sendCommand("COVER:START");
   void resetCover() => sendCommand("COVER:RESET");
 

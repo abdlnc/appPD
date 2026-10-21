@@ -17,6 +17,28 @@
 # environment, so conda + ROS2 must be set up here. Errors show up in:
 #     journalctl -u agv-slam.service -f
 
+# --- 0. wait for the clock to be set (up to CLOCK_WAIT_S) --------------------
+# The Pi has no battery clock: it boots at the last saved time, and a few
+# seconds later the time server moves it on -- by 7.5 hours on 2026-10-21.
+# slam_toolbox started BEFORE that jump kept running but no other node could
+# see it again (no map frame, no lidar position) until restarted by hand;
+# every node started after it was fine. So wait for the clock to be set.
+# Not forever: in the field with no internet it is never set -- but then it
+# never jumps either, so after CLOCK_WAIT_S start anyway. A restart (the
+# app's RESET MAPPED AREA) finds it already set and does not wait.
+CLOCK_WAIT_S=90
+for ((i = 0; i < CLOCK_WAIT_S; i++)); do
+    [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && break
+    [ "$i" -eq 0 ] && echo "waiting up to ${CLOCK_WAIT_S}s for the clock to be set (time server)..."
+    sleep 1
+done
+if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
+    echo "clock set: $(date)"
+else
+    echo "WARNING: clock not set after ${CLOCK_WAIT_S}s (no internet?) -- starting anyway." >&2
+    echo "         If it is set later, SLAM may vanish: sudo systemctl restart agv-slam.service" >&2
+fi
+
 # --- 1. locate the conda/mamba install (RoboStack/Miniforge) -----------------
 CONDA_BASE=""
 for base in "$HOME/miniforge3" "$HOME/mambaforge" "$HOME/miniconda3" "$HOME/anaconda3"; do
