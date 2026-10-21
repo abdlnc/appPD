@@ -184,5 +184,29 @@ chk("no checksum at all fails", not g.nmea_ok(good[:good.rfind("*")]))
 chk("two sentences run together fails",
     not g.nmea_ok(good[:30] + good))
 
+print("\n-- the receiver's own error estimate (GST)")
+import time as _time                          # noqa: E402
+from types import SimpleNamespace             # noqa: E402
+
+
+def fix(err, accepted=False, gst_age=0.5):
+    now = _time.time()
+    return SimpleNamespace(lat=LAT0, lon=LON0, fix=1, sats=11, hdop=1.1,
+                           last_gga=now, quality_ok=accepted,
+                           err_m=err, last_gst=now - gst_age)
+
+
+q = g.GPSNode._quality_check
+chk("HDOP 1.1 but the receiver says 9.4 m (the house): rejected",
+    q(fix(9.4))[0] is False and "9.4 m" in q(fix(9.4))[1], q(fix(9.4))[1])
+chk("it says 2 m (open field): accepted", q(fix(2.0))[0])
+chk("accepted, then 6.5 m: kept (hysteresis, keep <= 8)",
+    q(fix(6.5, accepted=True))[0])
+chk("not yet accepted, 6.5 m: not accepted (accept <= 5)",
+    not q(fix(6.5))[0])
+chk("accepted, then 8.5 m: dropped", not q(fix(8.5, accepted=True))[0])
+chk("no GST for 10 s: judged on sats and HDOP alone (as before)",
+    q(fix(30.0, gst_age=10.0))[0])
+
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

@@ -4,6 +4,9 @@ AGV GPS Node  (ROS2 / rclpy)  --  REAL or SIMULATED
 
 Publishes:
     /gps      (std_msgs/String) : "lat,lon,heading,speed_kmh,fix,sats"
+    /gps_accuracy (std_msgs/String) : the receiver's own error estimate,
+                                  metres ("" if it gives none) -- see
+                                  ERROR ESTIMATE below
     /position_ref (std_msgs/String, 1 Hz JSON) : the position you set and
                                   what is tracking it, for the app ("R:")
     /gps_raw  (std_msgs/String) : the same, WITHOUT the parked hold below --
@@ -135,6 +138,33 @@ UBX_STATIC_HOLD_CMS  = 0   # cm/s; 0 disables static hold entirely
 MIN_SATS_ACCEPT = 6        # to START trusting the fix
 MAX_HDOP_ACCEPT = 2.5
 MIN_SATS_KEEP   = 5        # to KEEP trusting a fix already accepted
+
+# ---- ERROR ESTIMATE: the receiver's own, in metres ----
+# HDOP describes only where the satellites are in the sky. It said 0.9-1.2
+# ("excellent") on 2026-10-21 while the position sat 113 m away for minutes:
+# signals bouncing off houses (multipath) do not show in it at all. The
+# receiver's error estimate does respond to them -- it is worked out from
+# how badly the satellite ranges disagree. It comes in the NMEA GST sentence
+# (std. deviation of latitude and longitude error, metres), which the NEO-M8N
+# does not send unless asked: configure_receiver turns it on (RAM only, like
+# the rest). Error = the two combined.
+#
+# A fix the receiver itself puts worse than MAX_ERR_ACCEPT_M is not
+# accepted; once accepted it is dropped above MAX_ERR_KEEP_M (hysteresis, as
+# the satellite and HDOP limits). A receiver that never sends GST is judged
+# on satellites and HDOP alone, as before (logged once).
+# Measured parked by the house, 2026-10-22, 5 min: the estimate never went
+# below 7.7 m (median 9.2), and the real spread agreed (median 4 m, up to
+# 13.5 m from the mean). It does NOT pick out the worse moments within that
+# -- fixes rated 5-8 m were no closer than ones rated 8-12 -- it tells you
+# the PLACE is poor. So by choice this limit is strict: among the houses
+# there is effectively no GPS; in the open field, where the M8N usually
+# rates itself 1-3 m, there is. (A set position -- YOU SET WHERE IT IS --
+# keeps working by lidar either way.)
+ERR_GATE = True
+MAX_ERR_ACCEPT_M = 5.0
+MAX_ERR_KEEP_M = 8.0
+GST_STALE_S = 3.0
 
 # ---- staleness: no fresh position = no fix ----
 # The reader thread STORES the last position it parsed, and publish_gps sends
@@ -564,6 +594,11 @@ class GPSNode(Node):
         self.last_gga = 0.0         # when a GGA last arrived (see GGA_STALE_S)
         self.sats_in_view = {}      # per-talker (GP/GL/GA/GB) satellites in view
         self.bad_lines = 0          # NMEA lines dropped for a bad checksum
+        self.err_m = None           # receiver's error estimate (GST), metres
+        self.last_gst = 0.0
+        self.acc_pub = self.create_publisher(String, '/gps_accuracy', 10)
+        self._gst_warned = False
+        self._started = time.time()
         self.ser = serial.Serial(PORT, BAUD, timeout=1.0)
         self.configure_receiver()
         self.running = True
@@ -696,6 +731,17 @@ class GPSNode(Node):
                 f"Receiver kept its own settings: dynModel={dyn} "
                 f"staticHold={hold} (asked for {UBX_DYN_MODEL}/"
                 f"{UBX_STATIC_HOLD_CMS})")
+        self.enable_gst()
+
+    def enable_gst(self):
+        """Ask for the GST sentence once a second (UBX-CFG-MSG, NMEA class
+        F0 id 07, rate 1 on this port), RAM only. Whether it worked shows up
+        as GST lines arriving -- publish_gps logs it if they never do."""
+        try:
+            self.ser.write(self._ubx(0x06, 0x01, bytes([0xF0, 0x07, 0x01])))
+            self.ser.flush()
+        except Exception as e:
+            self.get_logger().warn(f"Could not ask for GST: {e}")
 
     def _read_ubx(self, cls, mid, timeout=2.0):
         """Wait for one UBX message of this class/id, stepping over the NMEA
@@ -765,6 +811,12 @@ class GPSNode(Node):
                             self.speed_kmh = float(parts[7])
                         except ValueError:
                             pass
+                elif tag == 'GST' and len(parts) >= 8:
+                    # $..GST,time,rms,smaj,smin,orient,lat_err,lon_err,alt_err
+                    if parts[6] and parts[7]:
+                        self.err_m = math.hypot(float(parts[6]),
+                                                float(parts[7]))
+                        self.last_gst = time.time()
                 elif tag == 'GSV' and len(parts) >= 4:
                     # satellites in view for this constellation (GP/GL/GA/GB)
                     talker = parts[0][1:3]
@@ -794,10 +846,28 @@ class GPSNode(Node):
             return False, f"only {self.sats} sats (need {min_sats})"
         if hdop > max_hdop:
             return False, f"HDOP {hdop:.1f} (need <= {max_hdop})"
+        if ERR_GATE and time.time() - self.last_gst <= GST_STALE_S and \
+                self.err_m is not None:
+            max_err = MAX_ERR_KEEP_M if self.quality_ok else MAX_ERR_ACCEPT_M
+            if self.err_m > max_err:
+                return False, (f"receiver puts its own error at "
+                               f"{self.err_m:.1f} m (need <= {max_err:.0f})")
         return True, ""
 
     def publish_gps(self):
         msg = String()
+        gst_fresh = time.time() - self.last_gst <= GST_STALE_S
+        am = String()
+        am.data = f"{self.err_m:.2f}" if gst_fresh and self.err_m else ""
+        self.acc_pub.publish(am)
+        if not gst_fresh and not self._gst_warned and \
+                time.time() - self._started > 15.0 and \
+                time.time() - self.last_gga < GGA_STALE_S:
+            self._gst_warned = True
+            self.get_logger().warn(
+                "Receiver sends no error estimate (GST) -- fixes are judged "
+                "on satellites and HDOP only, which do not see signals "
+                "bouncing off buildings")
         ok, why = self._quality_check()
         if ok != self.quality_ok:
             self.quality_ok = ok
@@ -871,13 +941,16 @@ class GPSNode(Node):
                     f"FIX  sats={self.sats} hdop={hd} lat={self.lat:.6f} "
                     f"lon={self.lon:.6f} hdg={self.heading or '-'} "
                     f"spd={self.speed_kmh:.1f}km/h"
+                    + (f" err={self.err_m:.1f}m"
+                       if self.err_m is not None else "")
                     + (" (parked: /gps held)" if self.hold.anchor else "")
                     + (f" (manual position: {self.ref.using or 'SET'})"
                        if self.ref.stage != "OFF" else ""))
             elif self.lat is not None and self.fix >= 1:
+                err = f" err={self.err_m:.1f}m" if self.err_m is not None else ""
                 self.get_logger().info(
-                    f"weak fix held back: sats={self.sats} hdop={hd} "
-                    f"(needs {MIN_SATS_ACCEPT}+ sats, HDOP <= {MAX_HDOP_ACCEPT})")
+                    f"weak fix held back: sats={self.sats} hdop={hd}{err} "
+                    f"-- {why}")
             else:
                 siv = sum(self.sats_in_view.values()) if self.sats_in_view else 0
                 self.get_logger().info(
