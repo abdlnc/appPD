@@ -2,6 +2,10 @@
 """
 Measure how much the GPS position wanders while the robot stands still.
 
+Reads /gps_raw -- the receiver's own positions. /gps itself is held still
+while the robot is parked (gps_node.py, PARKED = HELD STILL), so it would
+read zero wander and tell you nothing about the receiver.
+
     source ~/miniforge3/etc/profile.d/conda.sh && conda activate ros2_humble
     source ~/ros2_ws/install/setup.bash
     python3 ~/gps_drift.py              # 10 minutes, robot parked, service running
@@ -40,7 +44,7 @@ class Rec(Node):
     def __init__(self):
         super().__init__('gps_drift')
         self.rows = []
-        self.create_subscription(String, '/gps', self.cb, 50)
+        self.create_subscription(String, '/gps_raw', self.cb, 50)
 
     def cb(self, m):
         p = m.data.split(",")
@@ -57,7 +61,7 @@ def main():
     rclpy.init()
     n = Rec()
     end = time.time() + a.minutes * 60
-    print(f"recording /gps for {a.minutes:.0f} min -- keep the robot still")
+    print(f"recording /gps_raw for {a.minutes:.0f} min -- keep the robot still")
     while time.time() < end:
         rclpy.spin_once(n, timeout_sec=0.5)
     rclpy.shutdown()

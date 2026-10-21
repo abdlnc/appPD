@@ -3,7 +3,12 @@
 AGV GPS Node  (ROS2 / rclpy)  --  REAL or SIMULATED
 
 Publishes:
-    /gps  (std_msgs/String) : "lat,lon,heading,speed_kmh,fix,sats"
+    /gps      (std_msgs/String) : "lat,lon,heading,speed_kmh,fix,sats"
+    /gps_raw  (std_msgs/String) : the same, WITHOUT the parked hold below --
+                                  what the receiver says. The boundary fence
+                                  reads this one (see below), and gps_drift.py.
+Subscribes:
+    /cmd_vel, /scan             : is the robot moving? (parked hold)
 
   * With a FIX  -> "lat,lon,heading,speed,fix,sats"   (sats = used in solution)
     ...but only a fix that passes the QUALITY FILTER (enough satellites, low
@@ -12,6 +17,33 @@ Publishes:
   * ACQUIRING   -> ",,,0.0,0,<sats_in_view>"          (no fix yet; live feedback)
     The empty lat/lon tells the app "still acquiring", while <sats_in_view>
     (parsed from GSV) lets the app show a rising count instead of a blank card.
+
+PARKED = HELD STILL. A parked GPS wanders -- measured on this robot: a
+median 3.1 m in 20 s and up to 9.9 m, without moving an inch -- and every
+consumer saw that as motion: the map marker crawling, the fence flipping
+IN/OUT at the stop line, photos tagged metres apart. So when nothing has
+told the wheels to move (/cmd_vel) for HOLD_STILL_S -- OR the lidar shows
+it is not moving although told to (stuck, boxed in, on a stand, motor power
+off: seen 2026-10-21, AUTO commanding forward and reverse, lidar distances
+unchanged to the centimetre, GPS wandering) -- /gps holds the position
+steady until it moves again (StationaryHold, LidarStill). The receiver's
+own "static hold" is NOT the way: it decides "parked" from its speed
+estimate, and froze this slow robot mid-drive (see receiver dynamics,
+below). No fix is still no fix: the hold never invents one.
+
+THE FENCE DOES NOT USE THE HOLD. fence_node reads /gps_raw. The lidar can
+in principle be fooled -- something pacing the robot dead ahead, nothing
+behind in range -- and a held position must never be what stands between
+the robot and the edge of the field. The fence keeps the receiver's own
+positions, exactly as it did before this hold existed.
+
+PICKED UP AND CARRIED, it still shows where it was parked, until the next
+drive command (any -- a joystick nudge will do). There is no automatic
+"it was moved" release because nothing available can tell: parked on
+2026-10-21 the receiver's own speed read 2 km/h or more 30% of the time
+(up to 19 km/h -- more than it reads while driving), and its position
+jumped up to 113 m away for minutes at a time. A release on either would
+have fired on the receiver's noise, not on a carry -- the drift again.
 
 TWO MODES:
   (default) REAL  : reads u-blox NEO-M8N NMEA on /dev/ttyAMA0 @ 9600.
@@ -36,6 +68,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
 
 PORT = "/dev/ttyAMA0"
 BAUD = 9600
@@ -90,6 +123,26 @@ MIN_SATS_KEEP   = 5        # to KEEP trusting a fix already accepted
 GGA_STALE_S = 3.0
 MAX_HDOP_KEEP   = 3.5
 
+# ---- parked hold (see PARKED = HELD STILL, top) ----
+HOLD_STILL_S = 2.0          # no drive command this long = parked (it has
+                            # rolled to a stop)
+MOVING_CMD = 0.02           # |linear.x| above this is a drive command.
+                            # Steering alone does not move a front-steer robot.
+# Lidar: "not moving" = the distances dead ahead and dead behind (median of
+# each +/-LIDAR_SECTOR_DEG sector) have stayed within LIDAR_STILL_M for the
+# whole of HOLD_STILL_S. Moving along its axis -- the only way this robot
+# moves -- changes one or both at once: 0.1 m/s is 0.2 m in 2 s, five times
+# the threshold. Measured parked on 2026-10-21 they held to +/-0.01 m.
+# Nothing in range either way (an open field): no lidar evidence, and the
+# drive commands alone decide.
+LIDAR_SECTOR_DEG = 15.0
+LIDAR_STILL_M = 0.04
+LIDAR_SEE_M = 8.0           # beyond this a return is too sparse to judge by
+LIDAR_MIN_SCANS = 5         # in the HOLD_STILL_S window (10 Hz scanner)
+LIDAR_FRESH_S = 0.5         # no scan this recent = lidar not running
+LIDAR_ANGLE_OFFSET_DEG = 180.0   # as control_node: mounted rotated 180 deg
+MIN_VALID_DIST = 0.15            # as control_node: own chassis / noise
+
 # Simulation start point (Quezon City) + virtual robot limits
 SIM_START_LAT = 14.7481338
 SIM_START_LON = 121.0616677
@@ -120,6 +173,21 @@ SIM_NOISE_TAU_S = 30.0
 SIM_COG_MIN_MPS = 0.2
 
 
+def nmea_ok(line):
+    """True if an NMEA sentence's *XX checksum matches. A line garbled on
+    the serial link otherwise parses as a perfectly good, wrong position."""
+    star = line.rfind('*')
+    if not line.startswith('$') or star < 1 or len(line) < star + 3:
+        return False
+    c = 0
+    for ch in line[1:star]:
+        c ^= ord(ch)
+    try:
+        return c == int(line[star + 1:star + 3], 16)
+    except ValueError:
+        return False
+
+
 def nmea_to_deg(val, hemi):
     """NMEA ddmm.mmmm / dddmm.mmmm -> signed decimal degrees."""
     if not val or '.' not in val:
@@ -139,12 +207,119 @@ def nmea_to_deg(val, hemi):
     return dec
 
 
+class LidarStill:
+    """Does the lidar say the robot is standing still? Pure Python.
+    feed() every scan; still(t) -> True / False (False also when it cannot
+    tell -- nothing in range, or no recent scans)."""
+
+    def __init__(self):
+        self.hist = []               # (t, front_median|None, rear_median|None)
+
+    @staticmethod
+    def _sectors(ranges, angle_min, inc):
+        front, rear = [], []
+        for i, r in enumerate(ranges):
+            if not (MIN_VALID_DIST <= r <= LIDAR_SEE_M):  # also drops inf/nan
+                continue
+            deg = (math.degrees(angle_min + i * inc)
+                   + LIDAR_ANGLE_OFFSET_DEG) % 360.0
+            if deg <= LIDAR_SECTOR_DEG or deg >= 360.0 - LIDAR_SECTOR_DEG:
+                front.append(r)
+            elif abs(deg - 180.0) <= LIDAR_SECTOR_DEG:
+                rear.append(r)
+
+        def med(v):
+            if len(v) < 3:
+                return None
+            v = sorted(v)
+            return v[len(v) // 2]
+        return med(front), med(rear)
+
+    def feed(self, t, ranges, angle_min, inc):
+        f, r = self._sectors(ranges, angle_min, inc)
+        self.hist.append((t, f, r))
+        while self.hist and t - self.hist[0][0] > HOLD_STILL_S + 1.0:
+            self.hist.pop(0)
+
+    def still(self, t):
+        if not self.hist or t - self.hist[-1][0] > LIDAR_FRESH_S:
+            return False
+        win = [h for h in self.hist if t - h[0] <= HOLD_STILL_S]
+        if len(win) < LIDAR_MIN_SCANS or \
+                win[0][0] > t - HOLD_STILL_S + 0.5:
+            return False                       # not a full window yet
+        seen = 0
+        for k in (1, 2):
+            vals = [h[k] for h in win]
+            if all(v is None for v in vals):
+                continue                       # nothing that way: no evidence
+            if any(v is None for v in vals):
+                return False                   # came into / out of range
+            if max(vals) - min(vals) > LIDAR_STILL_M:
+                return False                   # it moved
+            seen += 1
+        return seen > 0
+
+
+class StationaryHold:
+    """Holds the published position still while the robot is parked. Pure
+    Python (no ROS), tested by ~/gps_hold_test.py. See PARKED = HELD STILL.
+
+    commanded(t, linear_x) on every /cmd_vel, scan(...) on every /scan;
+    apply(t, lat, lon) on every fix -> (lat, lon, held). The caller handles no-fix itself: a
+    lost fix publishes as lost, and the held point survives it (losing the
+    fix does not move the robot)."""
+
+    def __init__(self):
+        self.last_move = -math.inf   # never commanded yet = parked since boot
+        self.anchor = None           # (lat, lon) being held
+        self.event = None            # what changed, to log -- take_event()
+        self.lidar = LidarStill()
+
+    def commanded(self, t, linear_x):
+        if abs(linear_x) > MOVING_CMD:
+            self.last_move = t
+
+    def scan(self, t, ranges, angle_min, inc):
+        self.lidar.feed(t, ranges, angle_min, inc)
+
+    def parked(self, t):
+        """None if moving, else why it counts as parked."""
+        if t - self.last_move >= HOLD_STILL_S:
+            return "no drive command"
+        if self.lidar.still(t):
+            return ("told to drive, but the lidar sees no movement -- stuck, "
+                    "boxed in, wheels off the ground or motor power off?")
+        return None
+
+    def take_event(self):
+        """What changed since last asked (or None), for the log."""
+        ev, self.event = self.event, None
+        return ev
+
+    def apply(self, t, lat, lon):
+        why = self.parked(t)
+        if why is None:
+            if self.anchor is not None:
+                self.anchor = None
+                self.event = "moving -- GPS hold released"
+            return lat, lon, False
+        if self.anchor is None:
+            self.anchor = (lat, lon)
+            self.event = f"parked ({why}) -- GPS position held still"
+        return self.anchor[0], self.anchor[1], True
+
+
 # ============================ REAL GPS ============================
 class GPSNode(Node):
     def __init__(self):
         super().__init__('gps_node')
         import serial
         self.pub = self.create_publisher(String, '/gps', 10)
+        self.raw_pub = self.create_publisher(String, '/gps_raw', 10)
+        self.hold = StationaryHold()
+        self.create_subscription(Twist, '/cmd_vel', self.cmd_cb, 10)
+        self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.lat = None
         self.lon = None
         self.heading = ""
@@ -155,6 +330,7 @@ class GPSNode(Node):
         self.quality_ok = False     # passes the filter (see MIN_SATS_*)
         self.last_gga = 0.0         # when a GGA last arrived (see GGA_STALE_S)
         self.sats_in_view = {}      # per-talker (GP/GL/GA/GB) satellites in view
+        self.bad_lines = 0          # NMEA lines dropped for a bad checksum
         self.ser = serial.Serial(PORT, BAUD, timeout=1.0)
         self.configure_receiver()
         self.running = True
@@ -162,6 +338,13 @@ class GPSNode(Node):
         self.create_timer(0.5, self.publish_gps)
         self._last_log = 0
         self.get_logger().info(f"GPS node ready (REAL) on {PORT} @ {BAUD}")
+
+    def cmd_cb(self, msg: Twist):
+        self.hold.commanded(time.time(), msg.linear.x)
+
+    def scan_cb(self, msg: LaserScan):
+        self.hold.scan(time.time(), msg.ranges, msg.angle_min,
+                       msg.angle_increment)
 
     # ---- receiver configuration (UBX) ----
     @staticmethod
@@ -245,6 +428,10 @@ class GPSNode(Node):
                 continue
             if not raw.startswith('$'):
                 continue
+            if not nmea_ok(raw):
+                self.bad_lines += 1
+                continue
+            raw = raw[:raw.rfind('*')]          # fields only, no checksum
             parts = raw.split(',')
             tag = parts[0][3:] if len(parts[0]) >= 6 else parts[0]
             try:
@@ -323,10 +510,15 @@ class GPSNode(Node):
                 self.get_logger().warn(
                     f"GPS fix REJECTED as unreliable: {why} -- publishing as "
                     f"no fix rather than a position that may be metres off")
+        raw = None
         if ok:
-            # real fix -> full position
-            msg.data = (f"{self.lat:.7f},{self.lon:.7f},{self.heading},"
-                        f"{self.speed_kmh:.1f},{self.fix},{self.sats}")
+            # real fix -> full position (held still while parked)
+            raw = (f"{self.lat:.7f},{self.lon:.7f},{self.heading},"
+                   f"{self.speed_kmh:.1f},{self.fix},{self.sats}")
+            lat, lon, held = self.hold.apply(time.time(), self.lat, self.lon)
+            spd = 0.0 if held else self.speed_kmh
+            msg.data = (f"{lat:.7f},{lon:.7f},{self.heading},"
+                        f"{spd:.1f},{self.fix},{self.sats}")
         else:
             # no fix, or a fix too poor to trust -> publish "acquiring" with
             # satellites IN VIEW so the app shows a live, rising count instead
@@ -337,6 +529,12 @@ class GPSNode(Node):
                 siv = 0     # a frozen count is as misleading as a frozen fix
             msg.data = f",,,0.0,0,{siv}"
         self.pub.publish(msg)
+        ev = self.hold.take_event()
+        if ev:
+            self.get_logger().info(ev)
+        rm = String()
+        rm.data = raw if raw is not None else msg.data
+        self.raw_pub.publish(rm)
 
         self._last_log += 1
         if self._last_log >= 10:
@@ -346,7 +544,8 @@ class GPSNode(Node):
                 self.get_logger().info(
                     f"FIX  sats={self.sats} hdop={hd} lat={self.lat:.6f} "
                     f"lon={self.lon:.6f} hdg={self.heading or '-'} "
-                    f"spd={self.speed_kmh:.1f}km/h")
+                    f"spd={self.speed_kmh:.1f}km/h"
+                    + (" (parked: /gps held)" if self.hold.anchor else ""))
             elif self.lat is not None and self.fix >= 1:
                 self.get_logger().info(
                     f"weak fix held back: sats={self.sats} hdop={hd} "
@@ -355,6 +554,11 @@ class GPSNode(Node):
                 siv = sum(self.sats_in_view.values()) if self.sats_in_view else 0
                 self.get_logger().info(
                     f"acquiring... {siv} sat(s) in view (no fix yet)")
+            if self.bad_lines:
+                self.get_logger().warn(
+                    f"{self.bad_lines} garbled NMEA line(s) dropped (bad "
+                    f"checksum) in the last 5 s -- serial wiring/noise?")
+                self.bad_lines = 0
 
     def destroy_node(self):
         self.running = False
@@ -370,6 +574,11 @@ class GPSSim(Node):
     def __init__(self):
         super().__init__('gps_node')   # same node/topic name as real
         self.pub = self.create_publisher(String, '/gps', 10)
+        self.raw_pub = self.create_publisher(String, '/gps_raw', 10)
+        # As the real node, but on drive commands only -- no lidar: on the
+        # bench the wheels are off the ground and the lidar sees a still
+        # room, which would freeze the simulated drive.
+        self.hold = StationaryHold()
         self.lat = SIM_START_LAT
         self.lon = SIM_START_LON
         self.heading = 90.0            # start facing East
@@ -393,6 +602,7 @@ class GPSSim(Node):
     def cmd_cb(self, msg: Twist):
         self.lin = max(-1.0, min(1.0, msg.linear.x))
         self.ang = max(-1.0, min(1.0, msg.angular.z))
+        self.hold.commanded(time.time(), msg.linear.x)
 
     def step(self):
         spd = self.lin * SIM_MAX_SPEED_MPS
@@ -419,9 +629,17 @@ class GPSSim(Node):
             lon += self.ex / (M_PER_DEG_LAT * math.cos(math.radians(lat)))
             if abs(spd) < SIM_COG_MIN_MPS:
                 hdg = ""                  # no course while barely moving
+        raw = String()
+        raw.data = (f"{lat:.7f},{lon:.7f},{hdg},"
+                    f"{abs(spd) * 3.6:.1f},1,12")
+        self.raw_pub.publish(raw)
+        lat, lon, held = self.hold.apply(time.time(), lat, lon)
+        ev = self.hold.take_event()
+        if ev:
+            self.get_logger().info(ev)
         msg = String()
         msg.data = (f"{lat:.7f},{lon:.7f},{hdg},"
-                    f"{abs(spd) * 3.6:.1f},1,12")
+                    f"{0.0 if held else abs(spd) * 3.6:.1f},1,12")
         self.pub.publish(msg)
         self._log += 1
         if self._log >= 25:

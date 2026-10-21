@@ -9,7 +9,9 @@ command passes through (see FENCE ENFORCEMENT in motor_node.py). This node
 only has to be right about where the robot is.
 
 Subscribes:
-    /gps        (std_msgs/String)  "lat,lon,heading,speed,fix,sats"
+    /gps_raw    (std_msgs/String)  "lat,lon,heading,speed,fix,sats" -- the
+                                   receiver's own positions, not the parked
+                                   hold on /gps (see gps_node.py)
     /fence_cmd  (std_msgs/String)  from bridge_node:
                     "SET <inset_m>|lat,lon;lat,lon;..."   replace the boundary
                     "ADD lat,lon"                          append a corner
@@ -95,7 +97,10 @@ class FenceNode(Node):
         super().__init__('fence_node')
         self.state_pub = self.create_publisher(String, '/fence_state', 10)
         self.fence_pub = self.create_publisher(String, '/fence', LATCHED)
-        self.create_subscription(String, '/gps', self.gps_cb, 10)
+        # /gps_raw, NOT /gps: /gps is held still while parked, and the
+        # fence must never rest on a held position (gps_node.py, THE FENCE
+        # DOES NOT USE THE HOLD). Same format, same no-fix rules.
+        self.create_subscription(String, '/gps_raw', self.gps_cb, 10)
         self.create_subscription(String, '/fence_cmd', self.cmd_cb, 10)
         self.create_subscription(Twist, '/cmd_vel', self.vel_cb, 10)
 
