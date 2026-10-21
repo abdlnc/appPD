@@ -160,10 +160,19 @@ CAPTURE_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 #                            ACTIVE boundary exists. Without one it stays plain
 #                            AUTO and says so in the log.
 #
-# Both are checked on every use, not at start-up, so touching or removing
+#   touch ~/agv_set_position Map taps tell the robot where it IS: first tap =
+#                            its real position, second tap = a point it is
+#                            facing (gps_node.py, YOU SET WHERE IT IS). The
+#                            robot is held in STOP. "Clear waypoint" drops the
+#                            set position (plain GPS again). rm the file for
+#                            normal waypoints -- the set position stays.
+#                            Checked before ~/agv_fence_edit.
+#
+# All are checked on every use, not at start-up, so touching or removing
 # one takes effect immediately with no restart.
 FENCE_EDIT_FLAG = os.path.expanduser("~/agv_fence_edit")
 COVERAGE_FLAG = os.path.expanduser("~/agv_coverage")
+SET_POSITION_FLAG = os.path.expanduser("~/agv_set_position")
 DEFAULT_ENV = "OUTDOOR"
 MANUAL_SPEED = MANUAL_SPEED_BY_ENV[DEFAULT_ENV]
                             # (map_saver_cli can transiently fail right after
@@ -201,6 +210,7 @@ class BridgeNode(Node):
 
         # --- field boundary and COVER mode ---
         self.fence_cmd_pub = self.create_publisher(String, '/fence_cmd', 10)
+        self.setpos_pub = self.create_publisher(String, '/set_position', 10)
         self.cover_cmd_pub = self.create_publisher(String, '/cover_cmd', 10)
         self.latest_fence = None         # JSON from fence_node (latched)
         self.fence_active = False
@@ -358,6 +368,19 @@ class BridgeNode(Node):
 
     def handle_waypoint(self, payload):
         payload = payload.strip()
+        if os.path.exists(SET_POSITION_FLAG):
+            # see "No-rebuild interim": the tap is WHERE THE ROBOT IS
+            m = String()
+            m.data = "CLEAR" if payload.upper() == "CLEAR" else "TAP " + payload
+            self.setpos_pub.publish(m)
+            self.get_logger().warn(
+                "*** SET POSITION (~/agv_set_position): "
+                + ("set position cleared" if m.data == "CLEAR" else
+                   "tap " + payload + " sent to gps_node")
+                + ", robot held in STOP. rm ~/agv_set_position for normal "
+                "waypoints. ***")
+            self.set_mode("STOP")
+            return
         if os.path.exists(FENCE_EDIT_FLAG):
             # see "No-rebuild interim": the tap is a CORNER, not a destination
             if payload.upper() == "CLEAR":

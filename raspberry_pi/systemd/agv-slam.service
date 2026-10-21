@@ -18,6 +18,15 @@ Description=AGV SLAM mapping (slam_toolbox)
 # No ordering is needed anyway: ROS2 subscriptions do not care about start
 # order, slam_toolbox just waits for /scan to appear.
 Wants=agv.service
+#
+# EXCEPT the network. Started before WiFi was up (SLAM at 21:48:07, wlan0 at
+# 21:48:12 on 2026-10-19), slam_toolbox ran but no other node could see it --
+# no map frame, no lidar position -- until restarted by hand. Ordering after
+# network-online.target is NOT the cycle above: that target does not depend
+# on this unit. On a RESET MAPPED AREA restart the network is already up, so
+# it costs nothing there.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

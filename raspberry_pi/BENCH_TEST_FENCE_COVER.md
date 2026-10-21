@@ -20,6 +20,8 @@ source ~/ros2_ws/install/setup.bash
 ```bash
 python3 ~/field_geometry_test.py        # boundary, lanes, coverage, dedup maths
 python3 ~/coverage_planner_test.py      # driving back to the start
+python3 ~/gps_hold_test.py              # GPS held still while parked
+python3 ~/gps_position_ref_test.py      # the position you set, tracked
 python3 ~/fence_enforcement_test.py     # what motor_node lets through at the fence
 python3 ~/gap_seeking_test.py           # AUTO unchanged with no boundary set
 python3 ~/turn_direction_test.py
@@ -180,10 +182,35 @@ the first are named `..._dup.jpg`, and they're still saved. Detections of the
 same thing log `detection NOT saved: ... at least as confident` or
 `better shot ... replacing ...`.
 
+## 9a. Setting where the robot is (no app rebuild)
+
+GPS among the houses can be tens of metres off. To tell the robot where it
+really is:
+
+```bash
+touch ~/agv_set_position
+```
+
+1. On the app's GPS map, tap **where the robot really is**. The marker jumps
+   there; the journal says `robot position SET (GPS was N m off)`.
+2. Tap a point **a few metres in front of it** (the way it faces). The
+   journal says `tracking it by LIDAR from here`.
+3. `rm ~/agv_set_position` so taps are waypoints again (the position stays).
+
+From then on, the marker moves by the lidar while it can see walls and
+houses, and by GPS corrected by the error it had while the lidar can't see
+enough. After 60 s without lidar tracking it drops back to plain GPS (the
+journal says so): tap again. "Clear waypoint" while the flag is there
+drops it at once. The boundary fence never uses this; it keeps reading the
+receiver.
+
+Check it: with lidar tracking on, push the robot (STOP mode) 3 m forward by
+hand, and the marker should move 3 m the way it faces. Then 3 m back.
+
 ## 10. Put everything back
 
 ```bash
-rm -f ~/agv_use_sim ~/agv_sim_ackermann ~/agv_sim_noise ~/agv_coverage ~/agv_fence_edit
+rm -f ~/agv_use_sim ~/agv_sim_ackermann ~/agv_sim_noise ~/agv_coverage ~/agv_fence_edit ~/agv_set_position
 ros2 topic pub --once /fence_cmd std_msgs/String "{data: CLEAR}"   # or: rm ~/agv_boundary.json
 rm -f ~/agv_coverage_state.json
 sudo systemctl restart agv.service

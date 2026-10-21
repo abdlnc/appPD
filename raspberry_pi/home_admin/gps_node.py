@@ -9,6 +9,9 @@ Publishes:
                                   reads this one (see below), and gps_drift.py.
 Subscribes:
     /cmd_vel, /scan             : is the robot moving? (parked hold)
+    /set_position               : "TAP lat,lon" | "CLEAR" -- see YOU SET
+                                  WHERE IT IS (from bridge_node)
+    TF map -> base_link         : slam_toolbox's lidar position
 
   * With a FIX  -> "lat,lon,heading,speed,fix,sats"   (sats = used in solution)
     ...but only a fix that passes the QUALITY FILTER (enough satellites, low
@@ -37,13 +40,31 @@ behind in range -- and a held position must never be what stands between
 the robot and the edge of the field. The fence keeps the receiver's own
 positions, exactly as it did before this hold existed.
 
-PICKED UP AND CARRIED, it still shows where it was parked, until the next
+PICKED UP AND CARRIED, it still shows where it was parked (unless lidar
+tracking is on -- YOU SET WHERE IT IS -- which sees it move), until the next
 drive command (any -- a joystick nudge will do). There is no automatic
 "it was moved" release because nothing available can tell: parked on
 2026-10-21 the receiver's own speed read 2 km/h or more 30% of the time
 (up to 19 km/h -- more than it reads while driving), and its position
 jumped up to 113 m away for minutes at a time. A release on either would
 have fired on the receiver's noise, not on a carry -- the drift again.
+
+YOU SET WHERE IT IS. Among houses this receiver can be tens of metres off
+(113 m, parked, 2026-10-21). So you can tell the robot where it is:
+touch ~/agv_set_position, then on the app's map tap where the robot REALLY
+is, then tap a point it is FACING (a few metres in front of it). From then
+on /gps is that spot plus how far the robot has moved since:
+  * by LIDAR (slam_toolbox), while the lidar can see enough around it --
+    walls, houses, fences. Accurate to a few tens of cm, and the heading
+    is real, not guessed from GPS positions.
+  * by GPS CORRECTED by the error it had when you tapped, when the lidar
+    cannot see enough (an open field). The correction is refreshed all
+    the time SLAM is working, so the hand-over does not jump; but GPS
+    error changes, so after OFFSET_TRUST_S without SLAM it is no better
+    than plain GPS, and the manual position is dropped (logged): tap again.
+CLEAR (the app's "clear waypoint" while the flag is there) drops it at
+once. The fence never uses any of this -- it reads /gps_raw. Not in --sim
+(the lidar on the bench sees a still room).
 
 TWO MODES:
   (default) REAL  : reads u-blox NEO-M8N NMEA on /dev/ttyAMA0 @ 9600.
@@ -69,6 +90,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
+import tf2_ros
 
 PORT = "/dev/ttyAMA0"
 BAUD = 9600
@@ -143,6 +165,29 @@ LIDAR_FRESH_S = 0.5         # no scan this recent = lidar not running
 LIDAR_ANGLE_OFFSET_DEG = 180.0   # as control_node: mounted rotated 180 deg
 MIN_VALID_DIST = 0.15            # as control_node: own chassis / noise
 
+# ---- you set where it is (see YOU SET WHERE IT IS, top) ----
+# SLAM is trusted while at least SLAM_MIN_SEEN of the lidar's rays return
+# something within SLAM_SEE_M, averaged over SLAM_SEEN_S. Measured among the
+# houses on 2026-10-21: 0.76 (0.67 at worst). TODO: measure in the field --
+# 0.30 is a guess at where scan matching stops having enough to hold on to.
+SLAM_SEE_M = 10.0
+SLAM_MIN_SEEN = 0.30
+SLAM_SEEN_S = 2.0
+SLAM_FRESH_S = 1.0          # no SLAM position this recent = SLAM not running
+# The SLAM position moving further than this between two readings (2 Hz) is
+# not driving -- slam_toolbox restarted (its map starts again at 0,0) or its
+# scan matching snapped somewhere else. Re-anchored to the last good position.
+SLAM_JUMP_M = 1.0
+RAW_MEAN_S = 5.0            # GPS error at a tap: the mean of this much raw GPS
+# Corrected GPS without SLAM: how long the correction is trusted. The error
+# is correlated over ~30-120 s; past roughly half that, subtracting an old
+# error adds as much as it removes.
+OFFSET_TRUST_S = 60.0
+FACE_MIN_M = 1.0            # the "facing" tap must be at least this far off
+SLAM_YAW_OFFSET_DEG = LIDAR_ANGLE_OFFSET_DEG   # base_link = laser frame, and
+                            # the lidar is mounted backwards: SLAM's yaw is
+                            # the robot's REAR. Its front is this much round.
+
 # Simulation start point (Quezon City) + virtual robot limits
 SIM_START_LAT = 14.7481338
 SIM_START_LON = 121.0616677
@@ -205,6 +250,173 @@ def nmea_to_deg(val, hemi):
     if hemi in ('S', 'W'):
         dec = -dec
     return dec
+
+
+def _enu(lat0, lon0, lat, lon):
+    """(east, north) metres of (lat, lon) from (lat0, lon0)."""
+    return ((lon - lon0) * M_PER_DEG_LAT * math.cos(math.radians(lat0)),
+            (lat - lat0) * M_PER_DEG_LAT)
+
+
+def _ll(lat0, lon0, e, n):
+    return (lat0 + n / M_PER_DEG_LAT,
+            lon0 + e / (M_PER_DEG_LAT * math.cos(math.radians(lat0))))
+
+
+class PositionRef:
+    """Where the robot is, from a position you tapped plus how far it has
+    moved since (see YOU SET WHERE IT IS, top). Pure Python -- tested by
+    ~/gps_position_ref_test.py.
+
+    tap(t, lat, lon, raw_mean, slam): your taps -- position, then facing.
+    fuse(t, raw, raw_mean, slam, slam_ok) on every publish -> None (no
+    manual position: publish GPS as usual) or (lat, lon, compass|None,
+    source). slam = (x, y, yaw_rad) in slam_toolbox's map frame, or None.
+    take_event() -> what to log."""
+
+    def __init__(self):
+        self.stage = "OFF"           # OFF | FACE (waiting for tap 2) | ON
+        self.pos = None              # tapped position (lat, lon)
+        self.pos_slam = None         # SLAM pose when it was tapped
+        self.anchor = None           # (x0, y0, rot, lat0, lon0): SLAM -> world
+        self.off = None              # (east, north) GPS correction, metres
+        self.off_t = None            # when the correction was last measured
+        self.last = None             # last fused (lat, lon, compass|None)
+        self.last_slam = None        # last SLAM pose seen, for jump checks
+        self.using = None            # "SLAM" | "GPS" -- for change logs
+        self.event = None
+
+    def take_event(self):
+        ev, self.event = self.event, None
+        return ev
+
+    def _say(self, msg):
+        self.event = msg if self.event is None else self.event + "; " + msg
+
+    def clear(self, why="cleared"):
+        ev = self.event
+        if self.stage != "OFF":
+            ev = (ev + "; " if ev else "") + \
+                f"manual position {why} -- plain GPS again"
+        self.__init__()
+        self.event = ev             # survives the reset, to be logged
+
+    def _anchor_at(self, lat, lon, compass, slam):
+        """Tie SLAM's frame to the world: the robot, at SLAM pose `slam`,
+        is at (lat, lon) facing `compass` (degrees, clockwise from north)."""
+        x0, y0, yaw = slam
+        front = yaw + math.radians(SLAM_YAW_OFFSET_DEG)
+        # ENU angle of the robot's front, minus its angle in SLAM's frame
+        rot = math.radians(90.0 - compass) - front
+        self.anchor = (x0, y0, rot, lat, lon)
+
+    def _from_slam(self, slam):
+        x0, y0, rot, lat0, lon0 = self.anchor
+        x, y, yaw = slam
+        dx, dy = x - x0, y - y0
+        e = dx * math.cos(rot) - dy * math.sin(rot)
+        n = dx * math.sin(rot) + dy * math.cos(rot)
+        lat, lon = _ll(lat0, lon0, e, n)
+        ang = yaw + math.radians(SLAM_YAW_OFFSET_DEG) + rot   # ENU, CCW
+        compass = (90.0 - math.degrees(ang)) % 360.0
+        return lat, lon, compass
+
+    def tap(self, t, lat, lon, raw_mean, slam):
+        if self.stage == "FACE":
+            plat, plon = self.pos
+            e, n = _enu(plat, plon, lat, lon)
+            if math.hypot(e, n) < FACE_MIN_M:
+                self._say(f"facing tap only {math.hypot(e, n):.1f} m from "
+                          f"the robot -- tap a point at least {FACE_MIN_M:.0f}"
+                          f" m in front of it")
+                return
+            compass = math.degrees(math.atan2(e, n)) % 360.0
+            self.stage = "ON"
+            if self.pos_slam is not None and slam is not None and \
+                    math.dist(self.pos_slam[:2], slam[:2]) < 0.5:
+                self._anchor_at(plat, plon, compass, self.pos_slam)
+                self.last = (plat, plon, compass)
+                self._say(f"robot faces {compass:.0f} deg -- tracking it by "
+                          f"LIDAR from here (corrected GPS where the lidar "
+                          f"cannot see enough)")
+            else:
+                self.last = (plat, plon, None)
+                self._say("robot faces {:.0f} deg, but SLAM is not running "
+                          "(or the robot moved between taps) -- tracking by "
+                          "CORRECTED GPS only, good for about {:.0f} s "
+                          "unless SLAM picks up".format(compass,
+                                                        OFFSET_TRUST_S))
+            return
+        # first tap (or a new position): where it is
+        self.__init__()
+        self.stage = "FACE"
+        self.pos = (lat, lon)
+        self.pos_slam = slam
+        self.last = (lat, lon, None)
+        if raw_mean is not None:
+            e, n = _enu(raw_mean[0], raw_mean[1], lat, lon)
+            self.off, self.off_t = (e, n), t
+            gps = f"GPS was {math.hypot(e, n):.0f} m off"
+        else:
+            gps = "no GPS fix to correct"
+        self._say(f"robot position SET ({gps}) -- now tap a point it is "
+                  f"facing, a few metres in front of it")
+
+    def fuse(self, t, raw, raw_mean, slam, slam_ok):
+        if self.stage == "OFF":
+            return None
+        if self.stage == "FACE":
+            # held in STOP between the taps: the tapped spot, as tapped
+            return self.pos[0], self.pos[1], None, "SET"
+
+        jumped = False
+        if slam is not None and self.last_slam is not None and \
+                math.dist(slam[:2], self.last_slam[:2]) > SLAM_JUMP_M:
+            jumped = True
+        if slam is not None:
+            self.last_slam = slam
+
+        # SLAM is only ever lined up with the world at your taps. Without
+        # that (SLAM not running then) it is corrected GPS until expiry.
+        if slam_ok and slam is not None and self.anchor is not None:
+            if jumped:
+                # SLAM's pose AND yaw jumped: re-tie both to the last good
+                # position and heading
+                self._say("SLAM jumped -- lidar tracking re-tied to the "
+                          "last good position")
+                self._anchor_at(self.last[0], self.last[1],
+                                self.last[2], slam)
+            elif self.using == "GPS":
+                # back from corrected GPS: SLAM may have lost track of
+                # distance while it could not see, but holds rotation far
+                # better -- keep its heading, re-tie the position
+                self._say("lidar can see again -- lidar tracking re-tied to "
+                          "the current (corrected GPS) position")
+                self._anchor_at(self.last[0], self.last[1],
+                                self._from_slam(slam)[2], slam)
+            lat, lon, compass = self._from_slam(slam)
+            if raw_mean is not None:       # keep the fallback fresh
+                self.off = _enu(raw_mean[0], raw_mean[1], lat, lon)
+                self.off_t = t
+            self.using = "SLAM"
+            self.last = (lat, lon, compass)
+            return lat, lon, compass, "SLAM"
+
+        # no usable SLAM: corrected GPS
+        if self.off is None or t - self.off_t > OFFSET_TRUST_S:
+            self.clear(f"expired ({OFFSET_TRUST_S:.0f} s without lidar "
+                       f"tracking)" if self.off is not None else
+                       "lost (no lidar tracking and no GPS to correct)")
+            return None
+        if raw is None:
+            return None                     # no fix: publish no fix
+        if self.using != "GPS":
+            self._say("lidar cannot see enough -- CORRECTED GPS for now "
+                      f"(good for about {OFFSET_TRUST_S:.0f} s)")
+            self.using = "GPS"
+        lat, lon = _ll(raw[0], raw[1], *self.off)
+        self.last = (lat, lon, self.last[2] if self.last else None)
+        return lat, lon, None, "GPS"
 
 
 class LidarStill:
@@ -320,6 +532,12 @@ class GPSNode(Node):
         self.hold = StationaryHold()
         self.create_subscription(Twist, '/cmd_vel', self.cmd_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
+        self.ref = PositionRef()       # see YOU SET WHERE IT IS (top)
+        self.create_subscription(String, '/set_position', self.setpos_cb, 10)
+        self.tf_buf = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf, self)
+        self.raw_hist = []          # (t, lat, lon) trusted raw fixes, RAW_MEAN_S
+        self.seen_hist = []         # (t, fraction of rays returning)
         self.lat = None
         self.lon = None
         self.heading = ""
@@ -343,8 +561,60 @@ class GPSNode(Node):
         self.hold.commanded(time.time(), msg.linear.x)
 
     def scan_cb(self, msg: LaserScan):
-        self.hold.scan(time.time(), msg.ranges, msg.angle_min,
-                       msg.angle_increment)
+        now = time.time()
+        self.hold.scan(now, msg.ranges, msg.angle_min, msg.angle_increment)
+        if msg.ranges:
+            seen = sum(1 for r in msg.ranges
+                       if MIN_VALID_DIST <= r <= SLAM_SEE_M) / len(msg.ranges)
+            self.seen_hist.append((now, seen))
+            while self.seen_hist and now - self.seen_hist[0][0] > SLAM_SEEN_S:
+                self.seen_hist.pop(0)
+
+    # ---- you set where it is ----
+    def _slam_pose(self):
+        """(x, y, yaw) from slam_toolbox, or None if it is not running."""
+        try:
+            tf = self.tf_buf.lookup_transform('map', 'base_link',
+                                              rclpy.time.Time())
+        except Exception:
+            return None
+        st = tf.header.stamp
+        if time.time() - (st.sec + st.nanosec * 1e-9) > SLAM_FRESH_S:
+            return None
+        q = tf.transform.rotation
+        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
+                         1 - 2 * (q.y * q.y + q.z * q.z))
+        return (tf.transform.translation.x, tf.transform.translation.y, yaw)
+
+    def _slam_ok(self, now):
+        if not self.seen_hist or now - self.seen_hist[-1][0] > LIDAR_FRESH_S:
+            return False
+        v = [f for _, f in self.seen_hist]
+        return sum(v) / len(v) >= SLAM_MIN_SEEN
+
+    def _raw_mean(self, now):
+        v = [(a, b) for t, a, b in self.raw_hist if now - t <= RAW_MEAN_S]
+        if not v:
+            return None
+        return (sum(a for a, _ in v) / len(v), sum(b for _, b in v) / len(v))
+
+    def setpos_cb(self, msg: String):
+        d = msg.data.strip()
+        now = time.time()
+        if d.upper() == "CLEAR":
+            self.ref.clear()
+        elif d.upper().startswith("TAP "):
+            try:
+                lat, lon = (float(x) for x in d[4:].split(","))
+            except ValueError:
+                self.get_logger().warn(f"bad /set_position: {d!r}")
+                return
+            raw_mean = self._raw_mean(now) if self.quality_ok else None
+            self.ref.tap(now, lat, lon, raw_mean, self._slam_pose())
+        self.hold.anchor = None     # publish the new position at once
+        ev = self.ref.take_event()
+        if ev:
+            self.get_logger().warn(ev)
 
     # ---- receiver configuration (UBX) ----
     @staticmethod
@@ -511,11 +781,37 @@ class GPSNode(Node):
                     f"GPS fix REJECTED as unreliable: {why} -- publishing as "
                     f"no fix rather than a position that may be metres off")
         raw = None
+        now = time.time()
         if ok:
-            # real fix -> full position (held still while parked)
             raw = (f"{self.lat:.7f},{self.lon:.7f},{self.heading},"
                    f"{self.speed_kmh:.1f},{self.fix},{self.sats}")
-            lat, lon, held = self.hold.apply(time.time(), self.lat, self.lon)
+            self.raw_hist.append((now, self.lat, self.lon))
+        while self.raw_hist and now - self.raw_hist[0][0] > RAW_MEAN_S:
+            self.raw_hist.pop(0)
+        fused = self.ref.fuse(now, (self.lat, self.lon) if ok else None,
+                              self._raw_mean(now) if ok else None,
+                              self._slam_pose(), self._slam_ok(now))
+        ev = self.ref.take_event()
+        if ev:
+            self.get_logger().warn(ev)
+        if fused is not None:
+            # your set position, carried along
+            flat, flon, compass, src = fused
+            if src == "SLAM":
+                # No parked hold on SLAM: it does not wander like GPS (6 cm,
+                # still, 2026-10-21), and it DOES see the robot pushed or
+                # carried, which the hold would hide.
+                lat, lon, held = flat, flon, False
+                self.hold.anchor = None   # re-anchor if it falls back to GPS
+            else:
+                lat, lon, held = self.hold.apply(now, flat, flon)
+            hdg = f"{compass:.1f}" if compass is not None else self.heading
+            spd = 0.0 if held or not ok else self.speed_kmh
+            msg.data = (f"{lat:.7f},{lon:.7f},{hdg},{spd:.1f},"
+                        f"{self.fix if ok else 1},{self.sats}")
+        elif ok:
+            # real fix -> full position (held still while parked)
+            lat, lon, held = self.hold.apply(now, self.lat, self.lon)
             spd = 0.0 if held else self.speed_kmh
             msg.data = (f"{lat:.7f},{lon:.7f},{self.heading},"
                         f"{spd:.1f},{self.fix},{self.sats}")
@@ -545,7 +841,9 @@ class GPSNode(Node):
                     f"FIX  sats={self.sats} hdop={hd} lat={self.lat:.6f} "
                     f"lon={self.lon:.6f} hdg={self.heading or '-'} "
                     f"spd={self.speed_kmh:.1f}km/h"
-                    + (" (parked: /gps held)" if self.hold.anchor else ""))
+                    + (" (parked: /gps held)" if self.hold.anchor else "")
+                    + (f" (manual position: {self.ref.using or 'SET'})"
+                       if self.ref.stage != "OFF" else ""))
             elif self.lat is not None and self.fix >= 1:
                 self.get_logger().info(
                     f"weak fix held back: sats={self.sats} hdop={hd} "
