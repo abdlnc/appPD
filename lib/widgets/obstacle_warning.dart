@@ -164,8 +164,7 @@ class ObstacleWarning extends StatelessWidget {
         if (socket.unsupportedField || !socket.hasGps) {
           final String detail;
           if (socket.unsupportedField) {
-            final pct = (socket.fieldConfidence * 100).round();
-            detail = 'soil camera: not a supported field ($pct%)';
+            detail = 'soil camera: not a supported field';
           } else {
             detail = 'no GPS fix - field type cannot be confirmed';
           }
