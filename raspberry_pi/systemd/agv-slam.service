@@ -20,9 +20,9 @@ Description=AGV SLAM mapping (slam_toolbox)
 Wants=agv.service
 #
 # Ordered after network-online.target (NOT the cycle above: that target does
-# not depend on this unit), which the clock sync in start_slam.sh needs.
-# Started before the boot-time clock jump, slam_toolbox runs but no other
-# node can see it -- start_slam.sh waits for the clock (see step 0 there).
+# not depend on this unit) -- harmless, kept. SLAM losing sight of the other
+# nodes was a Wi-Fi address change under running nodes, fixed by
+# ROS_LOCALHOST_ONLY in start_slam.sh / start_agv.sh.
 After=network-online.target
 Wants=network-online.target
 

@@ -39,4 +39,15 @@ fi
 source "$HOME/ros2_ws/install/setup.bash"
 
 # --- 4. launch everything (replaces this shell so systemd tracks ros2 launch) -
+# --- ROS traffic stays inside the Pi --------------------------------------
+# Every node runs on this Pi, and the app talks over its own WebSocket, so
+# nothing needs ROS over Wi-Fi. Without this, a node advertises the Wi-Fi
+# address it had when it STARTED: on 2026-10-22 the Pi moved to another
+# network at 15:49 with everything running, and from then on nothing started
+# later could reach the running nodes -- SLAM, restarted by the app's RESET
+# MAPPED AREA, never got another lidar scan, so no map and SAVE failed. On
+# loopback only, a Wi-Fi change cannot do that. Terminals (ros2 CLI, rviz2)
+# need the same setting to see the nodes -- it is in ~/.bashrc.
+export ROS_LOCALHOST_ONLY=1
+
 exec ros2 launch "$HOME/agv_autostart.launch.py"

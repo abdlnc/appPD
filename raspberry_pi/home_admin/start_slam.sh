@@ -17,28 +17,6 @@
 # environment, so conda + ROS2 must be set up here. Errors show up in:
 #     journalctl -u agv-slam.service -f
 
-# --- 0. wait for the clock to be set (up to CLOCK_WAIT_S) --------------------
-# The Pi has no battery clock: it boots at the last saved time, and a few
-# seconds later the time server moves it on -- by 7.5 hours on 2026-10-21.
-# slam_toolbox started BEFORE that jump kept running but no other node could
-# see it again (no map frame, no lidar position) until restarted by hand;
-# every node started after it was fine. So wait for the clock to be set.
-# Not forever: in the field with no internet it is never set -- but then it
-# never jumps either, so after CLOCK_WAIT_S start anyway. A restart (the
-# app's RESET MAPPED AREA) finds it already set and does not wait.
-CLOCK_WAIT_S=90
-for ((i = 0; i < CLOCK_WAIT_S; i++)); do
-    [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && break
-    [ "$i" -eq 0 ] && echo "waiting up to ${CLOCK_WAIT_S}s for the clock to be set (time server)..."
-    sleep 1
-done
-if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
-    echo "clock set: $(date)"
-else
-    echo "WARNING: clock not set after ${CLOCK_WAIT_S}s (no internet?) -- starting anyway." >&2
-    echo "         If it is set later, SLAM may vanish: sudo systemctl restart agv-slam.service" >&2
-fi
-
 # --- 1. locate the conda/mamba install (RoboStack/Miniforge) -----------------
 CONDA_BASE=""
 for base in "$HOME/miniforge3" "$HOME/mambaforge" "$HOME/miniconda3" "$HOME/anaconda3"; do
@@ -74,4 +52,15 @@ source "$HOME/ros2_ws/install/setup.bash"
 # NOTE: does NOT start a Lidar driver -- it only subscribes to /scan, which
 # agv.service's sllidar_node already publishes. Launching a second Lidar
 # driver here is what would cause a serial-port conflict.
+# --- ROS traffic stays inside the Pi --------------------------------------
+# Every node runs on this Pi, and the app talks over its own WebSocket, so
+# nothing needs ROS over Wi-Fi. Without this, a node advertises the Wi-Fi
+# address it had when it STARTED: on 2026-10-22 the Pi moved to another
+# network at 15:49 with everything running, and from then on nothing started
+# later could reach the running nodes -- SLAM, restarted by the app's RESET
+# MAPPED AREA, never got another lidar scan, so no map and SAVE failed. On
+# loopback only, a Wi-Fi change cannot do that. Terminals (ros2 CLI, rviz2)
+# need the same setting to see the nodes -- it is in ~/.bashrc. Must match start_agv.sh.
+export ROS_LOCALHOST_ONLY=1
+
 exec ros2 launch "$HOME/agv_slam/slam.launch.py"
