@@ -101,6 +101,15 @@ SESSION_ID        = datetime.now().strftime("%Y%m%d-%H%M")
 # used here is the one the model's own graph asks for -- it contains Keras'
 # MobileNetV3 rescaling layer, so raw 0-255 RGB, like the TFLite -- and the
 # conversion (Keras -> ONNX -> onnx2torch) is the likely culprit.
+#
+# 2026-10-27: replaced, on request, by a RETRAINED .pt (same MobileNetV3Small,
+# same input; 26 of 198 weight tensors changed -- the later layers and the
+# head). The previous one is kept as agv_field_classifier.prev_20261019.pt.
+# Measured the same way, two samples of 40 + 40: field ground called soil 0
+# and 2 of 40, indoor called not-soil 40 of 40 -- 50-52%, P(supported) 0.00-
+# 0.06 on field ground. No better: it calls nearly everything not-soil. 18
+# input variants (size 160/224/256, 0-255 / 0-1 / -1..1, RGB / BGR) gave at
+# best 57%. TFLite on the same samples: 68-75%, 40 of 40 field ground.
 FIELD_MODEL_PATH = os.path.expanduser("~/agv_models/agv_field_classifier.pt")
 FIELD_INPUT_SIZE = 224
 # Feed RAW 0-255 pixels. The model normalises them itself.
