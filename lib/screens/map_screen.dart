@@ -11,6 +11,9 @@ import '../services/robot_socket.dart';
 import '../services/run_log_store.dart';
 import '../theme/app_theme.dart';
 
+/// The app bar's tools-and-layers menu entries.
+enum _MapAction { setPosition, fence, satellite, trail, obstacles, photos, clear }
+
 /// GPS map (2.1 visualization) + interactive waypoint navigation (2.2).
 /// - GO starts navigation and shows a live NAVIGATING state + STOP button.
 /// - The map FOLLOWS the robot so the arrow always stays on the real GPS.
@@ -330,106 +333,18 @@ class _MapScreenState extends State<MapScreen> {
             style: GoogleFonts.rajdhani(
                 fontWeight: FontWeight.w700, letterSpacing: 1.5)),
         actions: [
-          IconButton(
-            icon: Icon(Icons.edit_location_alt,
-                color: _settingPos > 0
-                    ? const Color(0xFFFFB300)
-                    : (socket.positionRef?.active == true
-                        ? AppColors.lime
-                        : null)),
-            tooltip: _settingPos > 0
-                ? "Cancel setting the robot's position"
-                : "Set where the robot really is",
-            onPressed: !socket.isConnected
-                ? null
-                : () => setState(() {
-                      if (_settingPos > 0) {
-                        _cancelSetPos(socket);
-                      } else {
-                        _settingPos = 1;
-                        _posTap = null;
-                        _editingFence = false;
-                      }
-                    }),
-          ),
-          IconButton(
-            icon: Icon(Icons.fence,
-                color: _editingFence
-                    ? const Color(0xFFFFB300)
-                    : (socket.boundary?.active == true
-                        ? AppColors.lime
-                        : null)),
-            tooltip: _editingFence
-                ? "Stop editing the boundary"
-                : "Edit the field boundary",
-            onPressed: () => setState(() {
-              if (_settingPos > 0) _cancelSetPos(socket);
-              if (!_editingFence) {
-                // start from what the robot has, so editing is editing
-                _draft
-                  ..clear()
-                  ..addAll(socket.boundary?.points ?? const []);
-                _inset = socket.boundary?.insetM ?? kDefaultInsetM;
-              }
-              _editingFence = !_editingFence;
-            }),
-          ),
-          IconButton(
-            icon: Icon(_satellite ? Icons.map : Icons.satellite_alt),
-            tooltip: _satellite ? "Street view" : "Satellite view",
-            onPressed: () => setState(() => _satellite = !_satellite),
-          ),
-          IconButton(
-            icon: Icon(Icons.route, color: _showTrail ? null : Colors.white38),
-            tooltip: _showTrail
-                ? "Hide path trail (${_trail.length})"
-                : "Show path trail",
-            onPressed: () => setState(() => _showTrail = !_showTrail),
-          ),
-          IconButton(
-            icon: Icon(Icons.warning_amber_rounded,
-                color: _showObstacles
-                    ? const Color(0xFFE53935)
-                    : Colors.white38),
-            tooltip: _showObstacles
-                ? "Hide Lidar obstacle pins (${socket.obstaclePins.length})"
-                : "Show Lidar obstacle pins",
-            onPressed: () => setState(() => _showObstacles = !_showObstacles),
-          ),
-          IconButton(
-            icon: _photosLoading
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2, color: AppColors.lime),
-                  )
-                : Icon(Icons.photo_camera_outlined,
-                    color: _photoError != null
-                        ? const Color(0xFFFFB300)
-                        : (_showPhotos ? AppColors.lime : Colors.white38)),
-            tooltip: _photoError != null
-                ? "Obstacle pins unavailable - tap to retry"
-                : (_showPhotos
-                    ? "Hide obstacle photos (${_photoPins.length})"
-                    : "Show obstacle photos"),
-            onPressed: () {
-              if (_photoError != null || _photoPins.isEmpty) {
-                _loadPhotos();
-              } else {
-                setState(() => _showPhotos = !_showPhotos);
-              }
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.layers_clear),
-            tooltip: "Clear trail & Lidar pins",
-            onPressed: (_trail.isEmpty && socket.obstaclePins.isEmpty)
-                ? null
-                : () {
-                    _clearTrail();
-                    socket.clearObstaclePins();
-                  },
+          // Everything except Follow lives in one menu: eight icons did not
+          // fit a small phone's app bar. Amber while a tap mode is on, so it
+          // is clear why taps are not setting waypoints.
+          PopupMenuButton<_MapAction>(
+            tooltip: "Map tools and layers",
+            icon: Icon(Icons.layers,
+                color: (_settingPos > 0 || _editingFence)
+                    ? _stopColor
+                    : null),
+            color: AppColors.surface,
+            onSelected: (a) => _onMapAction(a, socket),
+            itemBuilder: (_) => _mapMenu(socket),
           ),
           IconButton(
             icon: Icon(_follow ? Icons.my_location : Icons.location_searching),
@@ -838,12 +753,17 @@ class _MapScreenState extends State<MapScreen> {
               children: [
                 const Icon(Icons.fence, color: _stopColor, size: 18),
                 const SizedBox(width: 6),
-                Text("EDITING BOUNDARY",
-                    style: GoogleFonts.rajdhani(
-                        color: _stopColor,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 1.2)),
-                const Spacer(),
+                // Flexible: on a narrow phone the title gives way, not the
+                // stop-line controls beside it
+                Expanded(
+                  child: Text("EDITING BOUNDARY",
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.rajdhani(
+                          color: _stopColor,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1.2)),
+                ),
                 Text("stop line",
                     style: GoogleFonts.rajdhani(
                         color: AppColors.textLo, fontSize: 12)),
@@ -902,6 +822,160 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  // ---------------------------------------------------------- map menu
+  /// The app bar's tools-and-layers menu. Built each time it opens, so it
+  /// always shows the current state (what is on, how many pins).
+  List<PopupMenuEntry<_MapAction>> _mapMenu(RobotSocket socket) {
+    PopupMenuItem<_MapAction> item(_MapAction a, IconData icon, String label,
+        {Color? color, String? detail, bool? checked, bool enabled = true}) {
+      return PopupMenuItem<_MapAction>(
+        value: a,
+        enabled: enabled,
+        child: Row(
+          children: [
+            Icon(icon,
+                size: 20,
+                color: enabled ? (color ?? AppColors.textHi) : Colors.white24),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(label,
+                      style: GoogleFonts.rajdhani(
+                          color: enabled ? AppColors.textHi : Colors.white38,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 15)),
+                  if (detail != null)
+                    Text(detail,
+                        style: GoogleFonts.rajdhani(
+                            color: AppColors.textLo, fontSize: 12)),
+                ],
+              ),
+            ),
+            if (checked != null)
+              Icon(checked ? Icons.check_box : Icons.check_box_outline_blank,
+                  size: 20,
+                  color: checked ? AppColors.lime : AppColors.textLo),
+          ],
+        ),
+      );
+    }
+
+    Widget heading(String t) => Text(t,
+        style: GoogleFonts.rajdhani(
+            color: AppColors.textLo,
+            fontSize: 11,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1.4));
+
+    final posOn = socket.positionRef?.active == true;
+    final fenceOn = socket.boundary?.active == true;
+    return [
+      PopupMenuItem<_MapAction>(enabled: false, height: 28,
+          child: heading("TOOLS")),
+      item(
+          _MapAction.setPosition,
+          Icons.edit_location_alt,
+          _settingPos > 0 ? "Cancel setting position" : "Set robot position",
+          color: _settingPos > 0
+              ? _stopColor
+              : (posOn ? AppColors.lime : null),
+          detail: _settingPos > 0
+              ? null
+              : (posOn
+                  ? "a position you set is active"
+                  : "tap where it really is"),
+          enabled: socket.isConnected),
+      item(
+          _MapAction.fence,
+          Icons.fence,
+          _editingFence ? "Stop editing boundary" : "Edit field boundary",
+          color: _editingFence
+              ? _stopColor
+              : (fenceOn ? AppColors.lime : null),
+          detail: _editingFence
+              ? null
+              : (fenceOn ? "boundary active" : "no boundary set")),
+      const PopupMenuDivider(),
+      PopupMenuItem<_MapAction>(enabled: false, height: 28,
+          child: heading("VIEW")),
+      item(_MapAction.satellite, _satellite ? Icons.map : Icons.satellite_alt,
+          _satellite ? "Street view" : "Satellite view"),
+      item(_MapAction.trail, Icons.route, "Path trail",
+          color: const Color(0xFF22D3EE),
+          detail: "${_trail.length} point${_trail.length == 1 ? '' : 's'}",
+          checked: _showTrail),
+      item(_MapAction.obstacles, Icons.warning_amber_rounded,
+          "Lidar obstacle pins",
+          color: const Color(0xFFE53935),
+          detail: "${socket.obstaclePins.length}",
+          checked: _showObstacles),
+      item(
+          _MapAction.photos,
+          Icons.photo_camera_outlined,
+          "Obstacle photos",
+          color: _photoError != null ? _stopColor : AppColors.lime,
+          detail: _photosLoading
+              ? "loading\u2026"
+              : (_photoError != null
+                  ? "unavailable \u2013 tap to retry"
+                  : (_photoPins.isEmpty
+                      ? "tap to load"
+                      : "${_photoPins.length}")),
+          checked: _photosLoading || _photoError != null || _photoPins.isEmpty
+              ? null
+              : _showPhotos,
+          enabled: !_photosLoading),
+      const PopupMenuDivider(),
+      item(_MapAction.clear, Icons.layers_clear, "Clear trail & Lidar pins",
+          enabled: _trail.isNotEmpty || socket.obstaclePins.isNotEmpty),
+    ];
+  }
+
+  void _onMapAction(_MapAction a, RobotSocket socket) {
+    switch (a) {
+      case _MapAction.setPosition:
+        setState(() {
+          if (_settingPos > 0) {
+            _cancelSetPos(socket);
+          } else {
+            _settingPos = 1;
+            _posTap = null;
+            _editingFence = false;
+          }
+        });
+      case _MapAction.fence:
+        setState(() {
+          if (_settingPos > 0) _cancelSetPos(socket);
+          if (!_editingFence) {
+            // start from what the robot has, so editing is editing
+            _draft
+              ..clear()
+              ..addAll(socket.boundary?.points ?? const []);
+            _inset = socket.boundary?.insetM ?? kDefaultInsetM;
+          }
+          _editingFence = !_editingFence;
+        });
+      case _MapAction.satellite:
+        setState(() => _satellite = !_satellite);
+      case _MapAction.trail:
+        setState(() => _showTrail = !_showTrail);
+      case _MapAction.obstacles:
+        setState(() => _showObstacles = !_showObstacles);
+      case _MapAction.photos:
+        if (_photoError != null || _photoPins.isEmpty) {
+          _loadPhotos();
+        } else {
+          setState(() => _showPhotos = !_showPhotos);
+        }
+      case _MapAction.clear:
+        _clearTrail();
+        socket.clearObstaclePins();
+    }
+  }
+
   // ---------------------------------------------------------- set position
   static const double _faceMinM = 1.0; // as gps_node FACE_MIN_M
 
@@ -958,11 +1032,16 @@ class _MapScreenState extends State<MapScreen> {
               children: [
                 const Icon(Icons.edit_location_alt, color: amber, size: 18),
                 const SizedBox(width: 6),
-                Text("SET ROBOT POSITION  \u2022  ${step1 ? '1' : '2'} of 2",
-                    style: GoogleFonts.rajdhani(
-                        color: amber,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 1.2)),
+                Expanded(
+                  child: Text(
+                      "SET ROBOT POSITION  \u2022  ${step1 ? '1' : '2'} of 2",
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.rajdhani(
+                          color: amber,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1.2)),
+                ),
               ],
             ),
             const SizedBox(height: 4),
