@@ -36,11 +36,11 @@ class GalleryImage {
   DateTime get captureTime => geo?.time ?? time;
 }
 
-/// Not-soil photos are left out of the SOIL tab altogether. They are still
-/// on the robot -- nothing is deleted -- and setting this to false brings
-/// them back, with their own NOT SOIL filter chip. The tab is for looking at
-/// soil; a desk or a wall from bench testing only gets in the way.
-const bool kHideNotSoil = true;
+/// Whether not-soil photos are left out of the SOIL tab. False (2026-10-27):
+/// they are shown, with their own NOT SOIL filter chip -- the classifier in
+/// use calls nearly everything not-soil, so hiding them hid almost every
+/// photo. True leaves them out (still on the robot, counted in a note).
+const bool kHideNotSoil = false;
 
 /// Saved-images viewer: raw camera captures + AI-annotated detections +
 /// downward soil-camera snapshots + saved SLAM maps, served by
@@ -644,21 +644,13 @@ class _GalleryGridState extends State<_GalleryGrid>
                       // normal case, and a badge on every photo saying so
                       // adds nothing -- the absence of the mark is the
                       // answer, as with the field-type stamp on the image.
-                      // Duplicate / outside-the-boundary marks, top-left.
-                      if (items[i].geo?.isDuplicate == true ||
-                          items[i].geo?.isOutside == true)
+                      // Duplicate mark, top-left. (Outside-the-boundary is
+                      // still in the filename, but not marked on the tile.)
+                      if (items[i].geo?.isDuplicate == true)
                         Positioned(
                           left: 4,
                           top: 4,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              if (items[i].geo?.isDuplicate == true)
-                                _tileTag("DUP", AppColors.textLo),
-                              if (items[i].geo?.isOutside == true)
-                                _tileTag("OUTSIDE", const Color(0xFFE5533D)),
-                            ],
-                          ),
+                          child: _tileTag("DUP", AppColors.textLo),
                         ),
                       if (items[i].geo?.soilClass == GeoImage.kNotSoil)
                         Positioned(
