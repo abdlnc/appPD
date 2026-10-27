@@ -1,0 +1,32 @@
+# Costmap settings for ~/make_costmaps.py.
+#
+# The SAME parameter names and meanings as Nav2's costmap (nav2_costmap_2d),
+# so this block can be dropped into a Nav2 params file unchanged if Nav2's
+# costmap is ever installed on the robot. make_costmaps.py reads only the
+# keys it implements: footprint, footprint_padding, track_unknown_space and
+# the inflation_layer values. The static layer is the saved SLAM map itself.
+costmap:
+  ros__parameters:
+    robot_base_frame: base_link
+    resolution: 0.05            # informational -- each map keeps its own
+    # The robot: 0.80 m long x 0.60 m wide, the lidar at the exact centre
+    # (control_node ROBOT_LENGTH / ROBOT_WIDTH, measured). x forward, y left.
+    footprint: "[[0.40, 0.30], [0.40, -0.30], [-0.40, -0.30], [-0.40, 0.30]]"
+    footprint_padding: 0.0
+    track_unknown_space: true   # unknown stays unknown (not free)
+    plugins: ["static_layer", "inflation_layer"]
+    static_layer:
+      plugin: "nav2_costmap_2d::StaticLayer"
+      map_subscribe_transient_local: true
+    inflation_layer:
+      plugin: "nav2_costmap_2d::InflationLayer"
+      # Inside the robot's INSCRIBED radius (0.30 m, half its width) of an
+      # obstacle, its centre cannot be there without the body touching:
+      # cost 253. Out to inflation_radius the cost then falls off as
+      # 252 * exp(-cost_scaling_factor * (distance - inscribed radius)).
+      # 0.55 m covers the CIRCUMSCRIBED radius (0.50 m, centre to a corner)
+      # plus a margin, so any cell where a corner could touch is costed.
+      inflation_radius: 0.55
+      cost_scaling_factor: 3.0
+      inflate_unknown: false
+      inflate_around_unknown: false
