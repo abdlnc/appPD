@@ -387,6 +387,62 @@ chk("INDOOR: post at the front corner, no gap: avoids, not straight on",
 started, sent = drive(scan_from_walls(corridor), "INDOOR")
 chk("INDOOR: same corridor, no post: still drives straight down it",
     not started and sent and sent[-1] == (0.50, 0.0), f"{sent}")
+# The 2026-10-28 photo: facing an open door, a chair stack running beside
+# the FRONT-LEFT of the body (1cm off its side, between the lidar and the
+# bumper), the left jamb further on in line with the body's left edge, a
+# 0.97m doorway, a bin off to the right. It would not go: the chairs beside
+# the body counted as if they were in the path ("Beside is not ahead").
+chairs = [((-0.30, 0.31), (0.38, 0.31))]
+
+
+def door_scene(jamb_y, shift=0.0):
+    """Chairs beside the front-left; the left jamb face at y=jamb_y (just
+    outside the body's 0.30), a doorway to y=-0.66, a bin to the right.
+    shift: the robot has driven that far toward the door."""
+    segs = [((0.95, jamb_y), (0.95, 1.6)), ((0.95, jamb_y), (1.10, jamb_y)),
+            ((0.95, -0.66), (0.95, -1.6)), ((0.95, -0.66), (1.10, -0.66)),
+            ((0.50, -0.80), (0.80, -0.80))]
+    segs = [((a[0] - shift, a[1]), (b[0] - shift, b[1])) for a, b in segs]
+    ch = [((a[0] - shift, a[1]), (b[0] - shift, b[1])) for a, b in chairs]
+    return ch + segs
+
+
+for shift in (0.0, 0.5):
+    started, sent = drive(scan_from_walls(door_scene(0.34, shift)), "INDOOR")
+    chk(f"chairs beside, jamb 4cm clear, {shift:.1f}m on: drives straight on",
+        not started and sent and sent[-1] == (0.50, 0.0),
+        f"{sent[-1] if sent else None}")
+    mir = [((a[0], -a[1]), (b[0], -b[1])) for a, b in door_scene(0.34, shift)]
+    started, sent = drive(scan_from_walls(mir), "INDOOR")
+    chk(f"...mirrored (chairs on the right), {shift:.1f}m on: same",
+        not started and sent and sent[-1] == (0.50, 0.0),
+        f"{sent[-1] if sent else None}")
+# An OFF-CENTRE 0.86m doorway, bumper 0.20m from it, 20cm-deep frame: the
+# left jamb is 4cm clear of the body -- under the 10cm gap margin, so the gap
+# search says no and the trigger decides. The old +/-30 deg cone saw that
+# jamb at ~0.89m (under 0.90m) and stopped; the body strip sees it is not in
+# the robot's path. (A CENTRED doorway never reached the trigger: the gap
+# search passes it first.)
+d86 = [((0.60, 0.34), (0.60, 2.0)), ((0.60, -0.52), (0.60, -2.0)),
+       ((0.60, 0.34), (0.80, 0.34)), ((0.60, -0.52), (0.80, -0.52))]
+started, sent = drive(scan_from_walls(d86), "INDOOR")
+chk("off-centre doorway, jamb 4cm clear, 0.20m ahead: drives straight in",
+    not started and sent and sent[-1] == (0.50, 0.0),
+    f"{sent[-1] if sent else None}")
+started, sent = drive(scan_from_walls(door_scene(0.31, 0.5)), "INDOOR")
+chk("jamb only 1cm clear, close up: stops (a graze) -- body strip +2cm",
+    started, f"{sent}")
+
+# Beside the body still counts when TURNING TOWARD it: the same chairs, but
+# the only opening is up and to the LEFT, past them.
+toward = chairs + [((0.95, -1.6), (0.95, 0.31)), ((0.95, 1.4), (0.95, 2.4))]
+o_ = object.__new__(cn.AGVControl)
+o_._gap_sign = 0.0; o_.prof = dict(cn.ENV_PROFILES["INDOOR"])
+st_, found_ = cn.AGVControl.pick_gap(o_, scan_from_walls(toward), 0.0,
+                                     math.radians(STEP))
+chk("opening only to the LEFT, past the chairs beside it: not taken",
+    not (found_ and st_ > 0), f"found={found_} steer={st_:+.2f}")
+
 import time as _time
 def clearance(segs, margin):
     o = object.__new__(cn.AGVControl)
@@ -403,6 +459,20 @@ chk("body-wide check: the corner post reads 0.05m ahead of the bumper",
 c = clearance([((0.20, 0.31), (0.30, 0.31))], cn.CORRIDOR_SIDE_MARGIN)
 chk("something touching beside the front half reads negative",
     c < 0, f"{c:.3f}")
+def clearance_b(segs, margin, beside):
+    o = object.__new__(cn.AGVControl)
+    o._scan_ranges = scan_from_walls(segs)
+    o._scan_geom = (0.0, math.radians(STEP)); o._scan_time = _time.time()
+    return cn.AGVControl.front_clearance(o, margin, beside=beside)
+c = clearance_b([((0.20, 0.31), (0.30, 0.31))], cn.CORRIDOR_SIDE_MARGIN,
+                "none")
+chk("...but not for driving straight (beside='none')", c == math.inf)
+c = clearance_b([((0.20, 0.31), (0.30, 0.31))], cn.CORRIDOR_SIDE_MARGIN,
+                "right")
+chk("...nor for a turn the other way (beside='right')", c == math.inf)
+c = clearance_b([((0.20, 0.31), (0.30, 0.31))], cn.CORRIDOR_SIDE_MARGIN,
+                "left")
+chk("...and still for a turn toward it (beside='left')", c < 0)
 
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

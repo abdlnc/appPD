@@ -311,11 +311,25 @@ TURN_SWING_EXTRA  = 0.15       # m
 # INDOOR ignores the front-corner ZONES so it can drive down corridors. But
 # when the gap search found no heading and the narrow centre cone was clear,
 # it then simply cruised STRAIGHT -- into anything at a front corner. Now a
-# corridor exactly as wide as the body (plus CORRIDOR_SIDE_MARGIN) is checked
-# straight ahead as well: something in it within the profile's 'front'
-# clearance is an obstacle, wherever it sits across the bumper. A corridor
-# wall BESIDE the body is outside it, so corridors still drive.
+# corridor exactly as wide as the body (plus CORRIDOR_SIDE_MARGIN) straight
+# ahead decides: something in it within the profile's 'front' clearance is
+# an obstacle, wherever it sits across the bumper. A corridor wall BESIDE
+# the body is outside it, so corridors still drive. Since the same day it
+# REPLACES the +/-30 degree centre cone for these profiles -- the cone is
+# 0.90m wide at the 0.90m trigger, and stopped it for door jambs beside its
+# path whenever a doorway was too tight for the gap search's margin.
 CORRIDOR_SIDE_MARGIN = 0.02    # m each side
+
+# ----------- Beside is not ahead -----------
+# 2026-10-28: next to a chair stack, facing an open door, it would not drive
+# straight on -- the chairs were a few cm beside the FRONT HALF of the body
+# (between the lidar and the bumper), and both the gap search and the
+# body-wide trigger counted them as if they were in the path ("only -0.31m
+# ahead of the bumper": negative = beside, not ahead). Driving forward
+# cannot hit something beside the body; only TURNING TOWARD it can, as the
+# front corner swings that way. So a return beside the body (not ahead of
+# the bumper) now blocks only headings that turn toward its side. Things
+# ahead of the bumper are judged exactly as before.
 
 # ----------- DEAD ENDS -----------
 # Measured 2026-10-28: in a dead end the stop/reverse/turn cycle repeated 8
@@ -963,15 +977,25 @@ class AGVControl(Node):
         z = self.zones
         # Bumper clearance -> /scan distance; see OVERHANG_FWD.
         front = OVERHANG_FWD + self.prof['front']
-        # INDOOR ignores the corner zones here on purpose -- see ENV_PROFILES.
-        hit = z['front'] < front
         if self.prof['corners_trigger']:
-            hit = hit or z['front_r'] < front or z['front_l'] < front
+            # OUTDOOR: the front cone and both front-corner zones.
+            ahead = z['front']
+            hit = (ahead < front or z['front_r'] < front
+                   or z['front_l'] < front)
         else:
-            # see "Body-wide front trigger"
-            body = self.front_clearance(CORRIDOR_SIDE_MARGIN)
-            if body is not None and body < self.prof['front']:
-                hit = True
+            # INDOOR: what is IN THE ROBOT'S WAY -- a strip as wide as the
+            # body (+CORRIDOR_SIDE_MARGIN) straight ahead, beside-the-body
+            # returns excluded -- as a /scan distance. Not the +/-30 degree
+            # front cone: at the 0.90m trigger that cone is 0.90m wide, half
+            # as wide again as the robot. When a gap is too tight for the
+            # gap search's margin (an off-centre doorway, a jamb a few cm
+            # clear) it is this trigger that decides, and the cone stopped
+            # it for jambs that were not in its path (2026-10-28: 29.5 deg,
+            # 4cm clear). See "Body-wide front trigger" / "Beside is not
+            # ahead".
+            body = self.front_clearance(CORRIDOR_SIDE_MARGIN, beside="none")
+            ahead = OVERHANG_FWD + (body if body is not None else 0.0)
+            hit = ahead < front
 
         # --- gap seeking, before anything is called blocked ---
         # Steer through what the robot physically fits through rather than
@@ -983,7 +1007,7 @@ class AGVControl(Node):
         # Skipped once something is inside GAP_MIN_FRONT: at that range
         # there is no room left to steer around anything, and pretending
         # otherwise would drive the robot into it at an angle.
-        if z['front'] > GAP_MIN_FRONT:
+        if ahead > GAP_MIN_FRONT:
             steer, found = self.pick_gap(ranges, msg.angle_min,
                                          msg.angle_increment, prefer)
             if found:
@@ -1142,13 +1166,15 @@ class AGVControl(Node):
             best = min(best, behind - OVERHANG_REAR)
         return best
 
-    def front_clearance(self, margin, extra_left=0.0, extra_right=0.0):
+    def front_clearance(self, margin, extra_left=0.0, extra_right=0.0,
+                        beside="both"):
         """Distance from the FRONT BUMPER to the nearest thing in a corridor
         as wide as the body (+ margin each side, + extra_left / extra_right
         on one side) straight ahead -- the forward twin of rear_clearance.
         Something alongside the front half of the body inside that width
-        reads negative (touching). math.inf for clear, None when the scan is
-        too old to trust."""
+        reads negative (touching) -- counted only on the side(s) named by
+        `beside` ("both", "left", "right" or "none"; see "Beside is not
+        ahead"). math.inf for clear, None when the scan is too old."""
         if time.time() - self._scan_time > REVERSE_SCAN_MAX_AGE:
             return None
         ranges = self._scan_ranges
@@ -1167,6 +1193,9 @@ class AGVControl(Node):
             side = r * math.sin(a)             # + = LEFT
             if side >= half + extra_left or side <= -(half + extra_right):
                 continue                       # beside the path, not in it
+            if ahead < OVERHANG_FWD and beside != "both" and \
+                    beside != ("left" if side > 0 else "right"):
+                continue                       # beside the body, ignored
             best = min(best, ahead - OVERHANG_FWD)
         return best
 
@@ -1269,6 +1298,7 @@ class AGVControl(Node):
 
         for cand in cands:
             th = math.radians(cand)
+            turn_sign = 0.0 if cand == 0 else (1.0 if cand > 0 else -1.0)
             # Half-width the body actually needs at THIS heading -- see the
             # ROBOT_LENGTH note above.
             half = (ROBOT_WIDTH * math.cos(abs(th))
@@ -1276,6 +1306,12 @@ class AGVControl(Node):
                 + self.prof.get('side_margin', GAP_SIDE_MARGIN)
             blocked = False
             for phi, r in pts:
+                # Beside the body, not ahead of the bumper: only blocks a
+                # turn TOWARD it -- see "Beside is not ahead".
+                if r * math.cos(phi) < OVERHANG_FWD:
+                    side = 1.0 if math.sin(phi) > 0 else -1.0
+                    if side != turn_sign:
+                        continue
                 rel = phi - th
                 # Along the candidate heading, and perpendicular to it.
                 if r * math.cos(rel) <= 0.0:
@@ -1449,7 +1485,8 @@ class AGVControl(Node):
             # then drive while turned -- WATCHED, see "Turning safely"
             # watch the strip ahead, wider on the side it turns toward
             swing = {"extra_left": TURN_SWING_EXTRA if steer > 0 else 0.0,
-                     "extra_right": TURN_SWING_EXTRA if steer < 0 else 0.0}
+                     "extra_right": TURN_SWING_EXTRA if steer < 0 else 0.0,
+                     "beside": "left" if steer > 0 else "right"}
             room = self.front_clearance(TURN_WATCH_MARGIN, **swing)
             if room is None or room < TURN_STOP_GAP:
                 log.warn("no room to turn forward: "
