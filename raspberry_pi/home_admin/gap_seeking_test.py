@@ -301,6 +301,7 @@ def drive(ranges, env="OUTDOOR"):
     """Returns (started_maneuver, commands_issued)."""
     o = object.__new__(cn.AGVControl)
     o.mode = "AUTO"; o.is_avoiding = False; o.blocked_hold = False
+    o.dead_end = False
     o._blocked = False; o._was_blocked = False; o._clear_scans = 0
     o._last_log = 1e9
     o._cam_time = 0.0; o._cam_conf = 0.0; o._cam_count = 0
@@ -368,6 +369,37 @@ walls = [((0.25, 3.0), (0.25, -3.0))]
 started, sent = drive(scan_from_walls(walls))
 chk(f"obstacle inside GAP_MIN_FRONT ({cn.GAP_MIN_FRONT:.2f}m on /scan): "
     f"maneuver, no threading", started)
+
+# INDOOR ignores the front-corner ZONES (so corridors drive). Reported
+# 2026-10-28: when no gap fitted and the narrow centre cone was clear, it
+# cruised STRAIGHT -- into anything at a front corner. A body-wide corridor
+# ahead now counts too. Corridor 1.0m wide, a post at the front-left corner
+# 31-35 degrees off the nose (outside the +/-30 centre cone), 0.05m ahead of
+# the bumper line.
+corridor = [((0.0, 0.50), (3.0, 0.50)), ((0.0, -0.50), (3.0, -0.50))]
+post = [((0.45, 0.27), (0.45, 0.31))]
+started, sent = drive(scan_from_walls(corridor + post), "INDOOR")
+chk("INDOOR: post at the front corner, no gap: avoids, not straight on",
+    started, f"{sent}")
+started, sent = drive(scan_from_walls(corridor), "INDOOR")
+chk("INDOOR: same corridor, no post: still drives straight down it",
+    not started and sent and sent[-1] == (0.50, 0.0), f"{sent}")
+import time as _time
+def clearance(segs, margin):
+    o = object.__new__(cn.AGVControl)
+    o._scan_ranges = scan_from_walls(segs)
+    o._scan_geom = (0.0, math.radians(STEP)); o._scan_time = _time.time()
+    return cn.AGVControl.front_clearance(o, margin)
+c = clearance([((0.0, 0.36), (3.0, 0.36)), ((0.0, -0.36), (3.0, -0.36))],
+              cn.CORRIDOR_SIDE_MARGIN)
+chk("body-wide check: walls 6cm beside the body are not 'ahead'",
+    c == math.inf, f"{c}")
+c = clearance(post, cn.CORRIDOR_SIDE_MARGIN)
+chk("body-wide check: the corner post reads 0.05m ahead of the bumper",
+    abs(c - 0.05) < 0.01, f"{c:.3f}")
+c = clearance([((0.20, 0.31), (0.30, 0.31))], cn.CORRIDOR_SIDE_MARGIN)
+chk("something touching beside the front half reads negative",
+    c < 0, f"{c:.3f}")
 
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

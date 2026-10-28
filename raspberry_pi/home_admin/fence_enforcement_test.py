@@ -165,6 +165,7 @@ def ctrl(mode="COVER"):
     o.mode = mode
     o.is_avoiding = False
     o.blocked_hold = False
+    o.dead_end = False
     o._blocked = False
     o._was_blocked = False
     o._clear_scans = 0

@@ -268,6 +268,53 @@ REV_SPEED_ESCALATED  = 0.40    # was REV_SPEED (0.60) for every reverse
 SETTLE_TIME         = 0.4      # s to let the steering reach full lock
 TURN_TIME           = 1.0      # s of driving while turned
 
+# ----------- Turning safely (the forward leg is watched too) -----------
+# Reported 2026-10-28: indoors, avoiding, it drove into the wall. The reverse
+# was watched (above) but the turn was not: full lock and TURN_SPEED for a
+# fixed TURN_TIME (up to 2.5x escalated) without reading the lidar. This
+# robot cannot pivot -- it has to DRIVE to turn -- so that leg carries its
+# front, and the outer front corner most of all, toward whatever it stopped
+# for. In the log, front readings after the turn: 0.53, 0.47, 0.45m on /scan
+# -- 5-13cm from the bumper -- and with no room to reverse it went straight
+# from 0.48m into the blind turn.
+#
+# Now the turn watches a corridor as wide as the BODY ahead of the front
+# bumper, every TURN_POLL, and stops the moment anything is within
+# TURN_STOP_GAP of it (or the scan goes stale, or the robot leaves AUTO). It
+# does not start at all with less than that. A turn cut short just means
+# another attempt -- and see DEAD ENDS for where that ends.
+TURN_STOP_GAP     = 0.15       # m from the front bumper: stop the turn
+TURN_WATCH_MARGIN = 0.05       # m of slack each side of the body
+TURN_POLL         = 0.05       # s between checks while turning
+
+# ----------- Body-wide front trigger (profiles that ignore the corners) ------
+# INDOOR ignores the front-corner ZONES so it can drive down corridors. But
+# when the gap search found no heading and the narrow centre cone was clear,
+# it then simply cruised STRAIGHT -- into anything at a front corner. Now a
+# corridor exactly as wide as the body (plus CORRIDOR_SIDE_MARGIN) is checked
+# straight ahead as well: something in it within the profile's 'front'
+# clearance is an obstacle, wherever it sits across the bumper. A corridor
+# wall BESIDE the body is outside it, so corridors still drive.
+CORRIDOR_SIDE_MARGIN = 0.02    # m each side
+
+# ----------- DEAD ENDS -----------
+# Measured 2026-10-28: in a dead end the stop/reverse/turn cycle repeated 8
+# times in 40 s until a person took over, edging closer each time --
+# path_blocked() only calls NO PATH when it is boxed in on EVERY side, and a
+# dead end is open behind. Two changes:
+#
+# THREE-POINT TURN. From the second attempt on, the reverse is steered the
+# OPPOSITE way to the coming forward turn, so the robot turns round while
+# backing up too -- nearly double the turn per cycle, where a straight
+# reverse only undid the forward leg. Only with KTURN_SIDE_ROOM beside the
+# body on BOTH sides (the nose swings one way, the tail the other).
+#
+# A LIMIT. Attempt DEAD_END_ATTEMPTS + 1 does not happen: the robot stops,
+# holds at zero and reports NO PATH ("DEAD END") for a person. Changing mode
+# (STOP / MANUAL and back to AUTO) clears it.
+DEAD_END_ATTEMPTS = 6
+KTURN_SIDE_ROOM   = 0.15       # m beside the body, each side
+
 # ----------- Gap seeking ("drive through what it fits through") -----------
 # The robot used to treat a near return in the front arc as a wall: stop,
 # reverse, turn, try again. That is correct for a wall and wrong for a
@@ -466,8 +513,8 @@ TURN_SIDE_MARGIN = 0.15        # m
 # maneuver plainly is not working, so make it bigger rather than keep
 # repeating it identically: back off further and turn for longer, in the
 # SAME direction (flipping would be the oscillation again). If that still
-# does not clear it, path_blocked() eventually reports NO PATH and a human
-# is called -- which is the designed escape hatch, not a failure here.
+# does not clear it, the robot stops after DEAD_END_ATTEMPTS and reports a
+# dead end for a person -- see DEAD ENDS.
 TURN_ESCALATE_AFTER = 2
 TURN_ESCALATE_MAX   = 2.5      # cap on the reverse/turn time multiplier
 
@@ -549,6 +596,7 @@ class AGVControl(Node):
         self.fence_allow = "R"       # direction that heads back in
         self.fence_time = 0.0
         self.fence_blocked = False   # stop line ahead AND something behind
+        self.dead_end = False        # gave up after DEAD_END_ATTEMPTS
         self._nofix_said = False
         self.create_subscription(String, '/fence_state', self.fence_cb, 10)
 
@@ -563,6 +611,13 @@ class AGVControl(Node):
         m = msg.data.strip().upper()
         if m != self.mode:
             self.get_logger().info(f"Mode -> {m}")
+            # A person stepped in: whatever the robot was stuck on is a fresh
+            # problem now -- forget the dead end and the turn commitment.
+            if self.dead_end:
+                self.get_logger().info("dead-end hold cleared (mode change)")
+            self.dead_end = False
+            self._last_turn = 0.0
+            self._turn_repeats = 0
         self.mode = m
         if m not in DRIVE_MODES:
             self.cmd = Twist()         # zero out (we won't publish anyway)
@@ -658,7 +713,7 @@ class AGVControl(Node):
         # only this node publishes /cmd_vel while AUTONOMOUS
         if self.mode not in DRIVE_MODES:
             return
-        if self.blocked_hold or self.fence_blocked:
+        if self.blocked_hold or self.fence_blocked or self.dead_end:
             # Boxed in -> hold at zero regardless of whatever avoid() last
             # computed. Enforced HERE, at the single point that publishes
             # /cmd_vel, so an already-running avoid() thread cannot drive
@@ -804,6 +859,10 @@ class AGVControl(Node):
         # autonomous decision (only when AUTO and not mid-maneuver)
         if self.mode not in DRIVE_MODES or self.is_avoiding:
             return
+        if self.dead_end:
+            # gave up (see DEAD ENDS) -- held until the mode changes
+            self.set_cmd(0.0, 0.0)
+            return
         if self.blocked_hold:
             # Nowhere to go -- avoid() has no maneuver that helps, so don't
             # start one. tick() is already holding the output at zero.
@@ -844,6 +903,11 @@ class AGVControl(Node):
         hit = z['front'] < front
         if self.prof['corners_trigger']:
             hit = hit or z['front_r'] < front or z['front_l'] < front
+        else:
+            # see "Body-wide front trigger"
+            body = self.front_clearance(CORRIDOR_SIDE_MARGIN)
+            if body is not None and body < self.prof['front']:
+                hit = True
 
         # --- gap seeking, before anything is called blocked ---
         # Steer through what the robot physically fits through rather than
@@ -966,7 +1030,12 @@ class AGVControl(Node):
                 self.get_logger().info("path clear again -- resuming")
 
         m = String()
-        if self.fence_blocked:
+        if self.dead_end:
+            # Same NO PATH the installed app shows; "DEADEND" says why to a
+            # rebuilt one (older builds ignore the 5th field).
+            lvl = level if level != "CLEAR" else "CAUTION"
+            m.data = f"{lvl}|{closest}|{dist:.2f}|BLOCKED|DEADEND"
+        elif self.fence_blocked:
             # Stop line ahead, obstacle behind. "BLOCKED" in the 4th field is
             # what the installed app shows as NO PATH; the 5th says why, for
             # a rebuilt app, and older builds ignore it.
@@ -1007,6 +1076,32 @@ class AGVControl(Node):
             if abs(r * math.sin(a)) >= half:
                 continue                       # beside the path, not in it
             best = min(best, behind - OVERHANG_REAR)
+        return best
+
+    def front_clearance(self, margin):
+        """Distance from the FRONT BUMPER to the nearest thing in a corridor
+        as wide as the body (+ margin each side) straight ahead -- the
+        forward twin of rear_clearance. Something alongside the front half of
+        the body inside that width reads negative (touching). math.inf for
+        clear, None when the scan is too old to trust."""
+        if time.time() - self._scan_time > REVERSE_SCAN_MAX_AGE:
+            return None
+        ranges = self._scan_ranges
+        amin, ainc = self._scan_geom
+        half = ROBOT_WIDTH / 2.0 + margin
+        best = math.inf
+        for k, r in enumerate(ranges):
+            if r is None or math.isinf(r) or math.isnan(r) \
+                    or r < MIN_VALID_DIST:
+                continue
+            a = math.radians((math.degrees(amin + k * ainc)
+                              + ANGLE_OFFSET_DEG) % 360.0)
+            ahead = r * math.cos(a)            # metres ahead of the lidar
+            if ahead <= 0.0:
+                continue                       # behind the lidar
+            if abs(r * math.sin(a)) >= half:
+                continue                       # beside the path, not in it
+            best = min(best, ahead - OVERHANG_FWD)
         return best
 
     def _stop_now(self):
@@ -1149,6 +1244,17 @@ class AGVControl(Node):
         # ends up after backing away.
         steer, repeats = self.pick_turn(z)
 
+        # Tried enough: see DEAD ENDS.
+        if repeats + 1 > DEAD_END_ATTEMPTS:
+            self.dead_end = True
+            self._stop_now()
+            self.publish_action("DEAD END")
+            log.warn(f"DEAD END -- {DEAD_END_ATTEMPTS} attempts the same way "
+                     f"have not got it out; HOLDING at zero for a person "
+                     f"(change mode to clear)")
+            self.is_avoiding = False
+            return
+
         # Repeating the same escape and getting nowhere: make it bigger.
         grow = 1.0
         if repeats >= TURN_ESCALATE_AFTER:
@@ -1168,7 +1274,18 @@ class AGVControl(Node):
                 and rear > self.prof['rear']):
             self.publish_action("REVERSING")
             speed = REV_SPEED_ESCALATED if grow > 1.0 else REV_SPEED
-            self.set_cmd(-speed, 0.0)
+            # Three-point turn from the 2nd attempt on (see DEAD ENDS):
+            # steer the reverse the OTHER way, so backing up turns it round
+            # too. Live zones, not the trigger snapshot.
+            room = OVERHANG_SIDE + KTURN_SIDE_ROOM
+            kturn = (repeats >= 1 and self.zones['left'] > room
+                     and self.zones['right'] > room)
+            rev_steer = -steer if kturn else 0.0
+            if kturn:
+                log.info("reversing as a three-point turn")
+                self.set_cmd(0.0, rev_steer)     # settle the steering first
+                time.sleep(SETTLE_TIME)
+            self.set_cmd(-speed, rev_steer)
             # Watched, not slept: see "Reversing safely".
             end = time.time() + REVERSE_TIME * grow
             while time.time() < end and self.mode in DRIVE_MODES:
@@ -1200,8 +1317,26 @@ class AGVControl(Node):
             self.publish_action("AVOIDING")
             self.set_cmd(0.0, steer)             # settle the steering first
             time.sleep(SETTLE_TIME)
-            self.set_cmd(TURN_SPEED, steer)      # then drive while turned
-            time.sleep(TURN_TIME * grow)
+            # then drive while turned -- WATCHED, see "Turning safely"
+            room = self.front_clearance(TURN_WATCH_MARGIN)
+            if room is None or room < TURN_STOP_GAP:
+                log.warn("no room to turn forward: "
+                         + ("no fresh scan" if room is None
+                            else f"only {room:.2f}m ahead of the bumper"))
+            else:
+                self.set_cmd(TURN_SPEED, steer)
+                end = time.time() + TURN_TIME * grow
+                while time.time() < end and self.mode in DRIVE_MODES:
+                    gap = self.front_clearance(TURN_WATCH_MARGIN)
+                    if gap is None:
+                        log.warn("scan stale while turning -- stopping")
+                        break
+                    if gap < TURN_STOP_GAP:
+                        log.warn(f"something {gap:.2f}m ahead of the bumper "
+                                 f"-- turn cut short")
+                        break
+                    time.sleep(TURN_POLL)
+                self._stop_now()
 
         self.set_cmd(0.0, 0.0)                   # stop, re-center
         self.publish_action("")                  # maneuver over

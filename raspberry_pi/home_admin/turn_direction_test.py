@@ -91,7 +91,8 @@ def Z(**k): return {**{z: 9999.0 for z in ZONES}, **k}
 def robot(env="OUTDOOR"):
     """A real AGVControl with its methods, minus __init__ (no ROS graph)."""
     o = object.__new__(cn.AGVControl)
-    o.mode = "AUTO"; o.is_avoiding = False
+    o.mode = "AUTO"; o.is_avoiding = False; o.dead_end = False
+    o.zones = Z()
     o.prof = dict(cn.ENV_PROFILES[env])
     o._last_turn = 0.0; o._last_turn_end = 0.0; o._turn_repeats = 0
     o._last_action = None
@@ -115,8 +116,14 @@ def run_avoid(o, z, scan=None):
     o._scan_geom = (0.0, math.radians(STEP))
     o._scan_time = CLOCK[0]
     LIDAR['robot'] = o
+    o.zones = dict(z)            # the live zones, as the trigger saw them
     cn.AGVControl.avoid(o, z)
-    turns = [az for lx, az in o.cmds if az != 0.0]
+    # The direction is the FORWARD turn's. From the 2nd attempt the reverse
+    # is steered the OTHER way on purpose (three-point turn, see DEAD ENDS),
+    # so the first steering command is no longer the turn direction.
+    turns = [az for lx, az in o.cmds if lx > 0 and az != 0.0]
+    if not turns:                # forward leg refused: its settle command
+        turns = [az for lx, az in o.cmds if lx == 0 and az != 0.0][-1:]
     o.last_cmds = list(o.cmds)   # kept: the reverse tests read these
     o.cmds.clear()
     return turns[0] if turns else 0.0
@@ -213,8 +220,11 @@ run_avoid(o2, Z(front=0.4, front_l=0.5, front_r=1.6, back=2.0))
 clear_rear = CLOCK[0] - t0
 # with the rear blocked: stop + settle + turn, and no reverse leg
 expect = cn.STOP_BEFORE_REVERSE + cn.SETTLE_TIME + cn.TURN_TIME
+# The turn is now WATCHED (polled every TURN_POLL, like the reverse), so it
+# can run up to one poll past TURN_TIME.
 chk("rear blocked: reverse leg skipped",
-    abs(blocked_rear - expect) < 0.01, f"{blocked_rear:.2f}s vs {expect:.2f}s")
+    -0.01 < blocked_rear - expect <= cn.TURN_POLL + 0.01,
+    f"{blocked_rear:.2f}s vs {expect:.2f}s")
 chk("rear clear: reverse leg included",
     clear_rear > blocked_rear + cn.REVERSE_TIME - 0.01,
     f"{clear_rear:.2f}s vs {blocked_rear:.2f}s")
@@ -324,6 +334,112 @@ LIDAR['after'] = t0 + cn.STOP_BEFORE_REVERSE + 0.5
 run_avoid(o, blocked)
 chk("a person stepping in mid-reverse is caught too",
     CLOCK[0] - t0 < full - 0.3, f"{CLOCK[0]-t0:.2f}s")
+
+# ================================================== 2026-10-28 additions
+def front_wall(d):
+    """A wall square ahead of the robot, d metres from the lidar."""
+    pts = []
+    b = -60.0
+    while b <= 60.0:
+        c = math.cos(math.radians(b))
+        if c > 1e-6:
+            pts.append((b, d / c))
+        b += STEP
+    return scan_with(pts)
+
+
+def both(front_d, rear_d):
+    f, r = front_wall(front_d), rear_wall(rear_d)
+    return [min(a, b) for a, b in zip(f, r)]
+
+
+print("\n-- the forward turn is watched (indoors it used to hit the wall)")
+o = robot("INDOOR")
+o.cmds.clear()
+stamps = []
+_orig = o.set_cmd
+def set_cmd_t(lx, az):
+    stamps.append((CLOCK[0], lx, az))
+    _orig(lx, az)
+o.set_cmd = set_cmd_t
+# Wall 0.40m ahead of the bumper; 0.3s into the turn it is 0.10m away.
+t0 = CLOCK[0]
+start_turn = t0 + cn.STOP_BEFORE_REVERSE + cn.SETTLE_TIME
+LIDAR['next'] = both(cn.OVERHANG_FWD + 0.10, 2.0)
+LIDAR['after'] = start_turn + 0.3
+run_avoid(o, Z(front=0.8, back=2.0), scan=both(cn.OVERHANG_FWD + 0.40, 0.3))
+fwd = [t for t, lx, az in stamps if lx > 0]
+stop_after = [t for t, lx, az in stamps if lx == 0 and az == 0 and fwd
+              and t > fwd[0]]
+ran = (stop_after[0] - fwd[0]) if fwd and stop_after else None
+chk("turn starts with room ahead", bool(fwd))
+chk("and is cut short when the wall comes within TURN_STOP_GAP",
+    ran is not None and ran < cn.TURN_TIME - 0.5, f"ran {ran}")
+chk("the stop goes out at once (published, not left for the tick)",
+    (0.0, 0.0) in o.published)
+
+o = robot("INDOOR")
+run_avoid(o, Z(front=0.5, back=0.45),
+          scan=both(cn.OVERHANG_FWD + 0.10, cn.OVERHANG_REAR + 0.05))
+chk("no room ahead (0.10m) and none behind: does not drive forward at all",
+    not any(lx > 0 for lx, az in o.last_cmds), f"{o.last_cmds}")
+o2 = robot("INDOOR")
+run_avoid(o2, Z(front=0.5, back=0.45),
+          scan=both(cn.OVERHANG_FWD + 0.40, cn.OVERHANG_REAR + 0.05))
+chk("(control: with 0.40m ahead it does turn forward)",
+    any(lx > 0 for lx, az in o2.last_cmds))
+
+print("\n-- dead ends: three-point turn, then a limit")
+dead = Z(front=0.6, front_l=0.9, front_r=1.6, left=0.9, right=0.9,
+         back=2.0)
+o = robot("INDOOR")
+run_avoid(o, dead, scan=both(cn.OVERHANG_FWD + 0.40, 2.0))
+rev = [(lx, az) for lx, az in o.last_cmds if lx < 0]
+chk("1st attempt: straight reverse, as before",
+    rev and all(az == 0.0 for _, az in rev), f"{rev}")
+turn1 = [az for lx, az in o.last_cmds if lx > 0][0]
+run_avoid(o, dead, scan=both(cn.OVERHANG_FWD + 0.40, 2.0))
+rev = [(lx, az) for lx, az in o.last_cmds if lx < 0]
+chk("2nd attempt: reverse steered the OTHER way (turns round backing up)",
+    rev and all(az == -turn1 for _, az in rev), f"{rev} vs turn {turn1}")
+tight = dict(dead, right=cn.OVERHANG_SIDE + 0.10)
+o3 = robot("INDOOR")
+run_avoid(o3, tight, scan=both(cn.OVERHANG_FWD + 0.40, 2.0))
+run_avoid(o3, tight, scan=both(cn.OVERHANG_FWD + 0.40, 2.0))
+rev = [(lx, az) for lx, az in o3.last_cmds if lx < 0]
+chk("...but straight if a side is within KTURN_SIDE_ROOM (tail swing)",
+    rev and all(az == 0.0 for _, az in rev), f"{rev}")
+
+o = robot("INDOOR")
+for i in range(cn.DEAD_END_ATTEMPTS):
+    run_avoid(o, dead, scan=both(cn.OVERHANG_FWD + 0.40, 2.0))
+chk(f"{cn.DEAD_END_ATTEMPTS} attempts: still trying", not o.dead_end)
+o.cmds.clear()
+run_avoid(o, dead, scan=both(cn.OVERHANG_FWD + 0.40, 2.0))
+chk(f"attempt {cn.DEAD_END_ATTEMPTS + 1}: gives up -- DEAD END hold",
+    o.dead_end and not o.is_avoiding)
+chk("and does not move at all", all(lx == 0 for lx, az in o.last_cmds),
+    f"{o.last_cmds}")
+
+msgs = []
+o.zones = dict(dead); o._blocked = False; o._was_blocked = False
+o.fence_blocked = False
+o.obstacle_pub = types.SimpleNamespace(publish=lambda m: msgs.append(m.data))
+cn.AGVControl.publish_obstacle(o)
+chk("reported as NO PATH, reason DEADEND (the installed app shows NO PATH)",
+    msgs and msgs[-1].endswith("|BLOCKED|DEADEND"), f"{msgs}")
+
+held = []
+o.pub = types.SimpleNamespace(publish=lambda m: held.append(m))
+o.blocked_hold = False; o.cmd = "drive!"
+cn.AGVControl.tick(o)
+chk("tick() publishes zeros while held", held and held[-1] != "drive!")
+
+class _M:
+    def __init__(self, d): self.data = d
+cn.AGVControl.mode_cb(o, _M("MANUAL"))
+chk("a mode change clears the hold and the attempt count",
+    not o.dead_end and o._turn_repeats == 0 and o._last_turn == 0.0)
 
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

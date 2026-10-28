@@ -110,9 +110,13 @@ class ObstacleWarning extends StatelessWidget {
             title: 'NO PATH',
             // FENCE: the field's stop line ahead and an obstacle behind --
             // the robot will not cross the line and cannot back up.
+            // DEADEND: tried the same way out 6 times; holding for a
+            // person (change mode to clear it).
             detail: socket.pathBlockedReason == 'FENCE'
                 ? 'field boundary ahead, obstacle behind'
-                : 'boxed in - no way forward, back or around',
+                : socket.pathBlockedReason == 'DEADEND'
+                    ? 'dead end - stopped after 6 tries; take over or change mode'
+                    : 'boxed in - no way forward, back or around',
           ));
         } else {
           final level = socket.obstacleLevel;
