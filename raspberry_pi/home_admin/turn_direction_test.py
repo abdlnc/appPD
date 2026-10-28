@@ -95,7 +95,7 @@ def robot(env="OUTDOOR"):
     o.zones = Z()
     o.prof = dict(cn.ENV_PROFILES[env])
     o._last_turn = 0.0; o._last_turn_end = 0.0; o._turn_repeats = 0
-    o._attempts = 0; o._turn_why = ""
+    o._attempts = 0; o._turn_why = ""; o._no_lidar_said = False
     o._last_action = None
     o.cmds = []
     o.published = []        # what _stop_now() sent immediately
@@ -107,7 +107,8 @@ def robot(env="OUTDOOR"):
     o.set_cmd = set_cmd
     o.pub = types.SimpleNamespace(publish=lambda m: o.published.append(m))
     o.get_logger = lambda: types.SimpleNamespace(warn=lambda m: None,
-                                                 info=lambda m: None)
+                                                 info=lambda m: None,
+                                                 error=lambda m: None)
     return o
 
 def run_avoid(o, z, scan=None):
@@ -545,6 +546,28 @@ chk("turning LEFT: the wall counts -- the corner would swing into it",
     turning_left < cn.TURN_STOP_GAP, f"{turning_left:.2f}")
 chk("turning RIGHT: it does not (the corner swings away)",
     turning_right == math.inf, f"{turning_right}")
+
+print("\n-- no scans, no driving (2026-10-28: the lidar never started)")
+o = robot("INDOOR")
+o.blocked_hold = False; o.fence_blocked = False; o._no_lidar_said = False
+acts = []
+o.publish_action = lambda t: acts.append(t)
+sent = []
+o.pub = types.SimpleNamespace(publish=lambda m: sent.append(m))
+o.cmd = "cruise"                                 # the last drive command
+o._scan_time = CLOCK[0]
+cn.AGVControl.tick(o)
+chk("fresh scan: the drive command goes out", sent[-1] == "cruise")
+CLOCK[0] += cn.SCAN_STALE_S + 0.1                # lidar goes quiet
+cn.AGVControl.tick(o)
+cn.AGVControl.tick(o)
+chk("no scan for > SCAN_STALE_S: zeros, not the last command",
+    sent[-1] != "cruise" and sent[-2] != "cruise")
+chk("and says NO LIDAR, once", acts.count("NO LIDAR") == 1, f"{acts}")
+o._scan_time = CLOCK[0]                          # scans come back
+cn.AGVControl.tick(o)
+chk("scans back: drives again, and clears the message",
+    sent[-1] == "cruise" and acts[-1] == "")
 
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

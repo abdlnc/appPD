@@ -1,0 +1,118 @@
+diff --git a/launch/sllidar_c1_launch.py b/launch/sllidar_c1_launch.py
+index 90b01af..788ba97 100644
+--- a/launch/sllidar_c1_launch.py
++++ b/launch/sllidar_c1_launch.py
+@@ -66,6 +66,10 @@ def generate_launch_description():
+                          'inverted': inverted, 
+                          'angle_compensate': angle_compensate, 
+                          'scan_mode': scan_mode}],
+-            output='screen'),
++            output='screen',
++            # AGV patch (2026-10-28): the driver now exits if the lidar will
++            # not start (see sllidar_node.cpp); start a fresh one.
++            respawn=True,
++            respawn_delay=3.0),
+     ])
+ 
+diff --git a/src/sllidar_node.cpp b/src/sllidar_node.cpp
+index 5abfd0f..76253d0 100644
+--- a/src/sllidar_node.cpp
++++ b/src/sllidar_node.cpp
+@@ -39,6 +39,8 @@
+ #include "math.h"
+ 
+ #include <signal.h>
++#include <thread>   // AGV patch: retry delay
++#include <chrono>
+ 
+ #ifndef _countof
+ #define _countof(_Array) (int)(sizeof(_Array) / sizeof(_Array[0]))
+@@ -305,35 +307,53 @@ public:
+         start_motor_service = this->create_service<std_srvs::srv::Empty>("start_motor", 
+                                 std::bind(&SLlidarNode::start_motor,this,std::placeholders::_1,std::placeholders::_2));
+ 
+-        drv->setMotorSpeed();
+-
++        // AGV PATCH (2026-10-28): retry the start, then EXIT on failure.
++        // After a quick restart the lidar could answer the scan-mode query
++        // with nothing ("supported modes:" and an empty list, then "Can not
++        // start scan: 80008001"). The stock driver then carried on with the
++        // lidar stopped -- alive, silent, never retried -- so the robot had
++        // no lidar until someone restarted it by hand. Now: stop it, wait,
++        // try again; if it still will not start, exit, and the launch file
++        // (respawn) starts a fresh driver.
+         LidarScanMode current_scan_mode;
+-        if (scan_mode.empty()) {
+-            op_result = drv->startScan(false /* not force scan */, true /* use typical scan mode */, 0, &current_scan_mode);
+-        } else {
+-            std::vector<LidarScanMode> allSupportedScanModes;
+-            op_result = drv->getAllSupportedScanModes(allSupportedScanModes);
++        const int start_tries = 5;
++        for (int attempt = 1; attempt <= start_tries; ++attempt) {
++            drv->setMotorSpeed();
++            if (scan_mode.empty()) {
++                op_result = drv->startScan(false /* not force scan */, true /* use typical scan mode */, 0, &current_scan_mode);
++            } else {
++                std::vector<LidarScanMode> allSupportedScanModes;
++                op_result = drv->getAllSupportedScanModes(allSupportedScanModes);
+ 
+-            if (SL_IS_OK(op_result)) {
+-                sl_u16 selectedScanMode = sl_u16(-1);
+-                for (std::vector<LidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
+-                    if (iter->scan_mode == scan_mode) {
+-                        selectedScanMode = iter->id;
+-                        break;
++                if (SL_IS_OK(op_result)) {
++                    sl_u16 selectedScanMode = sl_u16(-1);
++                    for (std::vector<LidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
++                        if (iter->scan_mode == scan_mode) {
++                            selectedScanMode = iter->id;
++                            break;
++                        }
+                     }
+-                }
+ 
+-                if (selectedScanMode == sl_u16(-1)) {
+-                    RCLCPP_ERROR(this->get_logger(),"scan mode `%s' is not supported by lidar, supported modes:", scan_mode.c_str());
+-                    for (std::vector<LidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
+-                        RCLCPP_ERROR(this->get_logger(),"\t%s: max_distance: %.1f m, Point number: %.1fK",  iter->scan_mode,
+-                                iter->max_distance, (1000/iter->us_per_sample));
++                    if (selectedScanMode == sl_u16(-1)) {
++                        RCLCPP_ERROR(this->get_logger(),"scan mode `%s' is not supported by lidar, supported modes:", scan_mode.c_str());
++                        for (std::vector<LidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
++                            RCLCPP_ERROR(this->get_logger(),"\t%s: max_distance: %.1f m, Point number: %.1fK",  iter->scan_mode,
++                                    iter->max_distance, (1000/iter->us_per_sample));
++                        }
++                        op_result = SL_RESULT_OPERATION_FAIL;
++                    } else {
++                        op_result = drv->startScanExpress(false /* not force scan */, selectedScanMode, 0, &current_scan_mode);
+                     }
+-                    op_result = SL_RESULT_OPERATION_FAIL;
+-                } else {
+-                    op_result = drv->startScanExpress(false /* not force scan */, selectedScanMode, 0, &current_scan_mode);
+                 }
+             }
++            if (SL_IS_OK(op_result)) {
++                break;
++            }
++            RCLCPP_WARN(this->get_logger(),
++                "AGV: scan start attempt %d/%d failed (%08x) -- stopping the lidar and retrying",
++                attempt, start_tries, op_result);
++            drv->stop();
++            std::this_thread::sleep_for(std::chrono::seconds(1));
+         }
+ 
+         if(SL_IS_OK(op_result))
+@@ -350,6 +370,12 @@ public:
+         else
+         {
+             RCLCPP_ERROR(this->get_logger(),"Can not start scan: %08x!", op_result);
++            // AGV PATCH: exit rather than run silent -- see above
++            RCLCPP_ERROR(this->get_logger(),
++                "AGV: lidar would not start after %d tries -- exiting so it is restarted", start_tries);
++            drv->setMotorSpeed(0);
++            drv->stop();
++            return -1;
+         }
+ 
+         rclcpp::Time start_scan_time;

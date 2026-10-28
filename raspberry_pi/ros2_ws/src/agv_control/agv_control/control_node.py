@@ -266,6 +266,14 @@ REVERSE_SIDE_MARGIN  = 0.05    # m of slack each side of the body
 REVERSE_POLL         = 0.05    # s between checks while reversing
 REVERSE_SCAN_MAX_AGE = 0.50    # s; an older scan cannot be trusted
 
+# ----------- No scans, no driving -----------
+# 2026-10-28: after a restart the lidar driver ran but never started the
+# lidar -- no /scan at all. tick() went on publishing the LAST drive command
+# at 10Hz regardless, so a lidar lost mid-run would have left the robot
+# driving blind on whatever it was last told. Now, in AUTO / COVER, a scan
+# older than this means stop, and say so, until scans come back.
+SCAN_STALE_S = 0.5             # s; the C1 scans at 10Hz
+
 # The escalated ("max") reverse runs up to 2.5x longer, so it is also run
 # slower: it covers more ground than a normal reverse, and slower gives the
 # watch above more time to catch something. Not lower than 0.40: motor_node
@@ -636,6 +644,7 @@ class AGVControl(Node):
         self.fence_time = 0.0
         self.fence_blocked = False   # stop line ahead AND something behind
         self.dead_end = False        # gave up after DEAD_END_ATTEMPTS
+        self._no_lidar_said = False  # "NO LIDAR" reported (see tick)
         self._nofix_said = False
         self.create_subscription(String, '/fence_state', self.fence_cb, 10)
 
@@ -753,6 +762,21 @@ class AGVControl(Node):
         # only this node publishes /cmd_vel while AUTONOMOUS
         if self.mode not in DRIVE_MODES:
             return
+        # see "No scans, no driving"
+        if time.time() - self._scan_time > SCAN_STALE_S:
+            if not self._no_lidar_said:
+                self._no_lidar_said = True
+                self.publish_action("NO LIDAR")
+                self.get_logger().error(
+                    "NO LIDAR SCANS for over "
+                    f"{SCAN_STALE_S:.1f}s -- holding at zero until they "
+                    "come back")
+            self.pub.publish(Twist())
+            return
+        if self._no_lidar_said:
+            self._no_lidar_said = False
+            self.publish_action("")
+            self.get_logger().info("lidar scans back -- resuming")
         if self.blocked_hold or self.fence_blocked or self.dead_end:
             # Boxed in -> hold at zero regardless of whatever avoid() last
             # computed. Enforced HERE, at the single point that publishes
