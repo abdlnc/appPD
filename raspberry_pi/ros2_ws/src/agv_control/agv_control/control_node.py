@@ -218,7 +218,14 @@ ENV_PROFILES = {
         # corner clearance AND the tightest gaps -- 6cm a side is all a 72cm
         # corridor has to give. If it now refuses an opening you know it
         # fits through, this is the one number to bring back down.
-        "side_margin": 0.15,
+        #
+        # 2026-10-28: brought down to 0.10, on request, so it takes a
+        # standard door (~0.80m clear) -- at 0.15 it needed 0.90m and an
+        # open door was never a gap. The corners no longer rest on this
+        # margin alone: the forward turn is watched (wider on the side it
+        # swings to) and a body-wide strip ahead triggers avoidance -- see
+        # "Turning safely" and "Body-wide front trigger".
+        "side_margin": 0.10,
     },
 }
 DEFAULT_ENV = "OUTDOOR"

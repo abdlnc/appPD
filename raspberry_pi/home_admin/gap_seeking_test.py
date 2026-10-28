@@ -228,7 +228,8 @@ print("\n-- INDOOR runs wider margins for corner clearance")
 # The robot kept catching walls on its CORNERS indoors. Raising the front
 # trigger does not help there: INDOOR sets corners_trigger False, so the
 # corner ZONES are ignored by design. What covers the corners is the gap
-# geometry's side margin, which INDOOR widens from 5cm to 15cm.
+# geometry's side margin, which INDOOR widens from 5cm (to 10cm since
+# 2026-10-28, so it takes a ~0.80m door).
 chk("INDOOR demands more corner clearance than OUTDOOR",
     cn.ENV_PROFILES['INDOOR']['side_margin']
     > cn.ENV_PROFILES['OUTDOOR']['side_margin'],
@@ -238,15 +239,17 @@ chk("so INDOOR needs a wider gap head-on",
     need_at(0, 'INDOOR') > need_at(0, 'OUTDOOR'),
     f"{need_at(0,'INDOOR'):.2f}m vs {need_at(0,'OUTDOOR'):.2f}m")
 
-# A 0.80m corridor: OUTDOOR takes it (needs 0.70m), INDOOR refuses it
-# (needs 0.90m). That is the trade being made deliberately -- 10cm a side
-# was what was grazing the walls.
-walls = [((-1, 0.40), (3, 0.40)), ((-1, -0.40), (3, -0.40))]
-r80 = scan_from_walls(walls)
-_, found_out, _ = gap(r80, env="OUTDOOR")
-_, found_in, _ = gap(r80, env="INDOOR")
-chk("80cm corridor: OUTDOOR drives it", found_out)
-chk("80cm corridor: INDOOR refuses it (corner clearance)", not found_in)
+# INDOOR needs 0.80m head-on (60cm + 10cm a side): a standard door. An
+# 0.82m doorway it takes; 0.76m it refuses -- OUTDOOR (0.70m) takes both.
+def doorway(w):
+    h = w / 2.0
+    return scan_from_walls([((1.0, h), (1.0, 3.0)), ((1.0, -h), (1.0, -3.0))])
+_, found_in, _ = gap(doorway(0.82), env="INDOOR")
+chk("82cm doorway ahead: INDOOR drives through it", found_in)
+_, found_in, _ = gap(doorway(0.76), env="INDOOR")
+_, found_out, _ = gap(doorway(0.76), env="OUTDOOR")
+chk("76cm doorway: INDOOR refuses it (corner clearance)", not found_in)
+chk("76cm doorway: OUTDOOR drives it", found_out)
 
 # A 1.0m corridor clears the wider margin, so INDOOR still passes.
 walls = [((-1, 0.50), (3, 0.50)), ((-1, -0.50), (3, -0.50))]
