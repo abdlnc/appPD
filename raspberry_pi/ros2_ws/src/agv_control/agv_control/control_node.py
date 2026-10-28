@@ -48,6 +48,7 @@ import threading
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from geometry_msgs.msg import Twist
@@ -639,7 +640,11 @@ class AGVControl(Node):
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
         self.create_subscription(String, '/mode', self.mode_cb, 10)
         self.create_subscription(String, '/ai_detections', self.ai_cb, 10)
-        self.create_subscription(String, '/env_mode', self.env_cb, 10)
+        # latched: bridge_node publishes the remembered environment once at
+        # start-up, possibly before this node exists (see bridge ENV_FILE)
+        self.create_subscription(
+            String, '/env_mode', self.env_cb,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # --- COVER route (see COVER) ---
         self.route_steer = 0.0

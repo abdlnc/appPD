@@ -181,6 +181,14 @@ COVERAGE_FLAG = os.path.expanduser("~/agv_coverage")
 SET_POSITION_FLAG = os.path.expanduser("~/agv_set_position")
 DEFAULT_ENV = "OUTDOOR"
 MANUAL_SPEED = MANUAL_SPEED_BY_ENV[DEFAULT_ENV]
+# The last environment the app set, kept across restarts. 2026-10-28: the
+# app sends ENV only when its control screen first opens, so after a robot
+# restart with the app still open the robot came back OUTDOOR (double the
+# INDOOR speed, a shorter trigger) while the phone still showed INDOOR.
+# Now the robot remembers it, and /env_mode is latched so control_node gets
+# it whichever node starts first.
+ENV_FILE = os.path.expanduser("~/agv_env")
+ENV_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
                             # (map_saver_cli can transiently fail right after
                             # a restart -- the script retries up to 3x itself)
 
@@ -206,7 +214,7 @@ class BridgeNode(Node):
         self.mode_pub = self.create_publisher(String, '/mode', 10)
         # Latched-ish: republished whenever the app sets it, and once at
         # startup, so control_node hears it even if it started second.
-        self.env_pub = self.create_publisher(String, '/env_mode', 10)
+        self.env_pub = self.create_publisher(String, '/env_mode', ENV_QOS)
 
         # see CAPTURE above -- OFF until a run starts
         self.capture_pub = self.create_publisher(String, '/capture_enabled',
@@ -238,6 +246,7 @@ class BridgeNode(Node):
         self.create_subscription(String, '/avoid_action', self.action_cb, 10)
         self.create_subscription(String, '/gps', self.gps_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
+        self.load_env()                  # the environment last set (ENV_FILE)
         self.get_logger().info(f"Bridge node ready. WebSocket on :{WS_PORT}")
 
     # ---- camera frames arrive here from camera_node (Phase 5) ----
@@ -366,11 +375,33 @@ class BridgeNode(Node):
         self._publish_capture()
 
     # ---- manual joystick -> Twist ----
-    def set_env(self, name):
+    def load_env(self):
+        """At start-up: the environment last set, if any (see ENV_FILE)."""
+        try:
+            with open(ENV_FILE) as f:
+                name = f.read().strip().upper()
+        except OSError:
+            name = ""
+        if name in MANUAL_SPEED_BY_ENV:
+            self.set_env(name, save=False)
+            self.get_logger().info(f"Environment {name} restored from "
+                                   f"{ENV_FILE}")
+        else:
+            self.set_env(DEFAULT_ENV, save=False)
+
+    def set_env(self, name, save=True):
         """OUTDOOR / INDOOR from the app's developer settings."""
         name = name.strip().upper()
         if name not in MANUAL_SPEED_BY_ENV:
             return
+        if save:
+            try:
+                tmp = ENV_FILE + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(name + "\n")
+                os.replace(tmp, ENV_FILE)
+            except OSError as e:
+                self.get_logger().warn(f"environment not saved: {e}")
         self.env = name
         self.manual_speed = MANUAL_SPEED_BY_ENV[name]
         m = String()

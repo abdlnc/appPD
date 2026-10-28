@@ -32,6 +32,10 @@ for m in ('rclpy','rclpy.node','sensor_msgs','sensor_msgs.msg','std_msgs',
           'std_msgs.msg','geometry_msgs','geometry_msgs.msg'):
     sys.modules.setdefault(m, types.ModuleType(m))
 sys.modules['rclpy.node'].Node = object
+sys.modules.setdefault('rclpy.qos', types.ModuleType('rclpy.qos'))
+sys.modules['rclpy.qos'].QoSProfile = lambda **k: None
+sys.modules['rclpy.qos'].DurabilityPolicy = types.SimpleNamespace(
+    TRANSIENT_LOCAL=1, VOLATILE=0)
 class S:
     def __init__(self): self.data = ""
 sys.modules['std_msgs.msg'].String = S
