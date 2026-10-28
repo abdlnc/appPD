@@ -286,6 +286,11 @@ TURN_TIME           = 1.0      # s of driving while turned
 TURN_STOP_GAP     = 0.15       # m from the front bumper: stop the turn
 TURN_WATCH_MARGIN = 0.05       # m of slack each side of the body
 TURN_POLL         = 0.05       # s between checks while turning
+# Extra on the side it is turning TOWARD. 2026-10-28: turning left, the
+# front-LEFT corner swung into a wall just outside the straight strip, and
+# the watch only stopped it when the bumper's centre got to 0.15m -- the
+# corner was ~5cm off. The corner swings sideways in a turn; watch there.
+TURN_SWING_EXTRA  = 0.15       # m
 
 # ----------- Body-wide front trigger (profiles that ignore the corners) ------
 # INDOOR ignores the front-corner ZONES so it can drive down corridors. But
@@ -509,6 +514,30 @@ FENCE_BAND_RESET_M = 2.0       # and its reset rule
 TURN_COMMIT_TIME = 5.0         # s
 TURN_SIDE_MARGIN = 0.15        # m
 
+# ----------- Which side: where it can GO, not just what is closest -----------
+# 2026-10-28: the side was chosen only by which front corner was closer. In
+# a room that means "away from the nearest chair", never "toward the way
+# out" -- it went right, away from a chair stack, when the open door was on
+# the left. Now each side (10-120 degrees off the nose) is scored by the
+# longest heading the body fits along (the profile's side margin, as the gap
+# search), out to OPEN_LOOKAHEAD. A side clearly more open, by
+# OPEN_SIDE_MARGIN, wins; otherwise the corner/side rules decide as before
+# (open ground and square walls behave exactly as they did).
+#
+# And the commitment can now be BROKEN, but only decisively: same run, the
+# right had opened to 1.4-1.5m and the left closed to 0.7m and it still
+# turned left, four times, into the wall, because the last turn was under
+# TURN_COMMIT_TIME ago. It switches when the other side is more open by
+# OPEN_SWITCH_MARGIN, or the committed side's front corner has become closer
+# by COMMIT_BREAK_CORNER. Both are far above the noise TURN_SIDE_MARGIN was
+# added for, so the old left/right flip-flopping does not come back.
+OPEN_LOOKAHEAD      = 3.0      # m, how far each side is judged
+OPEN_ARC_DEG        = (10.0, 120.0)   # off the nose, each side
+OPEN_STEP_DEG       = 5.0
+OPEN_SIDE_MARGIN    = 0.50     # m more open = that side, on a fresh choice
+OPEN_SWITCH_MARGIN  = 1.00     # m more open = break the commitment
+COMMIT_BREAK_CORNER = 0.40     # m closer corner = break the commitment
+
 # After this many committed repeats against the same obstacle, the same
 # maneuver plainly is not working, so make it bigger rather than keep
 # repeating it identically: back off further and turn for longer, in the
@@ -547,6 +576,9 @@ class AGVControl(Node):
         self._last_turn = 0.0       # steer sign of the last maneuver, 0 = none
         self._last_turn_end = 0.0   # when that maneuver finished
         self._turn_repeats = 0      # consecutive committed repeats
+        self._attempts = 0          # consecutive avoidances, either way --
+                                    # the DEAD END count (see pick_turn)
+        self._turn_why = ""         # what decided the last side, for the log
 
         # --- latest cleaned scan, read by the reverse watch (another
         # thread). Swapped as whole objects, so a reader never sees a
@@ -618,6 +650,7 @@ class AGVControl(Node):
             self.dead_end = False
             self._last_turn = 0.0
             self._turn_repeats = 0
+            self._attempts = 0
         self.mode = m
         if m not in DRIVE_MODES:
             self.cmd = Twist()         # zero out (we won't publish anyway)
@@ -1078,12 +1111,13 @@ class AGVControl(Node):
             best = min(best, behind - OVERHANG_REAR)
         return best
 
-    def front_clearance(self, margin):
+    def front_clearance(self, margin, extra_left=0.0, extra_right=0.0):
         """Distance from the FRONT BUMPER to the nearest thing in a corridor
-        as wide as the body (+ margin each side) straight ahead -- the
-        forward twin of rear_clearance. Something alongside the front half of
-        the body inside that width reads negative (touching). math.inf for
-        clear, None when the scan is too old to trust."""
+        as wide as the body (+ margin each side, + extra_left / extra_right
+        on one side) straight ahead -- the forward twin of rear_clearance.
+        Something alongside the front half of the body inside that width
+        reads negative (touching). math.inf for clear, None when the scan is
+        too old to trust."""
         if time.time() - self._scan_time > REVERSE_SCAN_MAX_AGE:
             return None
         ranges = self._scan_ranges
@@ -1099,10 +1133,45 @@ class AGVControl(Node):
             ahead = r * math.cos(a)            # metres ahead of the lidar
             if ahead <= 0.0:
                 continue                       # behind the lidar
-            if abs(r * math.sin(a)) >= half:
+            side = r * math.sin(a)             # + = LEFT
+            if side >= half + extra_left or side <= -(half + extra_right):
                 continue                       # beside the path, not in it
             best = min(best, ahead - OVERHANG_FWD)
         return best
+
+    def side_openness(self):
+        """(left, right): on each side, the longest straight run the body
+        fits along (profile side margin), over headings OPEN_ARC_DEG off the
+        nose, capped at OPEN_LOOKAHEAD. None if the scan is too old."""
+        if time.time() - self._scan_time > REVERSE_SCAN_MAX_AGE:
+            return None
+        ranges = self._scan_ranges
+        amin, ainc = self._scan_geom
+        pts = []
+        for k, r in enumerate(ranges):
+            if r is None or math.isinf(r) or math.isnan(r) \
+                    or r < MIN_VALID_DIST or r > OPEN_LOOKAHEAD + 1.0:
+                continue
+            deg = (math.degrees(amin + k * ainc) + ANGLE_OFFSET_DEG) % 360.0
+            pts.append((math.radians(deg), r))
+        half = ROBOT_WIDTH / 2.0 + self.prof.get('side_margin',
+                                                 GAP_SIDE_MARGIN)
+        best = {1: 0.0, -1: 0.0}
+        lo, hi = OPEN_ARC_DEG
+        for sign in (1, -1):
+            d = lo
+            while d <= hi:
+                th = math.radians(sign * d)
+                run = OPEN_LOOKAHEAD
+                for phi, r in pts:
+                    along = r * math.cos(phi - th)
+                    if along <= 0.0:
+                        continue
+                    if abs(r * math.sin(phi - th)) < half:
+                        run = min(run, along)
+                best[sign] = max(best[sign], run)
+                d += OPEN_STEP_DEG
+        return best[1], best[-1]
 
     def _stop_now(self):
         """Zero the command AND send it this instant. set_cmd() alone waits
@@ -1199,16 +1268,43 @@ class AGVControl(Node):
         avoid() uses to escalate. See TURN_COMMIT_TIME for why this has
         memory at all."""
         now = time.time()
+        opn = self.side_openness()               # (left, right) or None
+        corner = z['front_l'] - z['front_r']     # + = left corner clearer
 
         # 1. Already committed: still the same obstacle, so keep working the
-        #    same way around it rather than undoing the last attempt.
+        #    same way around it rather than undoing the last attempt --
+        #    UNLESS the other side has become decisively better (see "Which
+        #    side").
         if (self._last_turn != 0.0
                 and (now - self._last_turn_end) < TURN_COMMIT_TIME):
+            self._attempts += 1
+            c = self._last_turn
+            against = []
+            if opn is not None and -c * (opn[0] - opn[1]) > OPEN_SWITCH_MARGIN:
+                against.append(f"open {opn[0]:.1f}m left vs {opn[1]:.1f}m "
+                               f"right")
+            if -c * corner > COMMIT_BREAK_CORNER:
+                against.append(f"corners {z['front_l']:.2f}m left vs "
+                               f"{z['front_r']:.2f}m right")
+            if against:
+                self._turn_repeats = 0
+                self._turn_why = ("other side now clearly better: "
+                                  + "; ".join(against))
+                return -c, 0
             self._turn_repeats += 1
-            return self._last_turn, self._turn_repeats
+            self._turn_why = "same obstacle, same way"
+            return c, self._turn_repeats
 
         # A fresh obstacle: forget the last one.
         self._turn_repeats = 0
+        self._attempts = 0
+
+        # 1b. Toward the side the robot can actually GO -- see "Which side".
+        if opn is not None and abs(opn[0] - opn[1]) > OPEN_SIDE_MARGIN:
+            self._turn_why = (f"more open: {opn[0]:.1f}m left vs "
+                              f"{opn[1]:.1f}m right")
+            return (+1.0 if opn[0] > opn[1] else -1.0), 0
+        self._turn_why = ""
 
         # 2. Turn away from the side the obstacle is actually ON. The front
         #    corner zones are where something in the robot's path shows up;
@@ -1244,13 +1340,14 @@ class AGVControl(Node):
         # ends up after backing away.
         steer, repeats = self.pick_turn(z)
 
-        # Tried enough: see DEAD ENDS.
-        if repeats + 1 > DEAD_END_ATTEMPTS:
+        # Tried enough: see DEAD ENDS. Counted either way round, so switching
+        # sides cannot reset it into an endless loop.
+        if self._attempts + 1 > DEAD_END_ATTEMPTS:
             self.dead_end = True
             self._stop_now()
             self.publish_action("DEAD END")
-            log.warn(f"DEAD END -- {DEAD_END_ATTEMPTS} attempts the same way "
-                     f"have not got it out; HOLDING at zero for a person "
+            log.warn(f"DEAD END -- {DEAD_END_ATTEMPTS} attempts have not "
+                     f"got it out; HOLDING at zero for a person "
                      f"(change mode to clear)")
             self.is_avoiding = False
             return
@@ -1278,7 +1375,7 @@ class AGVControl(Node):
             # steer the reverse the OTHER way, so backing up turns it round
             # too. Live zones, not the trigger snapshot.
             room = OVERHANG_SIDE + KTURN_SIDE_ROOM
-            kturn = (repeats >= 1 and self.zones['left'] > room
+            kturn = (self._attempts >= 1 and self.zones['left'] > room
                      and self.zones['right'] > room)
             rev_steer = -steer if kturn else 0.0
             if kturn:
@@ -1307,7 +1404,8 @@ class AGVControl(Node):
                         else f"only {rear:.2f}m behind the bumper"))
 
         log.info(f"going {'LEFT' if steer > 0 else 'RIGHT'} around it"
-                 f"{f' (attempt {repeats + 1})' if repeats else ''}")
+                 f"{f' (attempt {self._attempts + 1})' if self._attempts else ''}"
+                 f"{f' -- {self._turn_why}' if self._turn_why else ''}")
 
         if self.mode in DRIVE_MODES:
             # "AVOIDING" rather than naming the turn direction: which way it
@@ -1318,7 +1416,10 @@ class AGVControl(Node):
             self.set_cmd(0.0, steer)             # settle the steering first
             time.sleep(SETTLE_TIME)
             # then drive while turned -- WATCHED, see "Turning safely"
-            room = self.front_clearance(TURN_WATCH_MARGIN)
+            # watch the strip ahead, wider on the side it turns toward
+            swing = {"extra_left": TURN_SWING_EXTRA if steer > 0 else 0.0,
+                     "extra_right": TURN_SWING_EXTRA if steer < 0 else 0.0}
+            room = self.front_clearance(TURN_WATCH_MARGIN, **swing)
             if room is None or room < TURN_STOP_GAP:
                 log.warn("no room to turn forward: "
                          + ("no fresh scan" if room is None
@@ -1327,7 +1428,7 @@ class AGVControl(Node):
                 self.set_cmd(TURN_SPEED, steer)
                 end = time.time() + TURN_TIME * grow
                 while time.time() < end and self.mode in DRIVE_MODES:
-                    gap = self.front_clearance(TURN_WATCH_MARGIN)
+                    gap = self.front_clearance(TURN_WATCH_MARGIN, **swing)
                     if gap is None:
                         log.warn("scan stale while turning -- stopping")
                         break

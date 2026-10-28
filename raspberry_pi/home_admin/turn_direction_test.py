@@ -95,6 +95,7 @@ def robot(env="OUTDOOR"):
     o.zones = Z()
     o.prof = dict(cn.ENV_PROFILES[env])
     o._last_turn = 0.0; o._last_turn_end = 0.0; o._turn_repeats = 0
+    o._attempts = 0; o._turn_why = ""
     o._last_action = None
     o.cmds = []
     o.published = []        # what _stop_now() sent immediately
@@ -440,6 +441,110 @@ class _M:
 cn.AGVControl.mode_cb(o, _M("MANUAL"))
 chk("a mode change clears the hold and the attempt count",
     not o.dead_end and o._turn_repeats == 0 and o._last_turn == 0.0)
+
+print("\n-- which side: where it can GO (2026-10-28, the open door)")
+
+
+def scene(left_r, right_r, post=None, front_r=0.85):
+    """Rays every STEP degrees: front_r within +/-10 deg, left_r on the left
+    (10-180), right_r on the right; post = (bearing_from, bearing_to, r)."""
+    pts = []
+    b = -180.0
+    while b < 180.0:
+        r = front_r if abs(b) < 10 else (left_r if b > 0 else right_r)
+        if post and post[0] <= b <= post[1]:
+            r = min(r, post[2])
+        pts.append((b, r))
+        b += STEP
+    return scan_with(pts)
+
+
+def choose(o, scan, z):
+    o._scan_ranges = scan
+    o._scan_geom = (0.0, math.radians(STEP))
+    o._scan_time = CLOCK[0]
+    return cn.AGVControl.pick_turn(o, z)
+
+
+# A post at the LEFT front corner (FL 0.60) -- the old rule turns RIGHT,
+# away from it -- but the right is a pocket closed at 1.0m and the left is
+# open beyond the post.
+door = scene(3.5, 1.0, post=(40, 45, 0.60))
+zd = Z(front=0.85, front_l=0.60, front_r=1.0, left=3.5, right=1.0, back=3.5)
+o = robot("INDOOR")
+o.set_cmd = lambda lx, az: None
+opn = None
+o._scan_ranges = door; o._scan_geom = (0.0, math.radians(STEP))
+o._scan_time = CLOCK[0]
+opn = cn.AGVControl.side_openness(o)
+chk("openness: left ~3m (past the post), right ~1m (pocket)",
+    opn[0] > 2.5 and opn[1] < 1.1, f"{opn[0]:.2f} / {opn[1]:.2f}")
+d, rep_ = choose(o, door, zd)
+chk("fresh choice: LEFT, toward where it can go (old rule: RIGHT)",
+    d == +1.0, f"{name(d)} -- {o._turn_why}")
+
+# nothing decisive either way: the corner rule decides, as before
+even = scene(2.0, 2.2)
+o = robot("INDOOR")
+d, _ = choose(o, even, Z(front=0.85, front_l=0.5, front_r=1.0,
+                         left=2.0, right=2.2))
+chk("sides about equally open: the corner rule still decides (RIGHT)",
+    d == -1.0, f"{name(d)}")
+
+print("\n-- the commitment gives way only to decisive evidence")
+o = robot("INDOOR")
+o._last_turn = -1.0; o._last_turn_end = CLOCK[0]; o._turn_repeats = 1
+d, rep_ = choose(o, door, zd)
+chk("committed RIGHT, left now 2m more open: switches to LEFT",
+    d == +1.0 and rep_ == 0, f"{name(d)} -- {o._turn_why}")
+# 15:33:16 replayed: committed LEFT, left corner 0.69, right corner 1.43
+o = robot("INDOOR")
+o._last_turn = +1.0; o._last_turn_end = CLOCK[0]; o._turn_repeats = 2
+d, _ = choose(o, scene(0.75, 1.5),
+              Z(front=0.68, front_l=0.69, front_r=1.43, left=0.70,
+                right=0.75))
+chk("15:33:16 replayed (L 0.69 vs R 1.43, committed LEFT): goes RIGHT",
+    d == -1.0, f"{name(d)} -- {o._turn_why}")
+o = robot("INDOOR")
+o._last_turn = +1.0; o._last_turn_end = CLOCK[0]; o._turn_repeats = 1
+d, rep_ = choose(o, scene(1.8, 2.1),
+                 Z(front=0.8, front_l=0.9, front_r=1.1, left=1.8,
+                   right=2.1))
+chk("small differences (0.3m open, 0.2m corner): stays committed LEFT",
+    d == +1.0 and rep_ == 2, f"{name(d)} rep {rep_}")
+
+print("\n-- the dead-end count survives switching sides")
+o = robot("INDOOR")
+left_open = scene(3.5, 1.0, post=(40, 45, 0.60))
+right_open = scene(1.0, 3.5, post=(-45, -40, 0.60))
+zl = Z(front=0.6, front_l=0.6, front_r=1.0, left=3.5, right=1.0, back=3.5)
+zr = Z(front=0.6, front_l=1.0, front_r=0.6, left=1.0, right=3.5, back=3.5)
+dirs = []
+for i in range(cn.DEAD_END_ATTEMPTS + 1):
+    sc, zz = (left_open, zl) if i % 2 == 0 else (right_open, zr)
+    run_avoid(o, zz, scan=[min(a, b) for a, b in
+                           zip(sc, rear_wall(3.0))])
+    dirs.append(o._last_turn)
+chk("(test data: it really did switch sides)", len(set(dirs[:-1])) == 2,
+    f"{[name(x) for x in dirs]}")
+chk(f"still stops at DEAD END after {cn.DEAD_END_ATTEMPTS} attempts",
+    o.dead_end)
+
+print("\n-- the turn watch covers the side it turns toward")
+o = robot("INDOOR")
+o._scan_ranges = scan_with([(45.0, 0.55)])     # wall at the front-LEFT corner
+o._scan_geom = (0.0, math.radians(STEP)); o._scan_time = CLOCK[0]
+straight = cn.AGVControl.front_clearance(o, cn.TURN_WATCH_MARGIN)
+turning_left = cn.AGVControl.front_clearance(
+    o, cn.TURN_WATCH_MARGIN, extra_left=cn.TURN_SWING_EXTRA)
+turning_right = cn.AGVControl.front_clearance(
+    o, cn.TURN_WATCH_MARGIN, extra_right=cn.TURN_SWING_EXTRA)
+chk("straight strip misses a wall at the front-left corner (the 15:33 hit)",
+    straight == math.inf, f"{straight}")
+chk("turning LEFT: the wall counts -- the corner would swing into it",
+    turning_left < cn.TURN_STOP_GAP, f"{turning_left:.2f}")
+chk("turning RIGHT: it does not (the corner swings away)",
+    turning_right == math.inf, f"{turning_right}")
 
 print("\nALL PASS" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)
