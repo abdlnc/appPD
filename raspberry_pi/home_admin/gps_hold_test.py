@@ -197,14 +197,20 @@ def fix(err, accepted=False, gst_age=0.5):
 
 
 q = g.GPSNode._quality_check
-chk("HDOP 1.1 but the receiver says 9.4 m (the house): rejected",
-    q(fix(9.4))[0] is False and "9.4 m" in q(fix(9.4))[1], q(fix(9.4))[1])
+A, K = g.MAX_ERR_ACCEPT_M, g.MAX_ERR_KEEP_M
+bad = K + 4.0
+chk(f"HDOP 1.1 but the receiver says {bad:.1f} m: rejected",
+    q(fix(bad))[0] is False and f"{bad:.1f} m" in q(fix(bad))[1],
+    q(fix(bad))[1])
 chk("it says 2 m (open field): accepted", q(fix(2.0))[0])
-chk("accepted, then 6.5 m: kept (hysteresis, keep <= 8)",
-    q(fix(6.5, accepted=True))[0])
-chk("not yet accepted, 6.5 m: not accepted (accept <= 5)",
-    not q(fix(6.5))[0])
-chk("accepted, then 8.5 m: dropped", not q(fix(8.5, accepted=True))[0])
+mid = (A + K) / 2.0
+chk(f"accepted, then {mid:.1f} m: kept (hysteresis, keep <= {K:.0f})",
+    q(fix(mid, accepted=True))[0])
+chk(f"not yet accepted, {mid:.1f} m: not accepted (accept <= {A:.0f})",
+    not q(fix(mid))[0])
+chk(f"accepted, then {K + 0.5:.1f} m: dropped",
+    not q(fix(K + 0.5, accepted=True))[0])
+chk("(the keep limit is above the accept limit)", K > A)
 chk("no GST for 10 s: judged on sats and HDOP alone (as before)",
     q(fix(30.0, gst_age=10.0))[0])
 

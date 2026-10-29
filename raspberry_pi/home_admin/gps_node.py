@@ -161,9 +161,14 @@ MIN_SATS_KEEP   = 5        # to KEEP trusting a fix already accepted
 # there is effectively no GPS; in the open field, where the M8N usually
 # rates itself 1-3 m, there is. (A set position -- YOU SET WHERE IT IS --
 # keeps working by lidar either way.)
+#
+# TEMPORARY (2026-10-29, on request): 10 / 13 m instead of 5 / 8 m. Under
+# open sky the receiver used only 8 of 25 satellites in view and settled at
+# a 7.5 m estimate -- a weak signal at the antenna (placement / electrical
+# noise), not the sky. Go back to 5 / 8 once the antenna is sorted.
 ERR_GATE = True
-MAX_ERR_ACCEPT_M = 5.0
-MAX_ERR_KEEP_M = 8.0
+MAX_ERR_ACCEPT_M = 10.0
+MAX_ERR_KEEP_M = 13.0
 GST_STALE_S = 3.0
 
 # ---- staleness: no fresh position = no fix ----
