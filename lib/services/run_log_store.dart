@@ -142,7 +142,12 @@ class RunLogStore extends ChangeNotifier {
     super.dispose();
   }
 
+  /// How many times [load] has run -- for the wiring test (it must be once).
+  @visibleForTesting
+  int debugLoadCount = 0;
+
   Future<void> load() async {
+    debugLoadCount++;
     final p = await SharedPreferences.getInstance();
     _runs = RunLog.decodeList(p.getString(_kRuns));
     _activeMode = p.getString(_kActiveMode);

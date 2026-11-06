@@ -242,6 +242,7 @@ class SoilCameraNode(Node):
         self.lock = threading.Lock()
         self.running = True
         self.last_capture = 0.0
+        self.last_saved = 0.0                  # last photo actually SAVED
 
         # Saving is OFF until the bridge says a run has started. When it turns
         # ON, the next tick shoots immediately rather than waiting out the
@@ -306,8 +307,13 @@ class SoilCameraNode(Node):
 
     def capture_cb(self, msg: String):
         on = msg.data.strip().upper() == "ON"
-        if on and not self.capture_on:
-            self._shoot_now = True             # first photo of the run, now
+        # First photo of a run, now -- unless one was SAVED under a minute
+        # ago. 2026-11-06: an app bug re-sent CAPTURE ON/OFF 10-20 times a
+        # second, and every ON took a photo -- one every 1-2 s, 255 in an
+        # afternoon. Whatever the app sends, it stays at most one a minute.
+        if on and not self.capture_on and \
+                time.time() - self.last_saved >= CAPTURE_INTERVAL:
+            self._shoot_now = True
         if on != self.capture_on:
             self.get_logger().info(
                 f"Soil capture {'ON -- saving' if on else 'OFF -- not saving'}")
@@ -489,6 +495,7 @@ class SoilCameraNode(Node):
             + (OUTSIDE_TAG if self._outside() else "") + ".jpg")
         try:
             cv2.imwrite(fname, self._stamp(frame, when))
+            self.last_saved = time.time()
             self.get_logger().info(f"Saved soil snapshot: {fname}")
         except Exception as e:
             self.get_logger().warn(f"Soil snapshot save failed: {e}")
