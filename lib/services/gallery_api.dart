@@ -12,14 +12,17 @@ const int kGalleryPort = 8080;
 /// Image kinds the server exposes, for the gallery's tabs.
 const List<String> kPhotoKinds = ['captures', 'detections', 'soil'];
 
-/// What the GPS map pins: OBSTACLES only.
+/// What the GPS map pins as OBSTACLE photos: the AI's annotated detections.
 ///
-/// The map answers "where did the robot find obstructions?", so only the AI's
-/// annotated detections are pinned. Soil photos are a timed log taken every
-/// 60s regardless of what is there, and raw captures are the un-annotated
-/// twins of these same detections -- pinning either buries the obstacles under
-/// points that carry no finding. Both are still browsable in the gallery.
+/// Raw captures are the un-annotated twins of these same detections, so they
+/// are not pinned (still browsable in the gallery).
 const List<String> kMapPinKinds = ['detections'];
+
+/// The soil camera's photos, pinned as their OWN layer (2026-11-07, on
+/// request) -- separate pins in a separate colour with their own toggle, so
+/// a 60s soil log never buries the obstacle findings it was once kept off
+/// the map to protect.
+const List<String> kMapSoilKinds = ['soil'];
 
 String galleryImgUrl(String ip, String kind, String name) =>
     'http://$ip:$kGalleryPort/img/$kind/$name';
@@ -89,15 +92,17 @@ class PhotoIndex {
   static const empty = PhotoIndex(photos: [], noFixCount: 0);
 }
 
-/// Loads all photo kinds concurrently and indexes them.
+/// Loads the given photo kinds concurrently and indexes them -- the obstacle
+/// kinds by default, [kMapSoilKinds] for the soil layer.
 ///
 /// A kind that fails is skipped rather than failing the whole load: a missing
 /// soil camera shouldn't wipe the obstacle pins off the map.
-Future<PhotoIndex> fetchPhotoIndex(String ip) async {
+Future<PhotoIndex> fetchPhotoIndex(String ip,
+    {List<String> kinds = kMapPinKinds}) async {
   // Asks for kMapListLimit so the map reflects the whole archive, not just
   // the most recent 200 photos in the folder.
   final results = await Future.wait(
-    kMapPinKinds.map((k) async {
+    kinds.map((k) async {
       try {
         return MapEntry(
             k, await fetchGalleryNames(ip, k, limit: kMapListLimit));

@@ -52,6 +52,7 @@ void main() {
       'Path trail',
       'Lidar obstacle pins',
       'Obstacle photos',
+      'Soil photos',
       'Clear trail & Lidar pins',
     ]) {
       expect(find.text(label), findsOneWidget, reason: label);

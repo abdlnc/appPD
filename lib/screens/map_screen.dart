@@ -12,7 +12,16 @@ import '../services/run_log_store.dart';
 import '../theme/app_theme.dart';
 
 /// The app bar's tools-and-layers menu entries.
-enum _MapAction { setPosition, fence, satellite, trail, obstacles, photos, clear }
+enum _MapAction {
+  setPosition,
+  fence,
+  satellite,
+  trail,
+  obstacles,
+  photos,
+  soil,
+  clear
+}
 
 /// GPS map (2.1 visualization) + interactive waypoint navigation (2.2).
 /// - GO starts navigation and shows a live NAVIGATING state + STOP button.
@@ -70,6 +79,13 @@ class _MapScreenState extends State<MapScreen> {
   bool _photosLoading = false;
   String? _photoError;
   bool _photosRequested = false;
+
+  // --- Soil photos: their own layer (green pins, own toggle) ---
+  PhotoIndex _soilIndex = PhotoIndex.empty;
+  List<PhotoCluster> _soilPins = [];
+  bool _showSoil = true;
+  bool _soilLoading = false;
+  String? _soilError;
   // Photos within this distance share one pin. The robot saves a soil image
   // every 60s, so a session leaves hundreds; one marker each would bury the
   // map, and while it is stationary they all land on the same spot anyway.
@@ -115,6 +131,7 @@ class _MapScreenState extends State<MapScreen> {
     if (!_photosRequested && s.hostIp != null) {
       _photosRequested = true;
       _loadPhotos();
+      _loadSoil();
     }
   }
 
@@ -148,6 +165,35 @@ class _MapScreenState extends State<MapScreen> {
       setState(() {
         _photoError = e.toString();
         _photosLoading = false;
+      });
+    }
+  }
+
+  /// The soil camera's photos as map pins -- the same as [_loadPhotos], for
+  /// the soil layer.
+  Future<void> _loadSoil() async {
+    final ip = _socket?.hostIp;
+    if (ip == null || _soilLoading) return;
+    setState(() {
+      _soilLoading = true;
+      _soilError = null;
+    });
+    try {
+      final idx = await fetchPhotoIndex(ip, kinds: kMapSoilKinds);
+      if (!mounted) return;
+      setState(() {
+        _soilIndex = idx;
+        _soilPins = clusterPhotos(
+          idx.photos.map((p) => p.geo).toList(),
+          radiusM: _photoClusterM,
+        );
+        _soilLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _soilError = e.toString();
+        _soilLoading = false;
       });
     }
   }
@@ -301,6 +347,24 @@ class _MapScreenState extends State<MapScreen> {
       }
     }
 
+    // Soil first, so obstacle pins draw on top where they overlap.
+    if (_showSoil) {
+      for (final pin in _soilPins) {
+        markers.add(Marker(
+          point: LatLng(pin.lat, pin.lon),
+          width: 30,
+          height: 30,
+          child: GestureDetector(
+            onTap: () => _showPhotoPin(pin),
+            child: _PhotoPinIcon(
+                cluster: pin,
+                color: _soilColor,
+                icon: Icons.grass,
+                iconColor: const Color(0xFF0B1A00)),
+          ),
+        ));
+      }
+    }
     if (_showPhotos) {
       for (final pin in _photoPins) {
         markers.add(Marker(
@@ -421,7 +485,8 @@ class _MapScreenState extends State<MapScreen> {
           // Photos that exist but carry no position. Stated explicitly:
           // if they just silently vanished from the map it would look like
           // a bug rather than the honest "there was no fix at that moment".
-          if (_showPhotos && _photoIndex.noFixCount > 0)
+          if ((_showPhotos && _photoIndex.noFixCount > 0) ||
+              (_showSoil && _soilIndex.noFixCount > 0))
             Positioned(
               top: 96,
               right: 10,
@@ -440,8 +505,12 @@ class _MapScreenState extends State<MapScreen> {
                         size: 13, color: Color(0xFFFFB300)),
                     const SizedBox(width: 5),
                     Text(
-                      "${_photoIndex.noFixCount} obstacle photo"
-                      "${_photoIndex.noFixCount == 1 ? '' : 's'} without GPS",
+                      "${[
+                        if (_showPhotos && _photoIndex.noFixCount > 0)
+                          "${_photoIndex.noFixCount} obstacle",
+                        if (_showSoil && _soilIndex.noFixCount > 0)
+                          "${_soilIndex.noFixCount} soil",
+                      ].join(" + ")} photos without GPS",
                       style: GoogleFonts.rajdhani(
                           color: AppColors.textLo,
                           fontSize: 12,
@@ -487,6 +556,7 @@ class _MapScreenState extends State<MapScreen> {
       ),
       builder: (_) {
         final imgs = cluster.images;
+        final soil = cluster.cover.kind == 'soil';
         return SafeArea(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
@@ -496,8 +566,9 @@ class _MapScreenState extends State<MapScreen> {
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.warning_amber_rounded,
-                        color: Color(0xFFFFB300), size: 18),
+                    Icon(soil ? Icons.grass : Icons.warning_amber_rounded,
+                        color: soil ? _soilColor : const Color(0xFFFFB300),
+                        size: 18),
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
@@ -510,9 +581,13 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                     ),
                     Text(
-                      imgs.length == 1
-                          ? "1 obstacle"
-                          : "${imgs.length} obstacles",
+                      soil
+                          ? (imgs.length == 1
+                              ? "1 soil photo"
+                              : "${imgs.length} soil photos")
+                          : (imgs.length == 1
+                              ? "1 obstacle"
+                              : "${imgs.length} obstacles"),
                       style: GoogleFonts.rajdhani(color: AppColors.textLo),
                     ),
                   ],
@@ -550,7 +625,7 @@ class _MapScreenState extends State<MapScreen> {
                             "${g.time.hour.toString().padLeft(2, '0')}:"
                             "${g.time.minute.toString().padLeft(2, '0')}:"
                             "${g.time.second.toString().padLeft(2, '0')}"
-                            "${g.kind == 'soil' ? '  soil' : ''}",
+                            "${g.kind != 'soil' ? '' : g.soilClass == GeoImage.kNotSoil ? '  not soil' : g.soilClass == GeoImage.kSoil ? '  soil' : ''}",
                             style: GoogleFonts.rajdhani(
                                 color: AppColors.textLo, fontSize: 12),
                           ),
@@ -624,6 +699,7 @@ class _MapScreenState extends State<MapScreen> {
   static const _fenceColor = Color(0xFF8BC34A);
   static const _stopColor = Color(0xFFFFB300);
   static const _laneColor = Color(0xFF22D3EE);
+  static const _soilColor = Color(0xFF7CB342); // soil photo pins
 
   /// The boundary, its stop line and COVER's lanes -- or, while editing,
   /// the draft and a live preview of where its stop line would fall.
@@ -928,6 +1004,24 @@ class _MapScreenState extends State<MapScreen> {
               ? null
               : _showPhotos,
           enabled: !_photosLoading),
+      item(
+          _MapAction.soil,
+          Icons.grass,
+          "Soil photos",
+          color: _soilError != null ? _stopColor : _soilColor,
+          detail: _soilLoading
+              ? "loading\u2026"
+              : (_soilError != null
+                  ? "unavailable \u2013 tap to retry"
+                  : (_soilPins.isEmpty
+                      ? "tap to load"
+                      : "${_soilIndex.photos.length} at "
+                          "${_soilPins.length} spot"
+                          "${_soilPins.length == 1 ? '' : 's'}")),
+          checked: _soilLoading || _soilError != null || _soilPins.isEmpty
+              ? null
+              : _showSoil,
+          enabled: !_soilLoading),
       const PopupMenuDivider(),
       item(_MapAction.clear, Icons.layers_clear, "Clear trail & Lidar pins",
           enabled: _trail.isNotEmpty || socket.obstaclePins.isNotEmpty),
@@ -969,6 +1063,12 @@ class _MapScreenState extends State<MapScreen> {
           _loadPhotos();
         } else {
           setState(() => _showPhotos = !_showPhotos);
+        }
+      case _MapAction.soil:
+        if (_soilError != null || _soilPins.isEmpty) {
+          _loadSoil();
+        } else {
+          setState(() => _showSoil = !_showSoil);
         }
       case _MapAction.clear:
         _clearTrail();
@@ -1377,11 +1477,17 @@ class _MapScreenState extends State<MapScreen> {
 /// finding you can open and the other is a live range reading.
 class _PhotoPinIcon extends StatelessWidget {
   final PhotoCluster cluster;
-  const _PhotoPinIcon({required this.cluster});
+  final Color color;
+  final IconData icon;
+  final Color iconColor;
+  const _PhotoPinIcon(
+      {required this.cluster,
+      this.color = const Color(0xFFFFB300), // obstacle photos
+      this.icon = Icons.photo_camera,
+      this.iconColor = const Color(0xFF1A1200)});
 
   @override
   Widget build(BuildContext context) {
-    const color = Color(0xFFFFB300);
     return Stack(
       clipBehavior: Clip.none,
       children: [
@@ -1391,8 +1497,7 @@ class _PhotoPinIcon extends StatelessWidget {
             shape: BoxShape.circle,
             border: Border.all(color: Colors.white, width: 1.5),
           ),
-          child: const Icon(Icons.photo_camera,
-              color: Color(0xFF1A1200), size: 17),
+          child: Icon(icon, color: iconColor, size: 17),
         ),
         if (cluster.count > 1)
           Positioned(
